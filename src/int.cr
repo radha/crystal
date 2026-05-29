@@ -710,6 +710,10 @@ struct Int
   private DIGITS_UPCASE   = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
   private DIGITS_BASE62   = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
+  # Concatenation of all two-digit decimal numbers from `00` to `99`, used by
+  # the base 10 fast path in `#internal_to_s` to emit two digits per iteration.
+  private DIGIT_PAIRS = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
+
   # Returns a string representation of this integer.
   #
   # *base* specifies the radix of the returned string, and must be either 62 or
@@ -826,12 +830,37 @@ struct Int
 
     neg = num < 0
 
-    digits = (base == 62 ? DIGITS_BASE62 : (upcase ? DIGITS_UPCASE : DIGITS_DOWNCASE)).to_unsafe
+    if base == 10
+      # Base 10 fast path: emit two digits per iteration from a lookup table of
+      # digit pairs. This halves the iteration count and, because the divisor is
+      # the constant 100 (rather than the variable `base`), lets LLVM lower the
+      # division to a magic-number multiply instead of a hardware divide.
+      pairs = DIGIT_PAIRS.to_unsafe
+      while num != 0
+        quotient = num.tdiv(100)
+        # `num - quotient * 100` equals `num.remainder(100)`, always in -99..99.
+        # `quotient * 100` cannot overflow since `|quotient| <= |num| // 100`.
+        rem = (num &- quotient &* 100).abs.to_i!
+        num = quotient
+        index = rem &* 2
+        if num == 0 && rem < 10
+          # Most-significant digit is a single digit: avoid a leading zero.
+          ptr -= 1
+          ptr.value = pairs[index &+ 1]
+        else
+          ptr -= 2
+          ptr.value = pairs[index]
+          (ptr + 1).value = pairs[index &+ 1]
+        end
+      end
+    else
+      digits = (base == 62 ? DIGITS_BASE62 : (upcase ? DIGITS_UPCASE : DIGITS_DOWNCASE)).to_unsafe
 
-    while num != 0
-      ptr -= 1
-      ptr.value = digits[num.remainder(base).abs]
-      num = num.tdiv(base)
+      while num != 0
+        ptr -= 1
+        ptr.value = digits[num.remainder(base).abs]
+        num = num.tdiv(base)
+      end
     end
 
     count = (ptr_end - ptr).to_i32
