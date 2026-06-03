@@ -4165,6 +4165,26 @@ class String
     yielded = 0
     byte_offset = 0
 
+    # With an ASCII separator in a single-byte string the separator occupies
+    # exactly one byte and can't collide with any other (invalid) byte, so we
+    # can locate it with `memchr` instead of decoding every codepoint.
+    if single_byte_optimizable? && separator.ascii?
+      separator_byte = separator.ord.to_u8!
+      slice = to_slice
+      while index = slice.fast_index(separator_byte, byte_offset)
+        piece_bytesize = index - byte_offset
+        yield String.new(to_unsafe + byte_offset, piece_bytesize) unless remove_empty && piece_bytesize == 0
+        yielded += 1
+        byte_offset = index + 1
+        break if limit && yielded + 1 == limit
+      end
+
+      piece_bytesize = bytesize - byte_offset
+      return if remove_empty && piece_bytesize == 0
+      yield String.new(to_unsafe + byte_offset, piece_bytesize)
+      return
+    end
+
     reader = Char::Reader.new(self)
     reader.each do |char|
       if char == separator

@@ -1476,6 +1476,11 @@ describe "String" do
       it { "=b".split('=').should eq(["", "b"]) }
       it { "=".split('=', 2).should eq(["", ""]) }
       it { "=".split('=', 2, remove_empty: true).should eq([] of String) }
+      # ASCII separator in a single-byte string with invalid bytes: the high
+      # bytes (>= 0x80) must not be mistaken for the separator and are kept
+      # verbatim inside the pieces.
+      it { "a\xFF,b\x80,c".split(',').should eq(["a\xFF", "b\x80", "c"]) }
+      it { "a\xFF,b\x80,c".split(',').map(&.bytesize).should eq([2, 2, 1]) }
     end
 
     describe "by string" do
