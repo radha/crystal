@@ -384,6 +384,23 @@ describe "::sprintf" do
       assert_sprintf "%300.250d", 10.to_big_d ** 200, "#{" " * 50}#{"0" * 49}1#{"0" * 200}"
       assert_sprintf "%- #300.250X", 16.to_big_d ** 200 - 1, " 0X#{"0" * 50}#{"F" * 200}#{" " * 47}"
     end
+
+    it "primitive (fast path) and BigInt (fallback) agree across flag combinations" do
+      formats = [
+        "%d", "%i", "%x", "%X", "%o", "%b",
+        "%+d", "% d", "%#x", "%#o", "%#b",
+        "%8d", "%-8d", "%08d", "%+08d", "%.5d", "%.0d",
+        "%12.6d", "%-12.6d", "%#12.6x", "%+.4d",
+      ]
+      # span Int8..Int64 widths, both signs, and zero
+      [0, 1, -1, 42, -42, 255, -255, 127_i64, -128_i64,
+       2147483647_i64, -2147483648_i64, 9223372036854775807_i64].each do |n|
+        formats.each do |fmt|
+          sprintf(fmt, n.to_i64).should eq(sprintf(fmt, n.to_big_i)),
+            "#{fmt.inspect} disagreed for #{n}"
+        end
+      end
+    end
   end
 
   it "doesn't stop at null character when doing '%'" do

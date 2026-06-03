@@ -270,6 +270,60 @@ struct String::Formatter(A)
   end
 
   def int(flags, arg : Int) : Nil
+    # Fixed-width integers take a zero-allocation streaming path. `BigInt` and
+    # any other non-primitive `Int` keep the allocating path (their digit count
+    # can exceed the fixed `to_s_digits` stack buffer). The `is_a?` is resolved
+    # at compile time for the concrete primitive types, so no extra dispatch is
+    # paid. (A separate `Int::Primitive` overload does not work here: it loses
+    # specificity to this `Int` overload in the formatter's call context.)
+    if arg.is_a?(Int::Primitive)
+      int_primitive(flags, arg)
+    else
+      int_allocating(flags, arg)
+    end
+  end
+
+  # Streams the formatted integer directly to `@io` instead of allocating a
+  # throwaway String via `arg.to_s(base, ...)`. `to_s_digits` yields the bare
+  # digits (no sign, no precision padding) from a stack buffer, from which we
+  # can both size the field and write it without any heap allocation.
+  private def int_primitive(flags, arg : Int::Primitive) : Nil
+    precision = int_precision(arg, flags)
+
+    arg.to_s_digits(flags.base, flags.uppercase?) do |digits, negative|
+      # bytesize of `arg.to_s(base, precision: precision)`: sign plus the digit
+      # run padded up to `precision` with leading zeros.
+      str_size = (negative ? 1 : 0) + {digits.size, precision}.max
+      str_size += 1 if arg >= 0 && (flags.plus || flags.space)
+      str_size += 2 if flags.sharp && flags.base != 10 && arg != 0
+
+      # If `arg` is zero-padded, we let the precision argument do the right-justification
+      pad(str_size, flags) if flags.left_padding? && flags.padding_char != '0'
+
+      write_plus_or_space(arg, flags)
+
+      if flags.sharp && arg < 0
+        @io << '-'
+        write_base_prefix(flags)
+        write_padded_digits(digits, precision)
+      else
+        write_base_prefix(flags) if flags.sharp && arg != 0
+        @io << '-' if negative
+        write_padded_digits(digits, precision)
+      end
+
+      pad(str_size, flags) if flags.right_padding?
+    end
+  end
+
+  # Writes *digits* (most-significant first, sign already handled by the caller)
+  # left-padded with leading zeros up to *precision* digits.
+  private def write_padded_digits(digits : Bytes, precision : Int) : Nil
+    (precision - digits.size).times { @io << '0' } if precision > digits.size
+    @io.write_string digits
+  end
+
+  private def int_allocating(flags, arg : Int) : Nil
     precision = int_precision(arg, flags)
     base_str = arg.to_s(flags.base, precision: precision, upcase: flags.uppercase?)
     str_size = base_str.bytesize
