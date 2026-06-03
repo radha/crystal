@@ -976,6 +976,28 @@ describe "Enumerable" do
         [Float64::NAN, 1.0, 2.0, Float64::NAN].max(2)
       end
     end
+
+    it "returns the count largest sorted descending for count == size" do
+      [3, 1, 2].max(3).should eq([3, 2, 1])
+    end
+
+    it "handles heavily duplicated (low cardinality) input" do
+      [5, 5, 5, 1, 5, 5].max(3).should eq([5, 5, 5])
+    end
+
+    it "matches a sort-based reference over random inputs" do
+      rng = Random.new(1234)
+      100.times do
+        n = rng.rand(200)
+        arr = Array.new(n) { rng.rand(50) }
+        snapshot = arr.dup
+        [0, 1, n // 2, n - 1, n, n + 5].each do |c|
+          next if c < 0
+          arr.max(c).should eq(arr.sort.last(c).reverse)
+        end
+        arr.should eq(snapshot) # input is never mutated
+      end
+    end
   end
 
   describe "max?" do
@@ -1052,6 +1074,28 @@ describe "Enumerable" do
     it "raises if not comparable in min(n)" do
       expect_raises ArgumentError do
         [Float64::NAN, 1.0, 2.0, Float64::NAN].min(2)
+      end
+    end
+
+    it "returns the count smallest sorted ascending for count == size" do
+      [3, 1, 2].min(3).should eq([1, 2, 3])
+    end
+
+    it "handles heavily duplicated (low cardinality) input" do
+      [5, 5, 5, 9, 5, 5].min(3).should eq([5, 5, 5])
+    end
+
+    it "matches a sort-based reference over random inputs" do
+      rng = Random.new(1234)
+      100.times do
+        n = rng.rand(200)
+        arr = Array.new(n) { rng.rand(50) }
+        snapshot = arr.dup
+        [0, 1, n // 2, n - 1, n, n + 5].each do |c|
+          next if c < 0
+          arr.min(c).should eq(arr.sort.first(c))
+        end
+        arr.should eq(snapshot) # input is never mutated
       end
     end
   end
