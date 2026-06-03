@@ -825,6 +825,21 @@ struct Int
     end
   end
 
+  # :nodoc:
+  # Yields the significant base-*base* digits of `self` (most-significant first,
+  # *without* sign or precision padding) as a `Slice(UInt8)` backed by a stack
+  # buffer, together with whether `self` is negative. The slice is only valid
+  # for the duration of the block. Enables zero-allocation integer formatting
+  # (see `String::Formatter#int`).
+  def to_s_digits(base : Int = 10, upcase : Bool = false, &)
+    raise ArgumentError.new("Invalid base #{base}") unless 2 <= base <= 36 || base == 62
+    raise ArgumentError.new("upcase must be false for base 62") if upcase && base == 62
+
+    internal_to_s(base, 1, upcase) do |ptr, count, negative|
+      yield Slice.new(ptr, count), negative
+    end
+  end
+
   private def internal_to_s(base, precision, upcase = false, &)
     # Given sizeof(self) <= 128 bits, we need at most 128 bytes for a base 2
     # representation, plus one byte for the negative sign (possibly used by the
