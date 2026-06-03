@@ -121,6 +121,32 @@ describe Indexable do
     end
   end
 
+  describe "#includes?" do
+    it "delegates to #index" do
+      indexable = SafeIndexable.new(3) # elements: 0, 1, 2
+      indexable.includes?(1).should be_true
+      indexable.includes?(0).should be_true
+      indexable.includes?(2).should be_true
+      indexable.includes?(3).should be_false
+      indexable.includes?(-1).should be_false
+    end
+
+    it "is empty-safe" do
+      SafeIndexable.new(0).includes?(0).should be_false
+    end
+
+    # Slice(UInt8) overrides #index with a memchr fast path; #includes? must
+    # match the generic equality semantics for every byte value, including
+    # the boundary values memchr could alias.
+    it "agrees with linear scan for Slice(UInt8) (memchr path)" do
+      bytes = Bytes[0, 1, 127, 128, 254, 255]
+      (0..255).each do |b|
+        bytes.includes?(b.to_u8).should eq(bytes.any? { |e| e == b.to_u8 })
+      end
+      Bytes.empty.includes?(0_u8).should be_false
+    end
+  end
+
   describe "#index!" do
     it "offset type" do
       indexable = SafeIndexable.new(3)
