@@ -308,20 +308,40 @@ class URI
   # by either `.encode_path(string : String) : String`, `.encode_path_segment(string : String) : String` or
   # `.encode_www_form(string : String, *, space_to_plus : Bool = true) : String`.
   def self.encode(string : String, io : IO, space_to_plus : Bool = false, &block) : Nil
-    string.each_byte do |byte|
+    bytes = string.to_slice
+    size = bytes.size
+    ptr = bytes.to_unsafe
+    # Index of the first byte of the current run of verbatim (unescaped) bytes.
+    # Verbatim bytes are accumulated and flushed in one `write_string` instead
+    # of being emitted one `IO#<<` Char at a time.
+    start = 0
+    i = 0
+    while i < size
+      byte = ptr[i]
       char = byte.unsafe_chr
       if char == ' ' && space_to_plus
+        io.write_string(bytes[start, i - start]) if i > start
         io << '+'
+        start = i + 1
       elsif char.ascii? && yield(byte) && (!space_to_plus || char != '+')
-        io << char
+        # Verbatim byte: extend the current run; flushed later in bulk.
       else
-        io << '%'
-        io << '0' if byte < 16
-        byte.to_s(io, 16, upcase: true)
+        io.write_string(bytes[start, i - start]) if i > start
+        # Emit "%XY" (upper-case, always two hex digits) in a single write.
+        escape = uninitialized UInt8[3]
+        escape.to_unsafe[0] = '%'.ord.to_u8
+        escape.to_unsafe[1] = HEX_UPCASE.to_unsafe[byte >> 4]
+        escape.to_unsafe[2] = HEX_UPCASE.to_unsafe[byte & 0x0f]
+        io.write_string(escape.to_slice)
+        start = i + 1
       end
+      i += 1
     end
+    io.write_string(bytes[start, size - start]) if size > start
     io
   end
+
+  private HEX_UPCASE = "0123456789ABCDEF".to_slice
 
   # :nodoc:
   def self.decode_one(string, bytesize, i, byte, char, io, plus_to_space = false)

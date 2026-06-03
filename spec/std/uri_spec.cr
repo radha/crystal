@@ -528,6 +528,10 @@ describe "URI" do
     assert_prints URI.encode_path("https://en.wikipedia.org/wiki/Crystal (programming language)"), "https%3A//en.wikipedia.org/wiki/Crystal%20%28programming%20language%29"
     assert_prints URI.encode_path("\xFF"), "%FF" # escapes invalid UTF-8 character
     assert_prints URI.encode_path("foo/bar/baz"), "foo/bar/baz"
+    # Verbatim bytes are flushed in bulk runs; check the run boundaries at the
+    # start, between escapes, and at the very end of the string.
+    assert_prints URI.encode_path(" abc def ghi "), "%20abc%20def%20ghi%20"
+    assert_prints URI.encode_path("trailing verbatim run"), "trailing%20verbatim%20run"
   end
 
   describe ".encode" do
