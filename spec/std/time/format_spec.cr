@@ -185,6 +185,36 @@ describe Time::Format do
     assert_prints time.to_rfc3339(fraction_digits: 9), "2016-02-15T08:23:45.000000000Z"
   end
 
+  # `Time::Format::Formatter#pad2`/`#pad4` emit zero-padded fixed-width fields
+  # via a two-digit lookup table. Sweep every field across its full range and
+  # check it against an independent zero-padding reference, so a wrong table
+  # entry, off-by-one index, or carry boundary (e.g. 99->100, 999->1000) is
+  # caught for every value the table can produce.
+  it "formats zero-padded fields across their full range" do
+    # pad2: seconds and minutes span the widest 0..59 range.
+    (0..59).each do |n|
+      time = Time.utc(2000, 1, 1, 0, n, n)
+      assert_prints time.to_s("%M"), n.to_s.rjust(2, '0')
+      assert_prints time.to_s("%S"), n.to_s.rjust(2, '0')
+    end
+
+    # pad2: remaining fields over their own ranges (hour, month, day).
+    (0..23).each do |h|
+      assert_prints Time.utc(2000, 1, 1, h).to_s("%H"), h.to_s.rjust(2, '0')
+    end
+    (1..12).each do |m|
+      assert_prints Time.utc(2000, m, 1).to_s("%m"), m.to_s.rjust(2, '0')
+    end
+    (1..28).each do |d|
+      assert_prints Time.utc(2000, 1, d).to_s("%d"), d.to_s.rjust(2, '0')
+    end
+
+    # pad4: the four-digit year exercises every hundreds/units lookup.
+    (1..9999).each do |y|
+      assert_prints Time.utc(y, 1, 1).to_s("%Y"), y.to_s.rjust(4, '0')
+    end
+  end
+
   it "parses empty" do
     t = Time.parse("", "", Time::Location.local)
     t.year.should eq(1)
