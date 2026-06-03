@@ -491,6 +491,85 @@ describe "Slice" do
     slice.rindex('z'.ord.to_u8).should be_nil
   end
 
+  describe "byte fast paths" do
+    it "#count counts a byte in a byte slice" do
+      Bytes[1, 2, 3, 2, 3, 2, 1].count(2).should eq(3)
+      Bytes[1, 2, 3, 2, 3, 2, 1].count(9).should eq(0)
+      Bytes.new(0).count(0).should eq(0)
+      Bytes.new(1000, 7u8).count(7).should eq(1000)
+    end
+
+    it "#count accepts an in-range Int" do
+      Bytes[1, 2, 2, 3].count(2).should eq(2)
+    end
+
+    it "#count agrees with the scalar reference across sizes and all byte values" do
+      r = Random.new(1234)
+      {0, 1, 7, 8, 9, 15, 16, 17, 64, 65, 257}.each do |sz|
+        slice = Bytes.new(sz) { r.rand(UInt8) }
+        (0..255).each do |bv|
+          b = bv.to_u8
+          expected = 0
+          slice.each { |x| expected += 1 if x == b }
+          slice.count(b).should eq(expected)
+        end
+      end
+    end
+
+    it "#rindex finds the last matching byte" do
+      Bytes[1, 2, 3, 2, 3, 2, 1].rindex(2).should eq(5)
+      Bytes[1, 2, 3, 2, 3, 2, 1].rindex(9).should be_nil
+      Bytes.new(0).rindex(0).should be_nil
+    end
+
+    it "#rindex honours offset, negative offset, and out-of-range offset" do
+      slice = Bytes[1, 2, 3, 2, 3]
+      slice.rindex(2, 2).should eq(1)
+      slice.rindex(3, offset: -1).should eq(4)
+      slice.rindex(2, offset: -4).should eq(1)
+      slice.rindex(2, offset: -100).should be_nil
+      slice.rindex(2, offset: 100).should be_nil
+    end
+
+    it "#rindex preserves the offset's integer type" do
+      slice = Bytes[1, 2, 2, 2]
+      slice.rindex(2, 3_i64).should be_a(Int64)
+      slice.rindex(2, 3_i64).should eq(3)
+      slice.rindex(2).should be_a(Int32)
+    end
+
+    it "#rindex agrees with the scalar reference across sizes, byte values, and offsets" do
+      r = Random.new(5678)
+      {0, 1, 7, 8, 9, 16, 17, 63, 64, 65, 257}.each do |sz|
+        slice = Bytes.new(sz) { |i| (r.rand(4) == 0 ? 0u8 : r.rand(UInt8)) }
+        {0u8, 0xFFu8, slice.empty? ? 0u8 : slice[r.rand(sz)]}.each do |b|
+          {-sz - 1, -1, 0, sz // 2, sz - 1, sz}.each do |off|
+            ref = nil.as(Int32?)
+            o = off
+            o += sz if o < 0
+            if 0 <= o < sz
+              i = o
+              while i >= 0
+                if slice[i] == b
+                  ref = i
+                  break
+                end
+                i -= 1
+              end
+            end
+            slice.rindex(b, off).should eq(ref)
+          end
+        end
+      end
+    end
+
+    it "#count and #rindex fall through for non-byte slices" do
+      Slice[10, 20, 30, 20].count(20).should eq(2)
+      Slice[10, 20, 30, 20].rindex(20).should eq(3)
+      Slice[10, 20, 30, 20].rindex(99).should be_nil
+    end
+  end
+
   it "does bytesize" do
     slice = Slice(Int32).new(2)
     slice.bytesize.should eq(8)

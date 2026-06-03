@@ -1233,6 +1233,85 @@ struct Slice(T)
     end
   end
 
+  def count(item) : Int32
+    # Optimize for the case of counting a byte in a byte slice
+    if T.is_a?(UInt8.class) &&
+       (item.is_a?(UInt8) || (item.is_a?(Int) && 0 <= item < 256))
+      return fast_count(item.to_u8!)
+    end
+
+    super
+  end
+
+  # :nodoc:
+  def fast_count(byte : UInt8) : Int32
+    ptr = to_unsafe
+    count = 0
+    i = 0
+    # Branchless tally: `count += (ptr[i] == byte)`. Wrapping arithmetic is
+    # safe (the result can't exceed `size`, which is an `Int32`), and lets
+    # the loop auto-vectorize into a SIMD compare-and-accumulate reduction.
+    while i < size
+      count &+= (ptr[i] == byte ? 1 : 0)
+      i &+= 1
+    end
+    count
+  end
+
+  def rindex(value, offset = size - 1)
+    # Optimize for the case of looking for a byte in a byte slice
+    if T.is_a?(UInt8.class) &&
+       (value.is_a?(UInt8) || (value.is_a?(Int) && 0 <= value < 256))
+      return fast_rindex(value.to_u8!, offset)
+    end
+
+    super
+  end
+
+  # :nodoc:
+  def fast_rindex(byte : UInt8, offset)
+    offset += size if offset < 0
+    return nil if offset >= size
+    # Search range is `[0, offset]`; an offset below zero leaves it empty.
+    return nil if offset < 0
+
+    ptr = to_unsafe
+    # Scan internally with a signed `Int32` index — positions always fit
+    # (`size` is itself an `Int32`) and a signed index keeps the `>= 0` loop
+    # bound correct even when *offset* is an unsigned type. The matched index
+    # is returned in *offset*'s own type, matching `Indexable#rindex`.
+    i = offset.to_i32!
+
+    # Word-at-a-time reverse scan. `broadcast` replicates the target byte
+    # across all 8 lanes; XOR-ing zeroes out matching bytes so the classic
+    # "has a zero byte" SWAR test detects whether the 8-byte window at
+    # [start, i] contains a match. Presence detection is exact (only the
+    # per-byte position flags can be skewed by borrow propagation), so when
+    # a word reports a hit we refine it with a short scalar scan to find the
+    # highest matching index.
+    broadcast = byte.to_u64 &* 0x0101010101010101_u64
+    while i >= 7
+      start = i - 7
+      word = (ptr + start).as(UInt64*).value
+      x = word ^ broadcast
+      if (x &- 0x0101010101010101_u64) & ~x & 0x8080808080808080_u64 != 0
+        j = i
+        while j >= start
+          return typeof(offset).new(j) if ptr[j] == byte
+          j &-= 1
+        end
+      end
+      i = start - 1
+    end
+
+    # Scalar tail for the remaining `[0, i]` bytes.
+    while i >= 0
+      return typeof(offset).new(i) if ptr[i] == byte
+      i &-= 1
+    end
+    nil
+  end
+
   # See `Object#hash(hasher)`
   def hash(hasher)
     {% if T == UInt8 %}
