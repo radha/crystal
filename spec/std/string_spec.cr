@@ -1363,6 +1363,25 @@ describe "String" do
       "Dizzy Miss Lizzy".byte_index('z'.ord, -17).should be_nil
     }
 
+    it "finds the NUL byte" do
+      String.new(Bytes[0x61, 0x00, 0x62]).byte_index(0).should eq(1)
+      "abc".byte_index(0).should be_nil
+    end
+
+    it "returns nil for byte values outside 0..255 (no modulo-256 wraparound)" do
+      # 0x16f & 0xff == 0x6f ('o'); must not match.
+      "foo".byte_index(0x16f).should be_nil
+      "foo".byte_index(256).should be_nil
+      "foo".byte_index(-1).should be_nil
+      "foo".byte_index(-145).should be_nil # -145 & 0xff would be 'o'
+    end
+
+    it "matches the full byte range" do
+      String.new(Bytes[0xff, 0x80, 0x00]).byte_index(0xff).should eq(0)
+      String.new(Bytes[0xff, 0x80, 0x00]).byte_index(0x80).should eq(1)
+      String.new(Bytes[0xff, 0x80, 0x00]).byte_index(255).should eq(0)
+    end
+
     it { "foo".byte_index('o').should eq(1) }
     it { "foo bar booz".byte_index('o', 3).should eq(9) }
     it { "foo".byte_index('a').should be_nil }

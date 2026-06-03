@@ -3759,15 +3759,14 @@ class String
   # "Dizzy Miss Lizzy".byte_index('z'.ord, -17) # => nil
   # ```
   def byte_index(byte : Int, offset : Int32 = 0) : Int32?
-    offset += bytesize if offset < 0
-    return if offset < 0
+    # A `UInt8` can only equal *byte* when it is within `0..255`; any other
+    # value can never match (mirroring the `to_unsafe[i] == byte` comparison),
+    # so bail out early. This guard is also required for correctness because
+    # `memchr` interprets its search value modulo 256.
+    return unless 0 <= byte < 256
 
-    offset.upto(bytesize - 1) do |i|
-      if to_unsafe[i] == byte
-        return i
-      end
-    end
-    nil
+    # Delegate to the bounds-checked `memchr` fast path.
+    to_slice.fast_index(byte.to_u8!, offset)
   end
 
   # Returns the index of the _first_ occurrence of *char* in the string, or `nil` if not present.
