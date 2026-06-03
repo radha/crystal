@@ -340,6 +340,11 @@ describe "Int" do
     it_converts_to_s 0, "0"
     it_converts_to_s 1, "1"
 
+    # Base 10 fast path emits two digits per iteration, with a single-digit
+    # most-significant branch for odd-length numbers (see `Int#internal_to_s`).
+    it_converts_to_s 100, "100"
+    it_converts_to_s 12345, "12345"
+
     context "extrema for various int sizes" do
       it_converts_to_s 127_i8, "127"
       it_converts_to_s -128_i8, "-128"
@@ -437,6 +442,18 @@ describe "Int" do
       it_converts_to_s 123, "123", precision: 2
       it_converts_to_s 123, "00123", precision: 5
       it_converts_to_s 123, "#{"0" * 197}123", precision: 200
+
+      it_converts_to_s 12345, "12345", precision: 3
+      it_converts_to_s 12345, "0000012345", precision: 10
+      it_converts_to_s -12345, "-0000012345", precision: 10
+
+      # Boundary between the reused stack buffer (`precision <= 128`) and a
+      # freshly allocated one (`precision > 128`) in the String overload.
+      it_converts_to_s 1, "#{"0" * 126}1", precision: 127
+      it_converts_to_s 1, "#{"0" * 127}1", precision: 128
+      it_converts_to_s 1, "#{"0" * 128}1", precision: 129
+      it_converts_to_s -1, "-#{"0" * 127}1", precision: 128
+      it_converts_to_s -1, "-#{"0" * 128}1", precision: 129
 
       it_converts_to_s 9223372036854775807_i64, "#{"1" * 63}", base: 2, precision: 62
       it_converts_to_s 9223372036854775807_i64, "#{"1" * 63}", base: 2, precision: 63
