@@ -1841,6 +1841,18 @@ class String
     end
   end
 
+  # Maps an ASCII byte to its hexadecimal nibble value (`0` to `15`), or `0xff`
+  # for any byte that is not a hexadecimal digit. Used by `#hexbytes?` to decode
+  # a hexstring with a single table lookup per character instead of a
+  # `Char#to_u8?(16)` call (which does not vectorize and dominates the loop).
+  private HEX_DECODE = begin
+    table = StaticArray(UInt8, 256).new(0xff_u8)
+    "0123456789".each_char_with_index { |c, i| table[c.ord] = i.to_u8 }
+    "abcdef".each_char_with_index { |c, i| table[c.ord] = (10 + i).to_u8 }
+    "ABCDEF".each_char_with_index { |c, i| table[c.ord] = (10 + i).to_u8 }
+    table
+  end
+
   # Interprets this string as containing a sequence of hexadecimal values
   # and decodes it as a slice of bytes. Two consecutive bytes in the string
   # represent a byte in the returned slice.
@@ -1871,15 +1883,20 @@ class String
     return unless bytesize.divisible_by?(2)
 
     bytes = Bytes.new(bytesize // 2)
+    src = to_unsafe
+    dst = bytes.to_unsafe
+    table = HEX_DECODE.to_unsafe
 
     i = 0
+    j = 0
     while i < bytesize
-      high_nibble = to_unsafe[i].unsafe_chr.to_u8?(16)
-      low_nibble = to_unsafe[i + 1].unsafe_chr.to_u8?(16)
-      return unless high_nibble && low_nibble
+      high_nibble = table[src[i]]
+      low_nibble = table[src[i + 1]]
+      return if high_nibble == 0xff_u8 || low_nibble == 0xff_u8
 
-      bytes[i // 2] = (high_nibble << 4) | low_nibble
+      dst[j] = (high_nibble << 4) | low_nibble
       i += 2
+      j += 1
     end
 
     bytes

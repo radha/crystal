@@ -3059,6 +3059,28 @@ describe "String" do
     "abc".hexbytes?.should be_nil
     "abc ".hexbytes?.should be_nil
     "abcd".hexbytes?.should eq(Bytes[171, 205])
+
+    # empty string decodes to an empty slice
+    "".hexbytes?.should eq(Bytes.new(0))
+
+    # all digits and both letter cases, mixed
+    "0123456789abcdef".hexbytes?.should eq(Bytes[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef])
+    "0123456789ABCDEF".hexbytes?.should eq(Bytes[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef])
+    "aAbBcCdDeEfF".hexbytes?.should eq(Bytes[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+
+    # invalid hex digit in either nibble, at the start and further in
+    "g0".hexbytes?.should be_nil
+    "0g".hexbytes?.should be_nil
+    "00gg".hexbytes?.should be_nil
+    "00ff0z".hexbytes?.should be_nil
+
+    # non-ASCII / high bytes are not hex digits
+    String.new(Bytes[0xff, 0xfe]).hexbytes?.should be_nil
+    "é".hexbytes?.should be_nil
+
+    # round-trips with hexstring for every byte value
+    bytes = Bytes.new(256) { |i| i.to_u8 }
+    bytes.hexstring.hexbytes?.should eq(bytes)
   end
 
   it "dups" do
