@@ -255,8 +255,16 @@ struct Time::Format
     end
 
     def pad2(value, padding) : Nil
-      io << padding if value < 10
-      io << value
+      # Zero-padded fixed-width fields are always in `0..99`, so a single
+      # `Crystal::DIGIT_PAIRS` lookup emits both digits without an `Int#to_s`
+      # call, its buffer setup, or a division.
+      if padding == '0' && value >= 0 && value < 100
+        i = value.to_i! &* 2
+        io.write_string Crystal::DIGIT_PAIRS.to_slice[i, 2]
+      else
+        io << padding if value < 10
+        io << value
+      end
     end
 
     def pad3(value, padding) : Nil
@@ -265,8 +273,15 @@ struct Time::Format
     end
 
     def pad4(value, padding) : Nil
-      io << padding if value < 1000
-      pad3 value, padding
+      if padding == '0' && value >= 0 && value < 10000
+        v = value.to_i!
+        pairs = Crystal::DIGIT_PAIRS.to_slice
+        io.write_string pairs[(v // 100) &* 2, 2]
+        io.write_string pairs[(v % 100) &* 2, 2]
+      else
+        io << padding if value < 1000
+        pad3 value, padding
+      end
     end
 
     def pad6(value, padding) : Nil
