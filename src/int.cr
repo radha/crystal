@@ -64,6 +64,16 @@
 # ```
 #
 # See [`Integer` literals](https://crystal-lang.org/reference/syntax_and_semantics/literals/integers.html) in the language reference.
+module Crystal
+  # :nodoc:
+  #
+  # Concatenation of all two-digit decimal numbers from `00` to `99`. Indexing
+  # at `n * 2` yields the zero-padded two-character decimal representation of
+  # `n` for `0 <= n <= 99`. Used by base 10 integer and zero-padded time
+  # formatting to emit two digits per lookup instead of per-digit division.
+  DIGIT_PAIRS = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
+end
+
 struct Int
   alias Signed = Int8 | Int16 | Int32 | Int64 | Int128
   alias Unsigned = UInt8 | UInt16 | UInt32 | UInt64 | UInt128
@@ -710,10 +720,6 @@ struct Int
   private DIGITS_UPCASE   = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
   private DIGITS_BASE62   = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
-  # Concatenation of all two-digit decimal numbers from `00` to `99`, used by
-  # the base 10 fast path in `#internal_to_s` to emit two digits per iteration.
-  private DIGIT_PAIRS = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
-
   # Returns a string representation of this integer.
   #
   # *base* specifies the radix of the returned string, and must be either 62 or
@@ -835,7 +841,7 @@ struct Int
       # digit pairs. This halves the iteration count and, because the divisor is
       # the constant 100 (rather than the variable `base`), lets LLVM lower the
       # division to a magic-number multiply instead of a hardware divide.
-      pairs = DIGIT_PAIRS.to_unsafe
+      pairs = Crystal::DIGIT_PAIRS.to_unsafe
       while num != 0
         quotient = num.tdiv(100)
         # `num - quotient * 100` equals `num.remainder(100)`, always in -99..99.
