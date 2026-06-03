@@ -758,6 +758,20 @@ module Indexable(T)
     hasher
   end
 
+  # Returns `true` if the collection contains *obj*, `false` otherwise.
+  #
+  # ```
+  # [1, 2, 3].includes?(2) # => true
+  # [1, 2, 3].includes?(5) # => false
+  # ```
+  #
+  # This overrides `Enumerable#includes?` to reuse `#index`, so subtypes with a
+  # specialized `#index` (e.g. `Slice(UInt8)`'s `memchr` fast path) benefit
+  # without a separate `#includes?` override.
+  def includes?(obj) : Bool
+    !index(obj).nil?
+  end
+
   # Returns the index of the first appearance of *object* in `self`
   # starting from the given *offset*, or `nil` if *object* is not in `self`.
   #
