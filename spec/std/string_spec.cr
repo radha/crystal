@@ -2525,6 +2525,23 @@ describe "String" do
     it { "hello world\\r\\n".count("X-\\w").should eq(3) }
     it { "aabbcc".count('a').should eq(2) }
     it { "aabbcc".count(&.in?('a', 'b')).should eq(4) }
+
+    describe "by char" do
+      it { "".count('a').should eq(0) }
+      it { "aabbcc".count('z').should eq(0) }
+      it { ("x" * 1000).count('x').should eq(1000) }
+      # a non-ASCII char cannot occur in an ASCII (single-byte) string
+      it { "aabbcc".count('日').should eq(0) }
+      it { "aabbcc".count('\u{FFFD}').should eq(0) }
+      # in a single-byte string each invalid UTF-8 byte decodes to one replacement char
+      it { "abc\xFFdef\x80".count('\u{FFFD}').should eq(2) }
+      it { "abc\xFFdef\x80".count('a').should eq(1) }
+      it { "\xFF\xFE\x80".count('\u{FFFD}').should eq(3) }
+      # genuine multibyte strings still go through the char-decoding path
+      it { "日本語日本語".count('本').should eq(2) }
+      it { "café résumé".count('é').should eq(3) }
+      it { "café résumé".count('e').should eq(0) }
+    end
   end
 
   describe "squeeze" do

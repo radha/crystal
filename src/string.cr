@@ -2930,6 +2930,24 @@ class String
   # "aabbcc".count('a') # => 2
   # ```
   def count(other : Char) : Int32
+    # If it's ASCII we can delegate to the byte slice, mirroring `#index(Char)`.
+    if single_byte_optimizable?
+      # With `single_byte_optimizable?` there are only ASCII characters and
+      # invalid UTF-8 byte sequences (each decoding to a single replacement
+      # character), so anything that is neither ASCII nor the replacement
+      # character cannot occur.
+      case other
+      when .ascii?
+        return to_slice.count(other.ord.to_u8!)
+      when Char::REPLACEMENT
+        n = 0
+        to_slice.each { |byte| n += 1 if byte >= 0x80 }
+        return n
+      else
+        return 0
+      end
+    end
+
     count { |char| char == other }
   end
 
