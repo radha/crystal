@@ -1120,9 +1120,14 @@ module Enumerable(T)
     data = self.is_a?(Array) ? self.dup : self.to_a
     n = data.size
     count = n if count > n
-    (0...count).map do |i|
-      quickselect_internal(data, 0, n - 1, n - 1 - i)
-    end
+    return [] of T if count == 0
+
+    # Isolate the *count* largest elements into `data[n - count, count]` with a
+    # single quickselect partition (O(n) average), then sort just that tail
+    # descending (O(count·log count)). This replaces the previous approach of
+    # running quickselect once per output element, which was Θ(count·n).
+    quickselect_internal(data, 0, n - 1, n - count) if count < n
+    data[n - count, count].sort! { |a, b| compare_or_raise(b, a) }
   end
 
   # Returns the element for which the passed block returns with the maximum value.
@@ -1233,9 +1238,14 @@ module Enumerable(T)
     data = self.is_a?(Array) ? self.dup : self.to_a
     n = data.size
     count = n if count > n
-    (0...count).map do |i|
-      quickselect_internal(data, 0, n - 1, i)
-    end
+    return [] of T if count == 0
+
+    # Isolate the *count* smallest elements into `data[0, count]` with a single
+    # quickselect partition (O(n) average), then sort just that prefix ascending
+    # (O(count·log count)). This replaces the previous approach of running
+    # quickselect once per output element, which was Θ(count·n).
+    quickselect_internal(data, 0, n - 1, count - 1) if count < n
+    data[0, count].sort! { |a, b| compare_or_raise(a, b) }
   end
 
   # Returns the element for which the passed block returns with the minimum value.
