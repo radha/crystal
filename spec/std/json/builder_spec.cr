@@ -65,6 +65,26 @@ describe JSON::Builder do
     end
   end
 
+  it "escapes every control byte, DEL and the named escapes" do
+    named = {0x08 => "\\b", 0x09 => "\\t", 0x0a => "\\n", 0x0c => "\\f",
+             0x0d => "\\r", 0x22 => "\\\"", 0x5c => "\\\\"}
+    named.each do |byte, expected|
+      s = String.new(Bytes[byte.to_u8])
+      assert_built(%<"#{expected}">) { string(s) }
+    end
+
+    # Remaining C0 controls and DEL (0x7f) become lowercase, zero-padded \u00XX.
+    ((0x00..0x1f).to_a << 0x7f).each do |byte|
+      next if named.has_key?(byte)
+      s = String.new(Bytes[byte.to_u8])
+      assert_built(%<"\\u#{byte.to_s(16).rjust(4, '0')}">) { string(s) }
+    end
+  end
+
+  it "passes through multibyte UTF-8 (high bytes) verbatim" do
+    assert_built(%<"héllo · 日本語 · 😀">) { string("héllo · 日本語 · 😀") }
+  end
+
   it "errors if writing before document start" do
     json = JSON::Builder.new(IO::Memory.new)
     expect_raises JSON::Error, "Write before start_document" do

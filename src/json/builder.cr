@@ -138,6 +138,28 @@ class JSON::Builder
   end
 
   private class Escape < IO
+    # Marker for bytes that must be emitted as a `\u00XX` escape.
+    private UNICODE_ESCAPE = 'u'.ord.to_u8
+
+    # 256-entry classification table indexed by byte value. `0` means the byte
+    # can be copied through verbatim. For the seven short escapes the entry is
+    # the suffix character (e.g. `'b'` for `\b`, `'"'` for `\"`); for the
+    # remaining control bytes (`0x00`-`0x1f` and `0x7f`) it is `UNICODE_ESCAPE`,
+    # meaning `\u00XX`. Replaces a per-byte chained `case` with one table lookup.
+    private ESCAPE_TABLE = begin
+      table = StaticArray(UInt8, 256).new(0_u8)
+      table[0x08] = 'b'.ord.to_u8
+      table[0x09] = 't'.ord.to_u8
+      table[0x0a] = 'n'.ord.to_u8
+      table[0x0c] = 'f'.ord.to_u8
+      table[0x0d] = 'r'.ord.to_u8
+      table[0x22] = '"'.ord.to_u8
+      table[0x5c] = '\\'.ord.to_u8
+      (0x00..0x1f).each { |i| table[i] = UNICODE_ESCAPE if table[i] == 0_u8 }
+      table[0x7f] = UNICODE_ESCAPE
+      table
+    end
+
     def initialize(@io : IO)
     end
 
@@ -148,33 +170,31 @@ class JSON::Builder
     end
 
     def write(slice : Bytes) : Nil
+      table = ESCAPE_TABLE.to_unsafe
       cursor = start = slice.to_unsafe
       fin = cursor + slice.bytesize
 
       while cursor < fin
-        case byte = cursor.value
-        when '\\' then escape = "\\\\"
-        when '"'  then escape = "\\\""
-        when '\b' then escape = "\\b"
-        when '\f' then escape = "\\f"
-        when '\n' then escape = "\\n"
-        when '\r' then escape = "\\r"
-        when '\t' then escape = "\\t"
-        when .<(0x20), 0x7f # Char#ascii_control?
-          @io.write_string Slice.new(start, cursor - start)
-          @io << "\\u00"
-          @io << '0' if byte < 0x10
-          byte.to_s(@io, 16)
-          cursor += 1
-          start = cursor
-          next
-        else
+        byte = cursor.value
+        code = table[byte]
+        if code == 0_u8
           cursor += 1
           next
         end
 
         @io.write_string Slice.new(start, cursor - start)
-        @io << escape
+        if code == UNICODE_ESCAPE
+          @io << "\\u00"
+          @io << '0' if byte < 0x10
+          byte.to_s(@io, 16)
+        else
+          # Emit the two-byte `\x` escape in a single write rather than two
+          # separate `IO#<<` (each of which would UTF-8-encode a Char).
+          pair = uninitialized UInt8[2]
+          pair.to_unsafe[0] = 0x5c_u8 # '\\'
+          pair.to_unsafe[1] = code
+          @io.write_string pair.to_slice
+        end
         cursor += 1
         start = cursor
       end
