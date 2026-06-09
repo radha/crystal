@@ -455,6 +455,20 @@ describe "Regex" do
     /(.)|(.)/x.capture_count.should eq(2)
   end
 
+  it "#capture_count is stable when memoized, including zero groups" do
+    no_groups = /abc/
+    no_groups.capture_count.should eq(0)
+    no_groups.capture_count.should eq(0) # second read hits the memo (0 is truthy)
+
+    re = /(a)(b)(?<n>c)/
+    re.capture_count.should eq(3)
+    re.capture_count.should eq(3)
+    # Matching must still see the correct number of groups after memoization.
+    md = "abc".match(re).should_not be_nil
+    md.size.should eq(4)
+    md[3].should eq("c")
+  end
+
   describe "#inspect" do
     context "with literal-compatible options" do
       it "prints flags" do

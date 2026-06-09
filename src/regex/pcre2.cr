@@ -5,6 +5,7 @@ require "crystal/value_with_finalizer"
 module Regex::PCRE2
   @re : LibPCRE2::Code*
   @jit : Bool
+  @capture_count : Int32?
 
   def self.version : String
     String.new(24) do |pointer|
@@ -201,7 +202,12 @@ module Regex::PCRE2
   end
 
   private def capture_count_impl
-    pattern_info(LibPCRE2::INFO_CAPTURECOUNT).to_i32
+    # The capture count is a constant property of the compiled (immutable)
+    # pattern, but `#match_impl` needs it on every match to size the ovector.
+    # Memoize it so each match avoids a `pcre2_pattern_info` FFI call. The lazy
+    # `||=` may race across threads sharing one `Regex`, but the result is an
+    # idempotent constant, so a duplicated compute is harmless.
+    @capture_count ||= pattern_info(LibPCRE2::INFO_CAPTURECOUNT).to_i32
   end
 
   private def match_impl(str, byte_index, options)
