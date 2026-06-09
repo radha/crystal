@@ -1404,6 +1404,31 @@ describe "String" do
       "こんにちは世界".byte_index("ちは").should eq(9)
     end
 
+    it "gets byte index of string on dense haystacks (memchr-anchor / RK cutover)" do
+      # The needle's first byte matches everywhere but the whole needle only
+      # matches at the very end, forcing many failed compares and the fallback
+      # from the memchr anchor to Rabin-Karp.
+      {8, 17, 100, 5000}.each do |n|
+        ("a" * n + "ab").byte_index("ab").should eq(n)
+        ("a" * n + "ab").byte_index("ab", n).should eq(n)
+        ("a" * n).byte_index("ab").should be_nil
+        ("a" * n + "aZ").byte_index("aZ").should eq(n)
+      end
+      # Sparse: rare first byte, single memchr hit.
+      ("a" * 4096 + "needle").byte_index("needle").should eq(4096)
+      ("a" * 4096).byte_index("needle").should be_nil
+    end
+
+    it "handles byte_index(String) edge cases" do
+      "abc".byte_index("").should eq(0)
+      "abc".byte_index("", 3).should eq(3)
+      "abc".byte_index("", 4).should be_nil
+      "abc".byte_index("abcd").should be_nil # needle longer than haystack
+      "abc".byte_index("abc").should eq(0)   # needle == haystack
+      "abc".byte_index("c", -1).should eq(2)
+      "".byte_index("a").should be_nil
+    end
+
     it "gets byte index of regex" do
       str = "0123x"
       pattern = /x/

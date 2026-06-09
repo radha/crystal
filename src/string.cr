@@ -3866,9 +3866,44 @@ class String
 
     return bytesize < offset ? nil : offset if search.empty?
 
-    # Rabin-Karp algorithm
-    # https://en.wikipedia.org/wiki/Rabin%E2%80%93Karp_algorithm
+    nsize = search.bytesize
+    # The last byte offset at which the needle still fits in the haystack.
+    limit = bytesize - nsize
+    return nil if offset > limit
 
+    first = search.to_unsafe.value
+    needle = search.to_unsafe
+    haystack = to_unsafe
+    bytes = to_slice
+    fails = 0
+
+    # Anchor on the needle's first byte using `memchr` (`Slice#fast_index`),
+    # then confirm the whole needle with a `memcmp`. This skips over the bytes
+    # between candidate positions with SIMD instead of rolling a hash across
+    # every single one. On adversarially dense inputs — where the first byte
+    # matches almost everywhere but the full needle rarely does — fall back to
+    # Rabin-Karp once enough compares have failed, keeping the worst case
+    # linear. This is the hybrid strategy used by Go's `strings.Index`.
+    while offset <= limit
+      idx = bytes.fast_index(first, offset)
+      return nil if idx.nil? || idx > limit
+      return idx if (haystack + idx).memcmp(needle, nsize) == 0
+
+      offset = idx + 1
+      fails &+= 1
+      if fails >= 4 + (offset >> 4)
+        return byte_index_rabin_karp(search, offset)
+      end
+    end
+
+    nil
+  end
+
+  # Searches for *search* starting at byte *offset* with the Rabin-Karp
+  # algorithm (https://en.wikipedia.org/wiki/Rabin%E2%80%93Karp_algorithm).
+  # Used as the linear-time fallback for `#byte_index` once the memchr anchor
+  # has failed too many times on a dense haystack.
+  private def byte_index_rabin_karp(search : String, offset : Int32) : Int32?
     # calculate a rolling hash of search text (needle)
     search_hash = 0u32
     search.each_byte do |b|
