@@ -5491,7 +5491,35 @@ class String
       return @length
     end
 
-    @length = each_byte_index_and_char_index { }
+    ptr = to_unsafe
+    bytesize = @bytesize
+    byte_index = 0
+    char_index = 0
+    # Highest byte index at which a full 8-byte word still fits. Computed with
+    # wrapping subtraction so it simply goes negative (disabling the word path)
+    # when there are fewer than 8 bytes, with no overflow check or wrap-around.
+    word_limit = bytesize &- 8
+
+    # Counting codepoints is byte-identical to `each_byte_index_and_char_index`:
+    # a byte `< 0x80` is always a one-byte codepoint (`char_bytesize_at` returns
+    # 1 and only inspects that byte), so a maximal run of ASCII bytes can be
+    # tallied a machine word at a time. Every byte `>= 0x80` is still classified
+    # individually, preserving the exact byte-by-byte resync over invalid UTF-8.
+    while byte_index < bytesize
+      if byte_index <= word_limit &&
+         (ptr + byte_index).as(UInt64*).value & 0x8080808080808080_u64 == 0
+        byte_index &+= 8
+        char_index &+= 8
+      elsif ptr[byte_index] < 0x80
+        byte_index &+= 1
+        char_index &+= 1
+      else
+        byte_index &+= char_bytesize_at(byte_index)
+        char_index &+= 1
+      end
+    end
+
+    @length = char_index
   end
 
   # Returns `true` if this String is comprised in its entirety
@@ -5502,14 +5530,30 @@ class String
   # "你好".ascii_only?    # => false
   # ```
   def ascii_only? : Bool
-    if @bytesize == size
-      each_byte do |byte|
-        return false unless byte < 0x80
-      end
-      true
-    else
-      false
+    return true if @bytesize == 0
+    # If the codepoint count is already known and differs from the byte count,
+    # some character spans more than one byte, so the string is not ASCII-only.
+    return false if @length > 0 && @length != @bytesize
+
+    # A string is ASCII-only exactly when no byte has its high bit set (this
+    # holds for invalid UTF-8 too: any byte >= 0x80 is non-ASCII). Accumulate
+    # all bytes with OR rather than returning early on the first non-ASCII byte;
+    # the reduction auto-vectorizes whereas a loop-carried early-out would not.
+    ptr = to_unsafe
+    acc = 0_u8
+    i = 0
+    while i < @bytesize
+      acc |= ptr[i]
+      i &+= 1
     end
+
+    return false unless acc < 0x80
+
+    # Every byte is one-byte ASCII, so the codepoint count equals the byte
+    # count. Memoize it only when not already known, matching `size`: a string
+    # whose `@length` is preset (e.g. a read-only literal) must not be written.
+    @length = @bytesize if @length == 0
+    true
   end
 
   # :nodoc:

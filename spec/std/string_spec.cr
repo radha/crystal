@@ -2388,6 +2388,30 @@ describe "String" do
     it "broken UTF-8 is not ascii_only" do
       "\xED\xA0\x80\xED\xBF\xBF".ascii_only?.should be_false
     end
+
+    it "does not mutate a read-only literal whose length is preset (#regression)" do
+      # An ASCII literal has its codepoint count precomputed and lives in
+      # read-only memory; `ascii_only?` must not store back into it.
+      "hello".ascii_only?.should be_true
+      "hello".ascii_only?.should be_true
+    end
+
+    it "is false for an invalid single byte even when size == bytesize" do
+      # \xff is one byte and counts as one codepoint (size == bytesize), but it
+      # is not ASCII — the scan must still inspect the high bit.
+      str = String.new(Bytes[0xff_u8])
+      str.size.should eq(1)
+      str.ascii_only?.should be_false
+    end
+
+    it "scans ASCII across word/vector boundaries (lazy length)" do
+      [1, 7, 8, 9, 16, 17, 31, 32, 33].each do |n|
+        String.new(Bytes.new(n, 0x61_u8)).ascii_only?.should be_true
+        # one non-ASCII byte anywhere flips the result
+        bytes = Bytes.new(n) { |i| i == n - 1 ? 0x80_u8 : 0x61_u8 }
+        String.new(bytes).ascii_only?.should be_false
+      end
+    end
   end
 
   describe "#scan" do
@@ -2516,6 +2540,46 @@ describe "String" do
 
   it "has size (same as size)" do
     "テスト".size.should eq(3)
+  end
+
+  describe "#size" do
+    # `String.new(Bytes)` leaves the codepoint count lazy (`@length == 0`), so
+    # these exercise the on-demand counting path (the SWAR ASCII-run skip),
+    # unlike literals/`*` which carry a precomputed length.
+    it "counts ASCII across word/vector boundaries" do
+      [0, 1, 7, 8, 9, 15, 16, 17, 23, 24, 25, 31, 32, 33, 64, 65, 127, 128].each do |n|
+        str = String.new(Bytes.new(n, 0x61_u8))
+        str.size.should eq(n)
+        str.ascii_only?.should be_true
+      end
+    end
+
+    it "counts a multibyte char at every offset around a word boundary" do
+      # 'を' is a 3-byte codepoint; placing it after k ASCII bytes must yield
+      # k + 1 codepoints regardless of where it lands relative to the 8-byte word.
+      (0..18).each do |k|
+        bytes = Bytes.new(k + 3) { |i| i < k ? 0x61_u8 : "を".to_slice[i - k] }
+        String.new(bytes).size.should eq(k + 1)
+      end
+    end
+
+    it "counts each invalid byte as one codepoint (byte-by-byte resync)" do
+      String.new(Bytes[0xff_u8]).size.should eq(1)
+      String.new(Bytes[0x80_u8, 0x80_u8, 0x80_u8]).size.should eq(3)
+      # lead byte followed by ASCII: lead is invalid (1), ASCII at next boundary (1)
+      String.new(Bytes[0xc2_u8, 0x41_u8]).size.should eq(2)
+      String.new(Bytes[0xf0_u8, 0x41_u8, 0x41_u8, 0x41_u8]).size.should eq(4)
+      # truncated multibyte at end: only the leading byte(s) are consumed
+      String.new(Bytes[0xe4_u8, 0xbd_u8]).size.should eq(2)
+      # ASCII + valid 2-byte + ASCII, straddling within a 16-byte window
+      String.new(Bytes[0x41_u8, 0xc3_u8, 0xa9_u8, 0x42_u8]).size.should eq(3)
+    end
+
+    it "memoizes the count without mutating read-only literals" do
+      str = String.new(Bytes.new(10, 0x61_u8))
+      str.size.should eq(10)
+      str.size.should eq(10) # second call hits the cache
+    end
   end
 
   describe "count" do
