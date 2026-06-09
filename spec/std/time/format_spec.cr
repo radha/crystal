@@ -215,6 +215,26 @@ describe Time::Format do
     end
   end
 
+  it "formats multiple date fields from a single decomposition (memo)" do
+    # A pattern referencing year, month, day and day-of-year must produce the
+    # same output as formatting each field independently — the cached `@ymd`
+    # decomposition must not desync across fields, including at leap days and
+    # year boundaries.
+    [
+      Time.utc(2024, 2, 29, 1, 2, 3), # leap day
+      Time.utc(2023, 12, 31, 23, 59, 59),
+      Time.utc(2024, 1, 1, 0, 0, 0),
+      Time.utc(1, 1, 1),
+      Time.utc(9999, 12, 31),
+      Time.utc(2000, 3, 1), # day after a leap day
+    ].each do |t|
+      expected = "#{t.to_s("%Y")}-#{t.to_s("%m")}-#{t.to_s("%d")} #{t.to_s("%j")} #{t.to_s("%B")}"
+      assert_prints t.to_s("%Y-%m-%d %j %B"), expected
+      # Re-decomposition order must not matter (day before year, etc.).
+      assert_prints t.to_s("%j-%d-%m-%Y"), "#{t.to_s("%j")}-#{t.to_s("%d")}-#{t.to_s("%m")}-#{t.to_s("%Y")}"
+    end
+  end
+
   it "parses empty" do
     t = Time.parse("", "", Time::Location.local)
     t.year.should eq(1)

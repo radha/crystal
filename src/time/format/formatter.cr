@@ -8,19 +8,30 @@ struct Time::Format
     getter io : IO
     getter time : Time
 
+    @ymd : {Int32, Int32, Int32, Int32}?
+
     def initialize(@time : Time, @io : IO)
     end
 
+    # Decompose the date once and reuse it across the year, month, day and
+    # day-of-year fields. A pattern such as `%Y-%m-%d` would otherwise re-run
+    # the full `Time#year_month_day_day_year` reduction for each field. The
+    # memo lives on this mutable struct and persists across the `#visit`
+    # traversal (`Time::Format#format` invokes `#visit` on a local variable).
+    private def ymd : {Int32, Int32, Int32, Int32}
+      @ymd ||= time.year_month_day_day_year
+    end
+
     def year : Nil
-      pad4(time.year, '0')
+      pad4(ymd[0], '0')
     end
 
     def year_modulo_100 : Nil
-      pad2(time.year % 100, '0')
+      pad2(ymd[0] % 100, '0')
     end
 
     def year_divided_by_100 : Nil
-      io << time.year // 100
+      io << ymd[0] // 100
     end
 
     def full_or_short_year : Nil
@@ -36,15 +47,15 @@ struct Time::Format
     end
 
     def month : Nil
-      io << time.month
+      io << ymd[1]
     end
 
     def month_zero_padded : Nil
-      pad2 time.month, '0'
+      pad2 ymd[1], '0'
     end
 
     def month_blank_padded : Nil
-      pad2 time.month, ' '
+      pad2 ymd[1], ' '
     end
 
     def month_name : Nil
@@ -68,15 +79,15 @@ struct Time::Format
     end
 
     def day_of_month : Nil
-      io << time.day
+      io << ymd[2]
     end
 
     def day_of_month_zero_padded : Nil
-      pad2 time.day, '0'
+      pad2 ymd[2], '0'
     end
 
     def day_of_month_blank_padded : Nil
-      pad2 time.day, ' '
+      pad2 ymd[2], ' '
     end
 
     def day_name : Nil
@@ -102,7 +113,7 @@ struct Time::Format
     end
 
     def day_of_year_zero_padded : Nil
-      pad3 time.day_of_year, '0'
+      pad3 ymd[3], '0'
     end
 
     def hour_24_zero_padded : Nil
@@ -239,7 +250,7 @@ struct Time::Format
     end
 
     def get_month_name
-      MONTH_NAMES[time.month - 1]
+      MONTH_NAMES[ymd[1] - 1]
     end
 
     def get_short_month_name
