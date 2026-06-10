@@ -862,8 +862,15 @@ abstract class IO
     # buffer windows are scanned with `Slice#fast_index` (memchr) instead
     # of reading one byte at a time. With an encoding the bytes must flow
     # through the decoder, and `peek` only exposes the raw, undecoded
-    # bytes, so the byte-at-a-time loop is used.
-    if !decoder() && (peek = self.peek)
+    # bytes, so the byte-at-a-time loop is used. The same goes when read
+    # buffering is disabled: filling the peek buffer would consume bytes
+    # from the underlying IO beyond the returned string.
+    use_peek = !decoder()
+    if (io = self).is_a?(IO::Buffered)
+      use_peek = false unless io.read_buffering?
+    end
+
+    if use_peek && (peek = self.peek)
       gets_peek(delimiter, chomp, peek)
     else
       gets_slow(delimiter, chomp, String::Builder.new)

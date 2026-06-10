@@ -325,6 +325,22 @@ describe IO do
       io.gets("ab").should be_nil
     end
 
+    {% if flag?(:unix) %}
+      it "gets with string as delimiter does not read ahead when read buffering is disabled" do
+        IO.pipe do |r, w|
+          w << "abXYcdef"
+          w.flush
+          w.close
+          r.read_buffering = false
+          r.gets("XY").should eq("abXY")
+          # The bytes after the delimiter must still be readable from the
+          # file descriptor itself, not buffered inside `r`.
+          other = IO::FileDescriptor.new(r.fd, close_on_finalize: false)
+          other.gets_to_end.should eq("cdef")
+        end
+      end
+    {% end %}
+
     it "does gets with limit" do
       io = SimpleIOMemory.new("hello\nworld\n")
       io.gets(3).should eq("hel")
