@@ -3604,9 +3604,98 @@ class String
     offset += size if offset < 0
     return if offset < 0
 
-    # Rabin-Karp algorithm
-    # https://en.wikipedia.org/wiki/Rabin%E2%80%93Karp_algorithm
+    # Non-integral offsets stay on the generic path below, whose `<=`
+    # comparison handles them like the original loop did.
+    if offset.is_a?(Int)
+      nsize = search.bytesize
+      return nil if nsize > bytesize
 
+      # The reverse search counts character positions the way the reverse
+      # Rabin-Karp always has: a character begins at every byte that is not a
+      # UTF-8 continuation byte (`String#size` can disagree with that count on
+      # invalid UTF-8, and results follow the byte count). Translate the
+      # character offset into a byte-position cap by counting those characters
+      # back from the end; every candidate at or below the cap satisfies the
+      # offset constraint.
+      haystack = to_unsafe
+      if offset >= size
+        cap = bytesize
+        cap_char = size
+      else
+        cap = rindex_byte_cap(size - offset.to_i32)
+        # Reachable only with invalid UTF-8, where fewer characters begin at
+        # a non-continuation byte than `size` reports: no position scans low
+        # enough to satisfy the offset.
+        return nil if cap < 0
+        cap_char = offset.to_i32
+      end
+
+      return cap_char if nsize == 0
+
+      limit = bytesize - nsize
+      pos = Math.min(cap, limit)
+      first = search.to_unsafe.value
+      needle = search.to_unsafe
+      bytes = to_slice
+      fails = 0
+      start_pos = pos
+
+      # For a tiny needle confirm candidates with inline byte compares
+      # instead of a `memcmp` call; the `nsize` guards are loop-invariant, so
+      # the optimizer unswitches them out of the loop.
+      n1 = nsize > 1 ? needle[1] : 0_u8
+      n2 = nsize > 2 ? needle[2] : 0_u8
+      n3 = nsize > 3 ? needle[3] : 0_u8
+
+      # Anchor on the needle's first byte with `Slice#fast_rindex` (a SWAR
+      # reverse `memchr`), then confirm the whole needle; the byte position
+      # of a confirmed match only needs translating back to a character
+      # index by counting the characters between it and the cap. On
+      # adversarially dense inputs — where the first byte matches almost
+      # everywhere but the full needle rarely does — fall back to a linear
+      # algorithm once enough compares have failed relative to the distance
+      # scanned, mirroring `#byte_index`.
+      while pos >= 0
+        idx = bytes.fast_rindex(first, pos)
+        return nil unless idx
+        matched = if nsize <= 4
+                    (nsize <= 1 || haystack[idx + 1] == n1) &&
+                      (nsize <= 2 || haystack[idx + 2] == n2) &&
+                      (nsize <= 3 || haystack[idx + 3] == n3)
+                  else
+                    (haystack + idx).memcmp(needle, nsize) == 0
+                  end
+        if matched
+          return cap_char - non_continuation_byte_count(idx, cap)
+        end
+
+        pos = idx - 1
+        fails &+= 1
+        if fails >= 4 + ((start_pos - pos) >> 4)
+          if nsize <= 4
+            if found = rindex_naive(search, pos)
+              return cap_char - non_continuation_byte_count(found, cap)
+            end
+            return nil
+          else
+            return rindex_by_rabin_karp(search, offset, haystack + cap, cap_char)
+          end
+        end
+      end
+
+      return nil
+    end
+
+    rindex_by_rabin_karp(search, offset, to_unsafe + bytesize, size)
+  end
+
+  # Reverse Rabin-Karp
+  # (https://en.wikipedia.org/wiki/Rabin%E2%80%93Karp_algorithm) over the
+  # byte range `[0, end_pointer)`, where *char_index* is the character index
+  # of *end_pointer*, counting a character at every non-continuation byte.
+  # Used as the generic path for `#rindex` and as its linear-time fallback
+  # when byte-domain anchoring keeps failing on a dense haystack.
+  private def rindex_by_rabin_karp(search : String, offset, end_pointer : Pointer(UInt8), char_index : Int32) : Int32?
     # calculate a rolling hash of search text (needle)
     search_hash = 0u32
     search.to_slice.reverse_each do |b|
@@ -3615,10 +3704,9 @@ class String
     pow = PRIME_RK &** search.bytesize
 
     hash = 0u32
-    char_index = size
 
     begin_pointer = to_unsafe
-    pointer = begin_pointer + bytesize
+    pointer = end_pointer
     tail_pointer = pointer
     hash_begin_pointer = pointer - search.bytesize
 
@@ -3650,6 +3738,93 @@ class String
       # update a rolling hash of this text (haystack)
       hash = hash &* PRIME_RK &+ byte &- pow &* tail_pointer.value
     end
+  end
+
+  # Brute-force reverse scan for *search* over candidate start positions
+  # `[0, pos]`, comparing bytes inline (no `memcmp` call). Linear-time
+  # fallback for `#rindex` on tiny needles once the anchored scan has failed
+  # too many times on a dense haystack; the `nsize` guards are
+  # loop-invariant, so the optimizer unswitches this into a flat compare
+  # chain per needle size. The caller guarantees
+  # `pos + search.bytesize <= bytesize`.
+  private def rindex_naive(search : String, pos : Int32) : Int32?
+    nsize = search.bytesize
+    needle = search.to_unsafe
+    haystack = to_unsafe
+
+    b0 = needle[0]
+    b1 = nsize > 1 ? needle[1] : 0_u8
+    b2 = nsize > 2 ? needle[2] : 0_u8
+    b3 = nsize > 3 ? needle[3] : 0_u8
+
+    while pos >= 0
+      if haystack[pos] == b0 &&
+         (nsize <= 1 || haystack[pos + 1] == b1) &&
+         (nsize <= 2 || haystack[pos + 2] == b2) &&
+         (nsize <= 3 || haystack[pos + 3] == b3)
+        return pos
+      end
+      pos -= 1
+    end
+
+    nil
+  end
+
+  # Returns the largest byte position `p` such that `[p, bytesize)` holds
+  # *remaining* non-continuation bytes — the byte position whose character
+  # index, counted the way the reverse Rabin-Karp does, equals the requested
+  # `#rindex` offset. Returns `-1` when no such position exists (possible
+  # only with invalid UTF-8). The caller guarantees `remaining >= 1`.
+  private def rindex_byte_cap(remaining : Int32) : Int32
+    ptr = to_unsafe
+
+    # Scalar scan with an early exit over the last partial block; with the
+    # default offset the target lies a needle's length from the end, so this
+    # usually finishes immediately.
+    floor = bytesize >= 64 ? bytesize - 64 : 0
+    cnt = 0
+    p = bytesize - 1
+    while p >= floor
+      if (ptr[p] & 0xC0) != 0x80
+        cnt += 1
+        return p if cnt == remaining
+      end
+      p -= 1
+    end
+
+    # Count whole blocks branchlessly (the tally vectorizes) while they fall
+    # short of the target count, then locate the exact byte within the last
+    # block with a scalar scan.
+    bound = floor
+    while bound >= 64
+      in_block = non_continuation_byte_count(bound - 64, bound)
+      break if cnt + in_block >= remaining
+      cnt += in_block
+      bound -= 64
+    end
+    p = bound - 1
+    while p >= 0
+      if (ptr[p] & 0xC0) != 0x80
+        cnt += 1
+        return p if cnt == remaining
+      end
+      p -= 1
+    end
+
+    -1
+  end
+
+  # Counts the bytes in `[from, to)` that are not UTF-8 continuation bytes —
+  # the number of characters the reverse Rabin-Karp counts across that range.
+  # The branchless tally auto-vectorizes.
+  private def non_continuation_byte_count(from : Int32, to : Int32) : Int32
+    ptr = to_unsafe
+    count = 0
+    while from < to
+      count &+= (ptr[from] & 0xC0) != 0x80 ? 1 : 0
+      from &+= 1
+    end
+    count
   end
 
   # Returns the index of the _last_ appearance of *search* in the string,

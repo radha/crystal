@@ -1207,6 +1207,32 @@ describe "String" do
       it { "foo baro baz".rindex("fg").should be_nil }
       it { "日本語日本語".rindex("日本").should eq(3) }
 
+      it "gets rindex on long haystacks" do
+        (("x" * 10_000) + "needle" + ("y" * 10_000)).rindex("needle").should eq(10_000)
+        (("x" * 10_000) + "needle").rindex("absent").should be_nil
+        ("needle" + ("x" * 10_000)).rindex("needle").should eq(0)
+        (("€" * 10_000) + "日本" + "€€").rindex("日本").should eq(10_000)
+      end
+
+      it "gets rindex when the needle's first byte is dense in the haystack" do
+        ("ab" + "a" * 10_000).rindex("ab").should eq(0)
+        (("a" * 99 + "b") + "a" * 10_000).rindex("a" * 99 + "b").should eq(0)
+      end
+
+      it "matches invalid UTF-8 like the reverse byte scan always did" do
+        # character positions count a character at every non-continuation
+        # byte, so a match after a lone continuation byte reports the byte
+        # scan's index, and positions inside multi-byte characters can match
+        "a\x82b".rindex("\x82").should eq(2)
+        "aé".rindex("\xA9", 2).should eq(2)
+        "aé".rindex("\xA9").should be_nil
+        "\x82\x82".rindex("").should eq(2)
+        "\x82\x82".rindex("", 1).should be_nil
+        "\x82\x82\x82".rindex("\x82", 0).should be_nil
+        "a\x82b".rindex("b", 1).should be_nil
+        "a\x82b".rindex("b", 2).should eq(2)
+      end
+
       describe "with offset" do
         it { "bbbb".rindex("b", 2).should eq(2) }
         it { "abbbb".rindex("b", 0).should be_nil }
@@ -1219,6 +1245,12 @@ describe "String" do
         it { "foo".rindex("", 3).should eq(3) }
         it { "foo".rindex("", 4).should eq(3) }
         it { "日本語日本語".rindex("日本", 2).should eq(0) }
+        it { (("needle" + "x" * 100) * 100).rindex("needle", 3).should eq(0) }
+
+        # Non-integral offsets compare like the generic scan always did
+        it { "aab".rindex("a", 1.5).should eq(1) }
+        it { "aab".rindex("b", 1.5).should be_nil }
+        it { "€a€a".rindex("a", 2.5).should eq(1) }
 
         # Check offset type
         it { "bbbb".rindex("b", 2_i64).should eq(2) }
