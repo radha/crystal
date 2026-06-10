@@ -4312,21 +4312,28 @@ class String
 
     single_byte_optimizable = single_byte_optimizable?
 
-    i = 0
-    stop = bytesize - separator.bytesize + 1
-    while i < stop
-      if (to_unsafe + i).memcmp(separator.to_unsafe, separator_bytesize) == 0
-        piece_bytesize = i - byte_offset
-        piece_size = single_byte_optimizable ? piece_bytesize : 0
-        unless remove_empty && piece_bytesize == 0
-          yield String.new(to_unsafe + byte_offset, piece_bytesize, piece_size)
-        end
-        yielded += 1
-        byte_offset = i + separator_bytesize
-        i += separator_bytesize - 1
-        break if limit && yielded + 1 == limit
+    # `byte_index` locates each occurrence with a memchr anchor (falling back
+    # to Rabin-Karp on dense haystacks), instead of a full separator compare
+    # at every byte position. A separator right at the cursor — runs of
+    # separators yielding empty pieces — is matched directly so it doesn't
+    # pay the search setup.
+    last_match_offset = bytesize - separator_bytesize
+    while byte_offset <= last_match_offset
+      if (to_unsafe + byte_offset).memcmp(separator.to_unsafe, separator_bytesize) == 0
+        i = byte_offset
+      else
+        i = byte_index(separator, byte_offset + 1)
+        break unless i
       end
-      i += 1
+
+      piece_bytesize = i - byte_offset
+      piece_size = single_byte_optimizable ? piece_bytesize : 0
+      unless remove_empty && piece_bytesize == 0
+        yield String.new(to_unsafe + byte_offset, piece_bytesize, piece_size)
+      end
+      yielded += 1
+      byte_offset = i + separator_bytesize
+      break if limit && yielded + 1 == limit
     end
 
     piece_bytesize = bytesize - byte_offset

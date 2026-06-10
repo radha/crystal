@@ -1527,6 +1527,19 @@ describe "String" do
       it { "=b".split("=").should eq(["", "b"]) }
       it { "=".split("=", 2).should eq(["", ""]) }
       it { "=".split("=", 2, remove_empty: true).should eq([] of String) }
+
+      it "splits a long haystack with sparse separators" do
+        ("#{"x" * 10_000};;" * 3).split(";;").should eq(["x" * 10_000, "x" * 10_000, "x" * 10_000, ""])
+      end
+
+      it "splits when the separator's first byte is dense in the haystack" do
+        ("a" * 10_000 + "ab").split("ab").should eq(["a" * 10_000, ""])
+      end
+
+      it "splits runs of adjacent separators" do
+        "a#{"--" * 5}b".split("--").should eq(["a", "", "", "", "", "b"])
+        "a#{"--" * 5}b".split("--", 3).should eq(["a", "", "#{"--" * 3}b"])
+      end
     end
 
     describe "by regex" do
