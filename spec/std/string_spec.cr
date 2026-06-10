@@ -1028,6 +1028,13 @@ describe "String" do
       it { "€€€".index("\x82\xAC").should be_nil }
       it { "€\xACa".index("\xACa").should eq(1) }
 
+      it "gets index when byte matches repeatedly land inside characters" do
+        # five non-boundary byte matches (inside each €) before the real one
+        "€a€a€a€a€a\xACa".index("\xACa").should eq(10)
+        ("€a" * 100 + "\xACa").index("\xACa").should eq(200)
+        ("€" * 100).index("\x82\xAC" + "€" * 10).should be_nil
+      end
+
       it "gets index in a long haystack" do
         (("x" * 10_000) + "needle").index("needle").should eq(10_000)
         (("x" * 10_000) + "needle").index("absent").should be_nil
@@ -1048,6 +1055,12 @@ describe "String" do
         it { "日本語日本語".index("本語", 2).should eq(4) }
         it { "\xFD\x9A\xAD\x50NG".index("PNG", 2).should eq(3) }
         it { "\xFD\x9A\xAD\x50NG".index("PNG", 4).should be_nil }
+
+        # Non-integral offsets round up, like the boundary walk always did
+        it { "aab".index("a", 0.5).should eq(1) }
+        it { "aab".index("a", 1.5).should be_nil }
+        it { "aab".index("ab", 1.5).should be_nil }
+        it { "€a€a".index("a", 0.5).should eq(1) }
 
         # Check offset type
         it { "foobarbaz".index("a", 5_i64).should eq(7) }

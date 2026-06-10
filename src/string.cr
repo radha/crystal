@@ -3353,8 +3353,20 @@ class String
   end
 
   # Prime number constant for the Rabin-Karp algorithm used by
-  # `String#rindex` and as the `String#byte_index` fallback.
+  # `String#index`, `String#rindex` and the `String#byte_index` fallback.
   private PRIME_RK = 2097169u32
+
+  # Update rolling hash for Rabin-Karp algorithm `String#index`.
+  private macro update_hash(n)
+    {% for i in 1..n %}
+      {% if i != 1 %}
+        byte = head_pointer.value
+      {% end %}
+      hash = hash &* PRIME_RK &+ pointer.value &- pow &* byte
+      pointer += 1
+      head_pointer += 1
+    {% end %}
+  end
 
   # Returns the index of the _first_ occurrence of *search* in the string, or `nil` if not present.
   # If *offset* is present, it defines the position to start the search.
@@ -3408,8 +3420,9 @@ class String
 
     # With only single-byte characters the character index of a match equals
     # its byte index, so the search can be delegated to `#byte_index` and its
-    # memchr anchor.
-    if single_byte_optimizable?
+    # memchr anchor. Non-integral offsets stay on the generic path below,
+    # whose `<` walk rounds them up like the original loop did.
+    if offset.is_a?(Int) && single_byte_optimizable?
       return nil if offset > bytesize
       return byte_index(search, offset.to_i32)
     end
@@ -3428,6 +3441,12 @@ class String
     # starting inside a character must be skipped, like the previous
     # boundary-stepping Rabin-Karp did. The character cursor only moves
     # forward, so boundary verification is amortized over the haystack.
+    # Every rejected candidate, however, costs a full needle compare inside
+    # `byte_index`; a needle that keeps byte-matching inside characters (it
+    # must start with a continuation or invalid byte) could turn that
+    # quadratic, so after a few rejections fall back to the linear
+    # boundary-stepping Rabin-Karp.
+    rejected = 0
     while b = byte_index(search, (pointer - to_unsafe).to_i32)
       target = to_unsafe + b
       while pointer < target
@@ -3435,9 +3454,57 @@ class String
         char_index += 1
       end
       return char_index if pointer == target
+
+      rejected += 1
+      return index_by_rabin_karp(search, char_index, pointer) if rejected >= 4
     end
 
     nil
+  end
+
+  # Searches for *search* with the Rabin-Karp algorithm
+  # (https://en.wikipedia.org/wiki/Rabin%E2%80%93Karp_algorithm), stepping
+  # through character boundaries starting at *char_index* / *head_pointer*.
+  # Used as the linear-time fallback for `#index` when byte-domain candidates
+  # keep landing inside characters.
+  private def index_by_rabin_karp(search : String, char_index : Int32, head_pointer : Pointer(UInt8))
+    # calculate a rolling hash of search text (needle)
+    search_hash = 0u32
+    search.each_byte do |b|
+      search_hash = search_hash &* PRIME_RK &+ b
+    end
+    pow = PRIME_RK &** search.bytesize
+
+    pointer = head_pointer
+    end_pointer = to_unsafe + bytesize
+
+    # calculate a rolling hash of this text (haystack)
+    hash = 0u32
+    hash_end_pointer = pointer + search.bytesize
+    return if hash_end_pointer > end_pointer
+    while pointer < hash_end_pointer
+      hash = hash &* PRIME_RK &+ pointer.value
+      pointer += 1
+    end
+
+    while true
+      # check hash equality and real string equality
+      if hash == search_hash && head_pointer.memcmp(search.to_unsafe, search.bytesize) == 0
+        return char_index
+      end
+
+      byte = head_pointer.value
+      char_bytesize = String.char_bytesize_at(head_pointer)
+      return if pointer + char_bytesize > end_pointer
+      case char_bytesize
+      when 1 then update_hash 1
+      when 2 then update_hash 2
+      when 3 then update_hash 3
+      else        update_hash 4
+      end
+
+      char_index += 1
+    end
   end
 
   # :ditto:
@@ -3848,14 +3915,16 @@ class String
     haystack = to_unsafe
     bytes = to_slice
     fails = 0
+    start_offset = offset
 
     # Anchor on the needle's first byte using `memchr` (`Slice#fast_index`),
     # then confirm the whole needle with a `memcmp`. This skips over the bytes
     # between candidate positions with SIMD instead of rolling a hash across
     # every single one. On adversarially dense inputs — where the first byte
     # matches almost everywhere but the full needle rarely does — fall back to
-    # Rabin-Karp once enough compares have failed, keeping the worst case
-    # linear. This is the hybrid strategy used by Go's `strings.Index`.
+    # Rabin-Karp once enough compares have failed relative to the distance
+    # scanned by this call, keeping the worst case linear. This is the hybrid
+    # strategy used by Go's `strings.Index`.
     while offset <= limit
       idx = bytes.fast_index(first, offset)
       return nil if idx.nil? || idx > limit
@@ -3863,7 +3932,7 @@ class String
 
       offset = idx + 1
       fails &+= 1
-      if fails >= 4 + (offset >> 4)
+      if fails >= 4 + ((offset - start_offset) >> 4)
         return byte_index_rabin_karp(search, offset)
       end
     end
@@ -4284,18 +4353,35 @@ class String
 
     single_byte_optimizable = single_byte_optimizable?
 
+    separator_pointer = separator.to_unsafe
+    first_byte = separator_pointer.value
+
     # `byte_index` locates each occurrence with a memchr anchor (falling back
     # to Rabin-Karp on dense haystacks), instead of a full separator compare
-    # at every byte position. A separator right at the cursor — runs of
-    # separators yielding empty pieces — is matched directly so it doesn't
-    # pay the search setup.
+    # at every byte position. It wins once the next separator is some
+    # distance away; short pieces — a separator within the next few bytes —
+    # would pay more for the search setup than for the bytes in between, so
+    # probe a small window with plain compares first.
     last_match_offset = bytesize - separator_bytesize
     while byte_offset <= last_match_offset
-      if (to_unsafe + byte_offset).memcmp(separator.to_unsafe, separator_bytesize) == 0
+      if to_unsafe[byte_offset] == first_byte && (to_unsafe + byte_offset).memcmp(separator_pointer, separator_bytesize) == 0
         i = byte_offset
       else
-        i = byte_index(separator, byte_offset + 1)
-        break unless i
+        i = nil
+        probe = byte_offset + 1
+        probe_limit = Math.min(byte_offset + 16, last_match_offset)
+        while probe <= probe_limit
+          if to_unsafe[probe] == first_byte && (to_unsafe + probe).memcmp(separator_pointer, separator_bytesize) == 0
+            i = probe
+            break
+          end
+          probe += 1
+        end
+
+        unless i
+          i = byte_index(separator, probe)
+          break unless i
+        end
       end
 
       piece_bytesize = i - byte_offset
