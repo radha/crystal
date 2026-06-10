@@ -1024,6 +1024,20 @@ describe "String" do
       it { "\xFD\x9A\xAD\x50NG".index("PNG").should eq(3) }
       it { "🧲$".index("✅").should be_nil } # #11745
 
+      # a byte-level match inside a character is not a match
+      it { "€€€".index("\x82\xAC").should be_nil }
+      it { "€\xACa".index("\xACa").should eq(1) }
+
+      it "gets index in a long haystack" do
+        (("x" * 10_000) + "needle").index("needle").should eq(10_000)
+        (("x" * 10_000) + "needle").index("absent").should be_nil
+        (("€" * 10_000) + "日本").index("日本").should eq(10_000)
+      end
+
+      it "gets index when the needle's first byte is dense in the haystack" do
+        ("a" * 10_000 + "ab").index("ab").should eq(10_000)
+      end
+
       describe "with offset" do
         it { "foobarbaz".index("ba", 4).should eq(6) }
         it { "foobarbaz".index("ba", -5).should eq(6) }

@@ -3352,20 +3352,9 @@ class String
     end
   end
 
-  # Prime number constant for Rabin-Karp algorithm `String#index`.
+  # Prime number constant for the Rabin-Karp algorithm used by
+  # `String#rindex` and as the `String#byte_index` fallback.
   private PRIME_RK = 2097169u32
-
-  # Update rolling hash for Rabin-Karp algorithm `String#index`.
-  private macro update_hash(n)
-    {% for i in 1..n %}
-      {% if i != 1 %}
-        byte = head_pointer.value
-      {% end %}
-      hash = hash &* PRIME_RK &+ pointer.value &- pow &* byte
-      pointer += 1
-      head_pointer += 1
-    {% end %}
-  end
 
   # Returns the index of the _first_ occurrence of *search* in the string, or `nil` if not present.
   # If *offset* is present, it defines the position to start the search.
@@ -3417,55 +3406,38 @@ class String
 
     return size < offset ? nil : offset if search.empty?
 
-    # Rabin-Karp algorithm
-    # https://en.wikipedia.org/wiki/Rabin%E2%80%93Karp_algorithm
-
-    # calculate a rolling hash of search text (needle)
-    search_hash = 0u32
-    search.each_byte do |b|
-      search_hash = search_hash &* PRIME_RK &+ b
+    # With only single-byte characters the character index of a match equals
+    # its byte index, so the search can be delegated to `#byte_index` and its
+    # memchr anchor.
+    if single_byte_optimizable?
+      return nil if offset > bytesize
+      return byte_index(search, offset.to_i32)
     end
-    pow = PRIME_RK &** search.bytesize
 
-    # Find start index with offset
+    # Find the byte position of char `offset`
     char_index = 0
     pointer = to_unsafe
     end_pointer = pointer + bytesize
     while char_index < offset && pointer < end_pointer
-      char_bytesize = String.char_bytesize_at(pointer)
-      pointer += char_bytesize
+      pointer += String.char_bytesize_at(pointer)
       char_index += 1
     end
 
-    head_pointer = pointer
-
-    # calculate a rolling hash of this text (haystack)
-    hash = 0u32
-    hash_end_pointer = pointer + search.bytesize
-    return if hash_end_pointer > end_pointer
-    while pointer < hash_end_pointer
-      hash = hash &* PRIME_RK &+ pointer.value
-      pointer += 1
+    # Locate candidates in the byte domain with `#byte_index`, then verify
+    # that the matched byte position falls on a character boundary — a match
+    # starting inside a character must be skipped, like the previous
+    # boundary-stepping Rabin-Karp did. The character cursor only moves
+    # forward, so boundary verification is amortized over the haystack.
+    while b = byte_index(search, (pointer - to_unsafe).to_i32)
+      target = to_unsafe + b
+      while pointer < target
+        pointer += String.char_bytesize_at(pointer)
+        char_index += 1
+      end
+      return char_index if pointer == target
     end
 
-    while true
-      # check hash equality and real string equality
-      if hash == search_hash && head_pointer.memcmp(search.to_unsafe, search.bytesize) == 0
-        return char_index
-      end
-
-      byte = head_pointer.value
-      char_bytesize = String.char_bytesize_at(head_pointer)
-      return if pointer + char_bytesize > end_pointer
-      case char_bytesize
-      when 1 then update_hash 1
-      when 2 then update_hash 2
-      when 3 then update_hash 3
-      else        update_hash 4
-      end
-
-      char_index += 1
-    end
+    nil
   end
 
   # :ditto:
