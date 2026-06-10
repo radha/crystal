@@ -857,23 +857,117 @@ abstract class IO
       return gets(delimiter[0], chomp: chomp)
     end
 
-    # The 'hard' case: we read until we match the last byte,
-    # and then compare backwards
-    last_byte = delimiter.byte_at(delimiter.bytesize - 1)
-    total_bytes = 0
+    # The 'hard' case: we scan for the delimiter's last byte and then
+    # compare backwards. If there's no encoding and we can peek, whole
+    # buffer windows are scanned with `Slice#fast_index` (memchr) instead
+    # of reading one byte at a time. With an encoding the bytes must flow
+    # through the decoder, and `peek` only exposes the raw, undecoded
+    # bytes, so the byte-at-a-time loop is used.
+    if !decoder() && (peek = self.peek)
+      gets_peek(delimiter, chomp, peek)
+    else
+      gets_slow(delimiter, chomp, String::Builder.new)
+    end
+  end
 
-    buffer = String::Builder.new
+  private def gets_peek(delimiter : String, chomp, peek) : String?
+    return nil if peek.empty?
+
+    delimiter_bytesize = delimiter.bytesize
+    last_byte = delimiter.byte_at(delimiter_bytesize - 1)
+
+    # We first check if the delimiter is already in the peek buffer: in
+    # that case it's much faster to create a String from a slice of the
+    # buffer instead of appending to a String::Builder. Candidates are the
+    # positions of the delimiter's last byte. Within this first window the
+    # window offset equals the offset of the bytes read by this call, so a
+    # candidate ending before `delimiter_bytesize` cannot be a match.
+    scan_offset = 0
+    while scan_offset < peek.size
+      # A candidate right at the cursor — runs of the last byte — is taken
+      # directly so it doesn't pay for a `memchr` call per byte.
+      if peek.to_unsafe[scan_offset] == last_byte
+        idx = scan_offset
+      else
+        idx = peek.fast_index(last_byte, scan_offset + 1)
+        break unless idx
+      end
+
+      end_offset = idx + 1
+      if end_offset >= delimiter_bytesize &&
+         (peek.to_unsafe + (end_offset - delimiter_bytesize)).memcmp(delimiter.to_unsafe, delimiter_bytesize) == 0
+        string = String.new(peek[0, chomp ? end_offset - delimiter_bytesize : end_offset])
+        skip(end_offset)
+        return string
+      end
+      scan_offset = end_offset
+    end
+
+    # The delimiter does not end inside the first window: append whole
+    # windows to a String::Builder and compare candidates against the
+    # builder's tail, since a delimiter may span window boundaries.
+    String.build do |buffer|
+      buffer.write peek
+      skip(peek.size)
+
+      found = false
+
+      until found
+        peek = self.peek
+
+        unless peek
+          # If for some reason this IO became unpeekable,
+          # default to the slow method. One example where this can
+          # happen is `IO::Delimited`.
+          return gets_slow(delimiter, chomp, buffer)
+        end
+
+        break if peek.empty?
+
+        written = 0
+        while written < peek.size
+          if peek.to_unsafe[written] == last_byte
+            idx = written
+          else
+            idx = peek.fast_index(last_byte, written + 1)
+            break unless idx
+          end
+
+          buffer.write peek[written, idx + 1 - written]
+          written = idx + 1
+          if buffer.bytesize >= delimiter_bytesize &&
+             (buffer.buffer + (buffer.bytesize - delimiter_bytesize)).memcmp(delimiter.to_unsafe, delimiter_bytesize) == 0
+            found = true
+            break
+          end
+        end
+
+        unless found
+          buffer.write peek[written, peek.size - written]
+          written = peek.size
+        end
+
+        skip(written)
+      end
+
+      buffer.back(delimiter_bytesize) if chomp && found
+    end
+  end
+
+  private def gets_slow(delimiter : String, chomp, buffer : String::Builder) : String?
+    delimiter_bytesize = delimiter.bytesize
+    last_byte = delimiter.byte_at(delimiter_bytesize - 1)
+
     while true
       unless byte = read_utf8_byte
         return buffer.empty? ? nil : buffer.to_s
       end
       buffer.write_byte(byte)
-      total_bytes += 1
 
       if (byte == last_byte) &&
-         (buffer.bytesize >= delimiter.bytesize) &&
-         (buffer.buffer + total_bytes - delimiter.bytesize).memcmp(delimiter.to_unsafe, delimiter.bytesize) == 0
-        buffer.back(delimiter.bytesize) if chomp
+         (buffer.bytesize >= delimiter_bytesize) &&
+         (buffer.buffer + (buffer.bytesize - delimiter_bytesize)).memcmp(delimiter.to_unsafe, delimiter_bytesize) == 0
+        buffer.back(delimiter_bytesize) if chomp
         break
       end
     end
