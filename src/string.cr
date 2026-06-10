@@ -3933,8 +3933,45 @@ class String
       offset = idx + 1
       fails &+= 1
       if fails >= 4 + ((offset - start_offset) >> 4)
-        return byte_index_rabin_karp(search, offset)
+        # For a tiny needle a failed compare costs at most a few register
+        # compares, so a brute-force scan stays linear with a smaller
+        # constant than rolling a hash; Rabin-Karp protects longer needles,
+        # whose partial matches can make failed compares expensive.
+        if nsize <= 4
+          return byte_index_naive(search, offset)
+        else
+          return byte_index_rabin_karp(search, offset)
+        end
       end
+    end
+
+    nil
+  end
+
+  # Brute-force scan for *search* starting at byte *offset*, comparing bytes
+  # inline (no `memcmp` call). Used as the linear-time fallback for
+  # `#byte_index` on tiny needles once the memchr anchor has failed too many
+  # times on a dense haystack. The `nsize` guards are loop-invariant, so the
+  # optimizer unswitches this into a flat compare chain per needle size.
+  private def byte_index_naive(search : String, offset : Int32) : Int32?
+    nsize = search.bytesize
+    limit = bytesize - nsize
+    needle = search.to_unsafe
+    haystack = to_unsafe
+
+    b0 = needle[0]
+    b1 = nsize > 1 ? needle[1] : 0_u8
+    b2 = nsize > 2 ? needle[2] : 0_u8
+    b3 = nsize > 3 ? needle[3] : 0_u8
+
+    while offset <= limit
+      if haystack[offset] == b0 &&
+         (nsize <= 1 || haystack[offset + 1] == b1) &&
+         (nsize <= 2 || haystack[offset + 2] == b2) &&
+         (nsize <= 3 || haystack[offset + 3] == b3)
+        return offset
+      end
+      offset += 1
     end
 
     nil
