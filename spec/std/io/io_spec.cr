@@ -98,6 +98,36 @@ private class OneByOneIO < IO
   end
 end
 
+# Exposes the data through a bounded peek window, optionally becoming
+# unpeekable after a number of peeks (like `IO::Delimited` can).
+private class WindowedPeekIO < IO
+  @bytes : Bytes
+
+  def initialize(string, @window : Int32, @unpeek_after : Int32? = nil)
+    @bytes = string.to_slice
+    @pos = 0
+    @peeks = 0
+  end
+
+  def read(slice : Bytes)
+    count = Math.min(slice.size, @bytes.size - @pos)
+    slice.copy_from(@bytes.to_unsafe + @pos, count)
+    @pos += count
+    count
+  end
+
+  def write(slice : Bytes) : Nil
+  end
+
+  def peek : Bytes?
+    @peeks += 1
+    if (unpeek_after = @unpeek_after) && @peeks > unpeek_after
+      return nil
+    end
+    Bytes.new(@bytes.to_unsafe + @pos, Math.min(@window, @bytes.size - @pos))
+  end
+end
+
 describe IO do
   describe "partial read" do
     it "doesn't block on first read.  blocks on 2nd read" do
@@ -254,6 +284,45 @@ describe IO do
       io.gets('\n').should eq("hello\n")
       io.gets('\n').should eq("world\n")
       io.gets('\n').should eq("bye")
+    end
+
+    it "gets with string as delimiter from a peekable IO" do
+      io = IO::Memory.new("hello world")
+      io.gets("lo").should eq("hello")
+      io.gets("rl").should eq(" worl")
+      io.gets("foo").should eq("d")
+      io.gets("foo").should be_nil
+
+      io = IO::Memory.new("ab+ab+x")
+      io.gets("ab", chomp: true).should eq("")
+      io.gets("ab", chomp: true).should eq("+")
+      io.gets("ab", chomp: true).should eq("+x")
+    end
+
+    it "gets with string as delimiter spanning peek windows" do
+      [1, 2, 3, 7].each do |window|
+        io = WindowedPeekIO.new("aaXYbbXYc", window)
+        io.gets("XY").should eq("aaXY")
+        io.gets("XY", chomp: true).should eq("bb")
+        io.gets("XY").should eq("c")
+        io.gets("XY").should be_nil
+      end
+    end
+
+    it "gets with string as delimiter when the IO becomes unpeekable" do
+      io = WindowedPeekIO.new("aaXYbbXYc", 2, unpeek_after: 1)
+      io.gets("XY").should eq("aaXY")
+      io.gets("XY", chomp: true).should eq("bb")
+      io.gets("XY").should eq("c")
+      io.gets("XY").should be_nil
+    end
+
+    it "gets with string as delimiter whose last byte is frequent" do
+      io = IO::Memory.new("aaaab" + "a" * 20 + "ab" + "aa")
+      io.gets("ab", chomp: true).should eq("aaa")
+      io.gets("ab", chomp: true).should eq("a" * 20)
+      io.gets("ab", chomp: true).should eq("aa")
+      io.gets("ab").should be_nil
     end
 
     it "does gets with limit" do
