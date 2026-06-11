@@ -3638,6 +3638,7 @@ class String
       needle = search.to_unsafe
       bytes = to_slice
       fails = 0
+      charged = 0_i64
       start_pos = pos
 
       # For a tiny needle confirm candidates with inline byte compares
@@ -3653,8 +3654,8 @@ class String
       # index by counting the characters between it and the cap. On
       # adversarially dense inputs — where the first byte matches almost
       # everywhere but the full needle rarely does — fall back to a linear
-      # algorithm once enough compares have failed relative to the distance
-      # scanned, mirroring `#byte_index`.
+      # algorithm once the worst-case cost of the failed compares outgrows
+      # the distance scanned, mirroring `#byte_index`.
       while pos >= 0
         idx = bytes.fast_rindex(first, pos)
         return nil unless idx
@@ -3672,13 +3673,34 @@ class String
         pos = idx - 1
         fails &+= 1
         if fails >= 4 + ((start_pos - pos) >> 4)
+          # For a tiny needle a failed compare costs at most a few register
+          # compares, so a brute-force scan stays linear with a smaller
+          # constant than rolling a hash; Rabin-Karp protects longer
+          # needles, whose partial matches can make failed compares
+          # expensive.
           if nsize <= 4
             if found = rindex_naive(search, pos)
               return cap_char - non_continuation_byte_count(found, cap)
             end
             return nil
           else
-            return rindex_by_rabin_karp(search, offset, haystack + cap, cap_char)
+            # The fallback must scan to the end of the string, not to the
+            # cap: the cap limits where a match may *start*, but a match
+            # starting at or below it can end up to `nsize` bytes past it.
+            # `rindex_by_rabin_karp` rejects starts above *offset* itself.
+            return rindex_by_rabin_karp(search, offset, haystack + bytesize, size)
+          end
+        end
+        if nsize > 4
+          # Anchors recurring no faster than once per 16 bytes never grow
+          # `fails` past the cap above, yet a periodic haystack can still
+          # make every failed compare run the needle's full length —
+          # quadratic when the anchors also recur faster than every `nsize`
+          # bytes. Charging each failure at that worst case catches exactly
+          # this zone.
+          charged &+= nsize
+          if charged >= 4_i64 &* nsize &+ (start_pos - pos)
+            return rindex_by_rabin_karp(search, offset, haystack + bytesize, size)
           end
         end
       end
@@ -4090,6 +4112,7 @@ class String
     haystack = to_unsafe
     bytes = to_slice
     fails = 0
+    charged = 0_i64
     start_offset = offset
 
     # Anchor on the needle's first byte using `memchr` (`Slice#fast_index`),
@@ -4097,9 +4120,9 @@ class String
     # between candidate positions with SIMD instead of rolling a hash across
     # every single one. On adversarially dense inputs — where the first byte
     # matches almost everywhere but the full needle rarely does — fall back to
-    # Rabin-Karp once enough compares have failed relative to the distance
-    # scanned by this call, keeping the worst case linear. This is the hybrid
-    # strategy used by Go's `strings.Index`.
+    # a linear algorithm once the worst-case cost of the failed compares
+    # outgrows the distance scanned by this call. This is the hybrid strategy
+    # used by Go's `strings.Index`.
     while offset <= limit
       idx = bytes.fast_index(first, offset)
       return nil if idx.nil? || idx > limit
@@ -4115,6 +4138,17 @@ class String
         if nsize <= 4
           return byte_index_naive(search, offset)
         else
+          return byte_index_rabin_karp(search, offset)
+        end
+      end
+      if nsize > 4
+        # Anchors recurring no faster than once per 16 bytes never grow
+        # `fails` past the cap above, yet a periodic haystack can still make
+        # every failed compare run the needle's full length — quadratic when
+        # the anchors also recur faster than every `nsize` bytes. Charging
+        # each failure at that worst case catches exactly this zone.
+        charged &+= nsize
+        if charged >= 4_i64 &* nsize &+ (offset - start_offset)
           return byte_index_rabin_karp(search, offset)
         end
       end

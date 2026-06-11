@@ -1045,6 +1045,16 @@ describe "String" do
         ("a" * 10_000 + "ab").index("ab").should eq(10_000)
       end
 
+      it "gets index when sparse anchors keep failing deep into the needle" do
+        # The anchor recurs every 20 bytes (too sparse for the fails guard)
+        # and every candidate matches 24 of the needle's 25 bytes, tripping
+        # the charged-cost fallback to Rabin-Karp.
+        block = "a" + "b" * 19
+        needle = block + "abbbc"
+        (block * 1_000).index(needle).should be_nil
+        (block * 1_000 + needle + block).index(needle).should eq(20_000)
+      end
+
       describe "with offset" do
         it { "foobarbaz".index("ba", 4).should eq(6) }
         it { "foobarbaz".index("ba", -5).should eq(6) }
@@ -1217,6 +1227,31 @@ describe "String" do
       it "gets rindex when the needle's first byte is dense in the haystack" do
         ("ab" + "a" * 10_000).rindex("ab").should eq(0)
         (("a" * 99 + "b") + "a" * 10_000).rindex("a" * 99 + "b").should eq(0)
+      end
+
+      it "gets rindex matches that end past the offset cap (RK fallback window)" do
+        # Dense anchors above the match trip the fails guard while the
+        # latest match starts at or below the cap but ends past it — the
+        # Rabin-Karp fallback must scan to the end of the string, not stop
+        # at the cap byte position.
+        haystack = "a" * 5_000 + "b" + "a" * 5_000
+        needle = "a" * 20 + "b" + "a" * 12
+        haystack.rindex(needle, 5_010).should eq(4_980)
+        haystack.rindex(needle, 4_990).should eq(4_980)
+        haystack.rindex(needle).should eq(4_980)
+        ("a" * 10_000).rindex("a" * 33).should eq(9_967)
+        ("ab" * 5_000).rindex("ab" * 16 + "a", 5_001).should eq(5_000)
+      end
+
+      it "gets rindex when sparse anchors keep failing deep into the needle" do
+        # The anchor recurs every 20 bytes (too sparse for the fails guard)
+        # and every candidate matches 24 of the needle's 25 bytes, tripping
+        # the charged-cost fallback to Rabin-Karp.
+        block = "a" + "b" * 19
+        needle = block + "abbbc"
+        (block * 1_000).rindex(needle).should be_nil
+        (block * 2 + needle + block * 1_000).rindex(needle).should eq(40)
+        (needle + block * 1_000).rindex(needle).should eq(0)
       end
 
       it "matches invalid UTF-8 like the reverse byte scan always did" do
@@ -1476,6 +1511,17 @@ describe "String" do
       # Sparse: rare first byte, single memchr hit.
       ("a" * 4096 + "needle").byte_index("needle").should eq(4096)
       ("a" * 4096).byte_index("needle").should be_nil
+    end
+
+    it "gets byte index of string when sparse anchors keep failing deep (charged-cost / RK cutover)" do
+      # The anchor recurs every 20 bytes (too sparse for the fails guard)
+      # and every candidate matches 24 of the needle's 25 bytes, tripping
+      # the charged-cost fallback to Rabin-Karp.
+      block = "a" + "b" * 19
+      needle = block + "abbbc"
+      (block * 1_000).byte_index(needle).should be_nil
+      (block * 1_000 + needle + block).byte_index(needle).should eq(20_000)
+      (block * 1_000 + needle + block).byte_index(needle, 100).should eq(20_000)
     end
 
     it "handles byte_index(String) edge cases" do
