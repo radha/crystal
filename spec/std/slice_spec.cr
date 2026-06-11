@@ -959,6 +959,70 @@ describe "Slice" do
         {% end %}
       end
     {% end %}
+
+    describe "#unstable_sort! on pre-sorted and adversarial inputs" do
+      # Exercises the no-swap partition short-circuit and the partial
+      # insertion sort bail-out.
+
+      it "sorts already sorted input" do
+        [16, 17, 128, 129, 130, 1000].each do |n|
+          slice = Slice.new(n) { |i| i }
+          slice.unstable_sort!
+          slice.should eq(Slice.new(n) { |i| i })
+        end
+      end
+
+      it "sorts reverse-sorted input" do
+        [128, 129, 130, 1000].each do |n|
+          slice = Slice.new(n) { |i| n - i }
+          slice.unstable_sort!
+          slice.should eq(Slice.new(n) { |i| i + 1 })
+        end
+      end
+
+      it "sorts nearly sorted input (partial insertion bail-out boundary)" do
+        # sorted but for a single far-displaced element: the first partition
+        # does no swaps yet one side needs more than the move budget
+        [200, 1000].each do |n|
+          arr = Array.new(n) { |i| i }
+          arr.delete_at(0)
+          arr.push(-1)
+          slice = Slice.new(arr.size) { |i| arr[i] }
+          slice.unstable_sort!
+          slice.to_a.should eq(arr.sort)
+        end
+      end
+
+      it "sorts a median-of-3 killer sequence" do
+        n = 1024
+        k = n // 2
+        killer = Array.new(n, 0)
+        k.times do |i|
+          killer[i] = i.even? ? i + 1 : k + i
+          killer[k + i] = 2 * (i + 1)
+        end
+        slice = Slice.new(n) { |i| killer[i] }
+        slice.unstable_sort!
+        slice.to_a.should eq(killer.sort)
+      end
+
+      it "matches stable sort on seeded random inputs, with and without a block" do
+        rng = Random.new(20260611)
+        50.times do
+          n = rng.rand(0..400)
+          arr = Array.new(n) { rng.rand(1 + rng.rand(n + 1)) }
+          ref = arr.sort
+
+          slice = Slice.new(n) { |i| arr[i] }
+          slice.unstable_sort!
+          slice.to_a.should eq(ref)
+
+          slice = Slice.new(n) { |i| arr[i] }
+          slice.unstable_sort! { |x, y| y <=> x }
+          slice.to_a.should eq(ref.reverse)
+        end
+      end
+    end
   end
 
   describe "<=>" do
