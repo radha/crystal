@@ -1,4 +1,7 @@
 struct Slice(T)
+  # `partial_insertion_sort!` gives up after moving this many elements.
+  private PARTIAL_INSERTION_LIMIT = 8
+
   protected def self.intro_sort!(a, n)
     return if n < 2
     quick_sort_for_intro_sort!(a, n, (n.bit_length - 1) * 2)
@@ -13,9 +16,18 @@ struct Slice(T)
       end
       d -= 1
       center_median!(a, n)
-      c = partition_for_quick_sort!(a, n)
-      quick_sort_for_intro_sort!(c, n - (c - a), d)
-      n = c - a
+      c, no_swaps = partition_for_quick_sort!(a, n)
+      l_size = c - a
+      r_size = n - l_size
+      # A decently balanced partition that required no swaps suggests the
+      # range is already mostly sorted; attempt a bounded insertion sort on
+      # both halves and skip recursing if both end up fully sorted.
+      if no_swaps && l_size >= n // 8 && r_size >= n // 8 &&
+         partial_insertion_sort!(a, l_size) && partial_insertion_sort!(c, r_size)
+        return
+      end
+      quick_sort_for_intro_sort!(c, r_size, d)
+      n = l_size
     end
   end
 
@@ -70,6 +82,18 @@ struct Slice(T)
 
   protected def self.partition_for_quick_sort!(a, n)
     v, l, r = a[n // 2], a + 1, a + n - 1
+    # First iteration peeled off: returning before any swap means the range
+    # was already partitioned around the pivot.
+    while cmp(l.value, v) < 0
+      l += 1
+    end
+    r -= 1
+    while cmp(v, r.value) < 0
+      r -= 1
+    end
+    return {l, true} unless l < r
+    l.value, r.value = r.value, l.value
+    l += 1
     loop do
       while cmp(l.value, v) < 0
         l += 1
@@ -78,7 +102,7 @@ struct Slice(T)
       while cmp(v, r.value) < 0
         r -= 1
       end
-      return l unless l < r
+      return {l, false} unless l < r
       l.value, r.value = r.value, l.value
       l += 1
     end
@@ -97,6 +121,28 @@ struct Slice(T)
     end
   end
 
+  # Insertion sort that gives up once more than `PARTIAL_INSERTION_LIMIT`
+  # elements have been moved, returning `false` with the range partially
+  # sorted (but still a permutation of its input).
+  protected def self.partial_insertion_sort!(a, n)
+    moves = 0_i64
+    (1...n).each do |i|
+      l = a + i
+      v = l.value
+      p = l - 1
+      if cmp(v, p.value) < 0
+        while l > a && cmp(v, p.value) < 0
+          l.value = p.value
+          l, p = p, p - 1
+        end
+        l.value = v
+        moves += (a + i) - l
+        return false if moves > PARTIAL_INSERTION_LIMIT
+      end
+    end
+    true
+  end
+
   protected def self.intro_sort!(a, n, comp)
     return if n < 2
     quick_sort_for_intro_sort!(a, n, (n.bit_length - 1) * 2, comp)
@@ -111,9 +157,18 @@ struct Slice(T)
       end
       d -= 1
       center_median!(a, n, comp)
-      c = partition_for_quick_sort!(a, n, comp)
-      quick_sort_for_intro_sort!(c, n - (c - a), d, comp)
-      n = c - a
+      c, no_swaps = partition_for_quick_sort!(a, n, comp)
+      l_size = c - a
+      r_size = n - l_size
+      # A decently balanced partition that required no swaps suggests the
+      # range is already mostly sorted; attempt a bounded insertion sort on
+      # both halves and skip recursing if both end up fully sorted.
+      if no_swaps && l_size >= n // 8 && r_size >= n // 8 &&
+         partial_insertion_sort!(a, l_size, comp) && partial_insertion_sort!(c, r_size, comp)
+        return
+      end
+      quick_sort_for_intro_sort!(c, r_size, d, comp)
+      n = l_size
     end
   end
 
@@ -168,6 +223,18 @@ struct Slice(T)
 
   protected def self.partition_for_quick_sort!(a, n, comp)
     v, l, r = a[n // 2], a + 1, a + n - 1
+    # First iteration peeled off: returning before any swap means the range
+    # was already partitioned around the pivot.
+    while l < a + n && cmp(l.value, v, comp) < 0
+      l += 1
+    end
+    r -= 1
+    while r >= a && cmp(v, r.value, comp) < 0
+      r -= 1
+    end
+    return {l, true} unless l < r
+    l.value, r.value = r.value, l.value
+    l += 1
     loop do
       while l < a + n && cmp(l.value, v, comp) < 0
         l += 1
@@ -176,7 +243,7 @@ struct Slice(T)
       while r >= a && cmp(v, r.value, comp) < 0
         r -= 1
       end
-      return l unless l < r
+      return {l, false} unless l < r
       l.value, r.value = r.value, l.value
       l += 1
     end
@@ -193,6 +260,28 @@ struct Slice(T)
       end
       l.value = v
     end
+  end
+
+  # Insertion sort that gives up once more than `PARTIAL_INSERTION_LIMIT`
+  # elements have been moved, returning `false` with the range partially
+  # sorted (but still a permutation of its input).
+  protected def self.partial_insertion_sort!(a, n, comp)
+    moves = 0_i64
+    (1...n).each do |i|
+      l = a + i
+      v = l.value
+      p = l - 1
+      if cmp(v, p.value, comp) < 0
+        while l > a && cmp(v, p.value, comp) < 0
+          l.value = p.value
+          l, p = p, p - 1
+        end
+        l.value = v
+        moves += (a + i) - l
+        return false if moves > PARTIAL_INSERTION_LIMIT
+      end
+    end
+    true
   end
 
   protected def self.cmp(v1, v2)
