@@ -1000,7 +1000,7 @@ struct Slice(T)
   # This sort operation modifies `self`. See `#sort` for a non-modifying option
   # that allocates a new instance.
   #
-  # The sort mechanism is implemented as [*merge sort*](https://en.wikipedia.org/wiki/Merge_sort).
+  # The sort mechanism is implemented as [*driftsort*](https://github.com/Voultapher/sort-research-rs/blob/main/writeup/driftsort_introduction/text.md).
   # It is stable, which is typically a good default.
   #
   # Stability means that two elements which compare equal (i.e. `a <=> b == 0`)
@@ -1022,7 +1022,7 @@ struct Slice(T)
     {% if T.union_types.size == 1 && (T <= Int::Primitive || T <= Char || T <= Enum || T <= Pointer || T <= Symbol || T <= Time::Span) %}
       unstable_sort!
     {% else %}
-      Slice.merge_sort!(self)
+      Slice.stable_sort!(self)
 
       self
     {% end %}
@@ -1079,7 +1079,7 @@ struct Slice(T)
   # This sort operation modifies `self`. See `#sort(&block : T, T -> U)` for a
   # non-modifying option that allocates a new instance.
   #
-  # The sort mechanism is implemented as [*merge sort*](https://en.wikipedia.org/wiki/Merge_sort).
+  # The sort mechanism is implemented as [*driftsort*](https://github.com/Voultapher/sort-research-rs/blob/main/writeup/driftsort_introduction/text.md).
   # It is stable, which is typically a good default.
   #
   # Stability means that two elements which compare equal (i.e. `a <=> b == 0`)
@@ -1096,7 +1096,7 @@ struct Slice(T)
       {% raise "Expected block to return Int32 or Nil, not #{U}.\nThe block is supposed to be a custom comparison operation, compatible with `Comparable#<=>`.\nDid you mean to use `#sort_by!`?" %}
     {% end %}
 
-    Slice.merge_sort!(self, block)
+    Slice.stable_sort!(self, block)
 
     self
   end
