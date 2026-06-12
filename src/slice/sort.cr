@@ -296,8 +296,12 @@ struct Slice(T)
     v
   end
 
-  # The stable sort implementation is ported from Rust.
-  # https://github.com/rust-lang/rust/blob/507bff92fadf1f25a830da5065a5a87113345163/library/alloc/src/slice.rs
+  # The stable sort implementation is a port of Rust's driftsort, by Orson
+  # Peters and Lukas Bergdoll.
+  # https://github.com/rust-lang/rust/tree/master/library/core/src/slice/sort/stable
+  #
+  # Design document:
+  # https://github.com/Voultapher/sort-research-rs/blob/main/writeup/driftsort_introduction/text.md
   #
   # Rust License (MIT):
   #
@@ -325,106 +329,382 @@ struct Slice(T)
   # IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
   # DEALINGS IN THE SOFTWARE.
 
-  # Slices of up to this length get sorted using insertion sort.
-  private MAX_INSERTION = 10
+  # Slices of up to this length get sorted using insertion sort; it is also
+  # the length below which the stable quicksort switches to insertion sort.
+  private STABLE_SMALL_SORT = 20
 
-  # Very short runs are extended using insertion sort to span at least this many elements.
-  private MIN_RUN = 10
+  # Above this length, pivot selection recursively computes a pseudomedian
+  # of the approximate medians of three sections instead of a plain median
+  # of 3.
+  private PSEUDO_MEDIAN_REC_THRESHOLD = 64
 
-  # This merge sort borrows some (but not all) ideas from TimSort, which is described in detail
-  # [here](http://svn.python.org/projects/python/trunk/Objects/listsort.txt).
+  # Pre-sorted runs shorter than roughly sqrt(n) are not worth tracking, see
+  # `drift_sort!`. For inputs of up to this threshold squared a constant
+  # threshold capped by half the input length is used instead, so that
+  # detection of fully or nearly sorted inputs keeps working.
+  private MIN_SQRT_RUN_LEN = 64
+
+  # The scratch buffer covers the whole input for inputs of up to this many
+  # bytes, so that the entire slice can be quicksorted, and is scaled back to
+  # `n - n // 2` (the longest span an unsorted logical run can reach) above
+  # it.
+  private STABLE_MAX_FULL_ALLOC_BYTES = 8_000_000
+
+  # Driftsort, a hybrid of bottom-up mergesort and top-down stable quicksort.
   #
-  # The algorithm identifies strictly descending and non-descending subsequences, which are called
-  # natural runs. There is a stack of pending runs yet to be merged. Each newly found run is pushed
-  # onto the stack, and then some pairs of adjacent runs are merged until these two invariants are
-  # satisfied:
-  #
-  # 1. for every `i` in `1..runs.len()`: `runs[i - 1].len > runs[i].len`
-  # 2. for every `i` in `2..runs.len()`: `runs[i - 2].len > runs[i - 1].len + runs[i].len`
-  #
-  # The invariants ensure that the total running time is `O(n * log(n))` worst-case.
-  protected def self.merge_sort!(v : Slice(T)) forall T
+  # The slice is scanned left to right, forming logical runs: pre-existing
+  # sorted runs of at least sqrt(n) elements are tracked as "sorted" runs,
+  # anything else becomes an "unsorted" run whose elements are only sorted
+  # (via stable quicksort) once the run has to be physically merged with a
+  # sorted neighbor. Adjacent unsorted runs combine without doing any work,
+  # so inputs with little pre-existing order get quicksorted in chunks as
+  # large as the scratch space allows, which both has better constants than
+  # merging and sorts inputs with k distinct values in O(n log k). The order
+  # in which runs are merged follows powersort's heuristic.
+  protected def self.stable_sort!(v : Slice(T)) forall T
     size = v.size
+    return if size < 2
 
-    # Short arrays get sorted in-place via insertion sort to avoid allocations.
-    if size <= MAX_INSERTION
-      if size >= 2
-        (size - 1).downto(0) { |i| insert_head!(v[i..]) }
-      end
+    if size <= STABLE_SMALL_SORT
+      insertion_sort!(v.to_unsafe, size)
       return
     end
 
-    # Allocate a buffer to use as scratch memory. We keep the length 0 so we can keep in it
-    # shallow copies of the contents of `v` without risking the dtors running on copies if
-    # `is_less` panics. When merging two sorted runs, this buffer holds a copy of the shorter run,
-    # which will always have length at most `len / 2`.
-    buf = Pointer(T).malloc(size // 2)
-
-    # In order to identify natural runs in `v`, we traverse it backwards. That might seem like a
-    # strange decision, but consider the fact that merges more often go in the opposite direction
-    # (forwards). According to benchmarks, merging forwards is slightly faster than merging
-    # backwards. To conclude, identifying runs by traversing backwards improves performance.
-    runs = [] of Range(Int32, Int32)
-    last = size
-    while last > 0
-      # Find the next natural run, and reverse it if it's strictly descending.
-      start = last - 1
-      if start > 0
-        start -= 1
-        if cmp(v[start + 1], v[start]) < 0
-          while start > 0 && cmp(v[start], v[start - 1]) < 0
-            start -= 1
-          end
-          v[start...last].reverse!
-        else
-          while start > 0 && cmp(v[start], v[start - 1]) > 0
-            start -= 1
-          end
-        end
-      end
-
-      # Insert some more elements into the run if it's too short. Insertion sort is faster than
-      # merge sort on short sequences, so this significantly improves performance.
-      while start > 0 && last - start < MIN_RUN
-        start -= 1
-        insert_head!(v[start...last])
-      end
-
-      # Push this run onto the stack.
-      runs.push(start...last)
-      last = start
-
-      # Merge some pairs of adjacent runs to satisfy the invariants.
-      while r = collapse(runs)
-        left = runs[r + 1]
-        right = runs[r]
-        merge!(v[left.begin...right.end], left.size, buf)
-        runs[r] = left.begin...right.end
-        runs.delete_at(r + 1)
-      end
+    # Fully ascending and descending inputs are common enough to deserve
+    # finishing in n - 1 comparisons without allocating any scratch space.
+    # The detected first run is handed down to `drift_sort!` so it is never
+    # scanned twice.
+    first_run_len, first_run_reversed = find_natural_run(v)
+    if first_run_len == size
+      v.reverse! if first_run_reversed
+      return
     end
+
+    scratch_len = Math.max(size - size // 2, Math.min(size, STABLE_MAX_FULL_ALLOC_BYTES // Math.max(sizeof(T), 1)))
+    scratch = Pointer(T).malloc(scratch_len)
+
+    # For small inputs quicksort is not yet beneficial: one or two
+    # small-sorts plus a single merge outperform it, so sort runs eagerly.
+    eager_sort = size <= STABLE_SMALL_SORT * 2
+    drift_sort!(v, scratch, scratch_len, eager_sort, first_run_len, first_run_reversed)
   end
 
-  # Inserts `v[0]` into pre-sorted sequence `v[1..]` so that whole `v[..]` becomes sorted.
+  # The main loop for driftsort: identifies logical runs and merges them in
+  # the order given by powersort's heuristic. If `eager_sort` is true, only
+  # small-sorts and physical merges are performed, ensuring O(n log n)
+  # worst-case complexity. Fully ascending and descending inputs are sorted
+  # with exactly n - 1 comparisons.
   #
-  # This is the integral subroutine of insertion sort.
-  protected def self.insert_head!(v)
-    if v.size >= 2 && cmp(v[1], v[0]) < 0
-      x, v[0] = v[0], v[1]
-      (2...v.size).each do |i|
-        if cmp(v[i], x) < 0
-          v[i - 1] = v[i]
-        else
-          v[i - 1] = x
-          return
-        end
+  # A non-negative *first_run_len* hands in the already detected (but not
+  # yet reversed) natural run at the start of `v`, saving a rescan.
+  protected def self.drift_sort!(v : Slice(T), scratch : Pointer(T), scratch_len, eager_sort, first_run_len = -1, first_run_reversed = false) forall T
+    size = v.size
+    return if size < 2
+
+    scale_factor = merge_tree_scale_factor(size)
+
+    # It's important to have a relatively high entry barrier for pre-sorted
+    # runs, as the presence of a single such run forces on average several
+    # merge operations and shrinks the maximum quicksort size a lot.
+    min_good_run_len =
+      if size <= MIN_SQRT_RUN_LEN * MIN_SQRT_RUN_LEN
+        Math.min(size - size // 2, MIN_SQRT_RUN_LEN)
+      else
+        sqrt_approx(size)
       end
-      v[v.size - 1] = x
+
+    # Stack of logical runs (length and sorted flag), plus the desired depth
+    # of the merge node between each run and its successor per powersort's
+    # heuristic. The desired depths on the stack are strictly increasing and
+    # `merge_tree_depth` is at most 64, so together with the initial dummy
+    # run the capacity of 66 can never be exceeded.
+    runs = uninitialized StaticArray(Tuple(Int32, Bool), 66)
+    desired_depths = uninitialized StaticArray(Int32, 66)
+    stack_len = 0
+
+    scan_idx = 0
+    prev_run_len = 0
+    prev_sorted = true # Initial dummy run.
+
+    loop do
+      # Compute the next run and the desired depth of the merge node between
+      # the previous and the next run. On the last iteration a dummy run with
+      # root-level desired depth fully collapses the merge tree.
+      if scan_idx < size
+        next_run_len, next_sorted =
+          if scan_idx == 0 && first_run_len >= 0
+            adopt_run(v, first_run_len, first_run_reversed, min_good_run_len, eager_sort)
+          else
+            create_run(v[scan_idx, size - scan_idx], min_good_run_len, eager_sort)
+          end
+        desired_depth = merge_tree_depth(scan_idx - prev_run_len, scan_idx, scan_idx + next_run_len, scale_factor)
+      else
+        next_run_len, next_sorted = 0, true
+        desired_depth = 0
+      end
+
+      # Process the merge nodes between earlier runs that desire to be deeper
+      # in the merge tree than the merge node between the previous and next
+      # run: pop the left neighbor run from the stack and merge it into the
+      # previous run.
+      while stack_len > 1 && desired_depths[stack_len - 1] >= desired_depth
+        left_run_len, left_sorted = runs[stack_len - 1]
+        merged_len = left_run_len + prev_run_len
+        merge_start = scan_idx - merged_len
+        prev_sorted = logical_merge!(v[merge_start, merged_len], scratch, scratch_len, left_run_len, left_sorted, prev_sorted)
+        prev_run_len = merged_len
+        stack_len -= 1
+      end
+
+      runs[stack_len] = {prev_run_len, prev_sorted}
+      desired_depths[stack_len] = desired_depth
+      stack_len += 1
+
+      # Break before overriding the last run with the dummy run.
+      break if scan_idx >= size
+
+      scan_idx += next_run_len
+      prev_run_len = next_run_len
+      prev_sorted = next_sorted
+    end
+
+    unless prev_sorted
+      stable_quicksort!(v, scratch, scratch_len)
     end
   end
 
-  # Merges non-decreasing runs `v[..mid]` and `v[mid..]` using `buf` as temporary storage, and
-  # stores the result into `v[..]`.
+  # Creates a new logical run over the start of `v`, returning its length
+  # and whether it is sorted. A pre-existing run that clears the
+  # `min_good_run_len` threshold is returned as a sorted run. Otherwise, if
+  # `eager_sort` is true a freshly sorted run of up to `STABLE_SMALL_SORT`
+  # elements is returned, and if it is false an unsorted run of up to
+  # `min_good_run_len` elements.
+  protected def self.create_run(v : Slice(T), min_good_run_len, eager_sort) forall T
+    if v.size >= min_good_run_len
+      run_len, was_reversed = find_natural_run(v)
+      adopt_run(v, run_len, was_reversed, min_good_run_len, eager_sort)
+    else
+      adopt_run(v, 0, false, min_good_run_len, eager_sort)
+    end
+  end
+
+  # Turns an already detected (not yet reversed) natural run at the start of
+  # `v` into a logical run, applying `create_run`'s policy.
+  protected def self.adopt_run(v : Slice(T), run_len, was_reversed, min_good_run_len, eager_sort) forall T
+    size = v.size
+    if run_len >= min_good_run_len
+      v[0, run_len].reverse! if was_reversed
+      return {run_len, true}
+    end
+
+    if eager_sort
+      run_len = Math.min(STABLE_SMALL_SORT, size)
+      insertion_sort!(v.to_unsafe, run_len)
+      {run_len, true}
+    else
+      {Math.min(min_good_run_len, size), false}
+    end
+  end
+
+  # Returns the length of the natural run at the start of `v`, and whether
+  # that run is strictly descending - in which case reversing it is a stable
+  # operation that sorts it.
+  protected def self.find_natural_run(v : Slice(T)) forall T
+    size = v.size
+    return {size, false} if size < 2
+
+    a = v.to_unsafe
+    run_len = 2
+    if cmp(a[1], a[0]) < 0
+      while run_len < size && cmp(a[run_len], a[run_len - 1]) < 0
+        run_len += 1
+      end
+      {run_len, true}
+    else
+      while run_len < size && cmp(a[run_len], a[run_len - 1]) >= 0
+        run_len += 1
+      end
+      {run_len, false}
+    end
+  end
+
+  # Merges the adjacent logical runs `v[0...mid]` and `v[mid...]`, returning
+  # whether the combined run is sorted. Two unsorted runs that still fit the
+  # scratch space simply combine into a bigger unsorted run, deferring the
+  # work; otherwise any unsorted side is quicksorted and the two runs are
+  # physically merged.
+  protected def self.logical_merge!(v : Slice(T), scratch : Pointer(T), scratch_len, mid, left_sorted, right_sorted) forall T
+    if v.size > scratch_len || left_sorted || right_sorted
+      stable_quicksort!(v[0, mid], scratch, scratch_len) unless left_sorted
+      stable_quicksort!(v[mid..], scratch, scratch_len) unless right_sorted
+      merge!(v, mid, scratch)
+      true
+    else
+      false
+    end
+  end
+
+  protected def self.stable_quicksort!(v : Slice(T), scratch : Pointer(T), scratch_len) forall T
+    # Limit the number of imbalanced partitions to `2 * floor(log2(len))`.
+    limit = 2 * ((v.size | 1).bit_length - 1)
+    stable_quicksort!(v, scratch, scratch_len, limit, Pointer(T).null)
+  end
+
+  # Sorts `v` recursively using stable quicksort, partitioning out-of-place
+  # through the scratch space, which `v` must fit (unsorted logical runs are
+  # never allowed to outgrow it). `ancestor_pivot` points at a copy of the
+  # pivot of the most recent partition this call descended right of, if any:
+  # every element of `v` then compares greater than or equal to it.
+  protected def self.stable_quicksort!(v : Slice(T), scratch : Pointer(T), scratch_len, limit, ancestor_pivot : Pointer(T)) forall T
+    raise "BUG: driftsort quicksort range exceeds the scratch space" if v.size > scratch_len
+
+    loop do
+      size = v.size
+
+      if size <= STABLE_SMALL_SORT
+        insertion_sort!(v.to_unsafe, size)
+        return
+      end
+
+      if limit == 0
+        # Too many bad pivots: switch to the O(n log n) fallback algorithm,
+        # driftsort in eager mode (it then performs only small-sorts and
+        # physical merges, and in particular never re-enters quicksort).
+        drift_sort!(v, scratch, scratch_len, true)
+        return
+      end
+      limit -= 1
+
+      pivot = v.unsafe_fetch(choose_stable_pivot(v))
+
+      # If the pivot is equal to our left ancestor pivot, all elements equal
+      # to it sort before everything else in `v`: partition with
+      # less-than-or-equal, putting them in front, and skip them entirely
+      # instead of recursing on them. This gives O(n log k) sorting for k
+      # distinct values, a strategy borrowed from pdqsort.
+      equal_partition = !ancestor_pivot.null? && cmp(ancestor_pivot.value, pivot) >= 0
+
+      num_lt = 0
+      unless equal_partition
+        num_lt = stable_partition!(v, scratch, pivot, 0)
+        # A pivot that is the minimum of `v` also makes the less-than part
+        # empty; the equal-partition pass is then what removes the pivot's
+        # duplicates and guarantees progress.
+        equal_partition = num_lt == 0
+      end
+
+      if equal_partition
+        num_le = stable_partition!(v, scratch, pivot, 1)
+        v = v[num_le..]
+        ancestor_pivot = Pointer(T).null
+        next
+      end
+
+      # Process the right side with recursion, the left side with the next
+      # loop iteration.
+      stable_quicksort!(v[num_lt..], scratch, scratch_len, limit, pointerof(pivot))
+      v = v[0, num_lt]
+    end
+  end
+
+  # Partitions `v` into the elements that compare less than (`bound = 0`) or
+  # at most equal to (`bound = 1`) `pivot`, which end up in front, and the
+  # rest at the back, both parts keeping their relative order: a stable
+  # partition. Returns the size of the front part.
+  #
+  # The elements are partitioned out-of-place into the scratch space - the
+  # front part filling it upwards from the bottom and the back part downwards
+  # from the top - and then copied back, un-reversing the back part.
+  protected def self.stable_partition!(v : Slice(T), scratch : Pointer(T), pivot : T, bound) forall T
+    size = v.size
+
+    scan = v.to_unsafe
+    num_left = 0
+    scratch_rev = scratch + size
+
+    i = 0
+    while i < size
+      x = scan[i]
+      towards_left = cmp(x, pivot) < bound
+      # The branchless core: select the destination side and store, without
+      # the value ever depending on a taken branch.
+      scratch_rev -= 1
+      dst = (towards_left ? scratch : scratch_rev) + num_left
+      dst.value = x
+      num_left += towards_left ? 1 : 0
+      i += 1
+    end
+
+    # The front part goes back as is. The back part was filled top-down in
+    # scan order, so copying it back in reverse restores its original
+    # relative order.
+    scan.copy_from(scratch, num_left)
+    num_right = size - num_left
+    dst = scan + num_left
+    src = scratch + size - 1
+    i = 0
+    while i < num_right
+      dst[i] = (src - i).value
+      i += 1
+    end
+
+    num_left
+  end
+
+  # Selects a pivot from `v`, as an index, without mutating `v`. Algorithm
+  # taken from glidesort by Orson Peters: an adaptive number of points is
+  # sampled, approximating the quality of a median of sqrt(n) elements.
+  protected def self.choose_stable_pivot(v : Slice(T)) forall T
+    size = v.size
+    base = v.to_unsafe
+    len_div_8 = size // 8
+
+    a = base                 # [0, n/8)
+    b = base + len_div_8 * 4 # [4n/8, 5n/8)
+    c = base + len_div_8 * 7 # [7n/8, n)
+
+    median =
+      if size < PSEUDO_MEDIAN_REC_THRESHOLD
+        median3(a, b, c)
+      else
+        median3_rec(a, b, c, len_div_8)
+      end
+    (median - base).to_i32
+  end
+
+  # Calculates an approximate median of 3 elements from sections `a`, `b`,
+  # `c`, or recursively from an approximation of each if they're large
+  # enough. By dividing the size of each section by 8 when recursing this
+  # samples f(n) = 3*f(n/8) -> O(n^(log(3)/log(8))) ~= O(n^0.528) elements.
+  protected def self.median3_rec(a : Pointer(T), b : Pointer(T), c : Pointer(T), n) forall T
+    if n * 8 >= PSEUDO_MEDIAN_REC_THRESHOLD
+      n8 = n // 8
+      a = median3_rec(a, a + n8 * 4, a + n8 * 7, n8)
+      b = median3_rec(b, b + n8 * 4, b + n8 * 7, n8)
+      c = median3_rec(c, c + n8 * 4, c + n8 * 7, n8)
+    end
+    median3(a, b, c)
+  end
+
+  # Calculates the median of 3 elements, as a pointer to it.
+  protected def self.median3(a : Pointer(T), b : Pointer(T), c : Pointer(T)) forall T
+    x = cmp(a.value, b.value) < 0
+    y = cmp(a.value, c.value) < 0
+    if x == y
+      # If both false then b, c <= a, and we want to return max(b, c).
+      # If both true then a < b, c, and we want to return min(b, c).
+      # Toggling the outcome of b < c by x gives this behavior.
+      z = cmp(b.value, c.value) < 0
+      z != x ? c : b
+    else
+      # Either c <= a < b or b <= a < c, thus a is the median.
+      a
+    end
+  end
+
+  # Merges non-decreasing runs `v[..mid]` and `v[mid..]` using `buf` as
+  # temporary storage (it must fit the shorter of the two runs), and stores
+  # the result into `v[..]`.
   protected def self.merge!(v, mid, buf)
     size = v.size
 
@@ -477,100 +757,325 @@ struct Slice(T)
     end
   end
 
-  # This merge sort borrows some (but not all) ideas from TimSort, which is described in detail
-  # [here](http://svn.python.org/projects/python/trunk/Objects/listsort.txt).
+  # Nearly-Optimal Mergesorts: Fast, Practical Sorting Methods That Optimally
+  # Adapt to Existing Runs by J. Ian Munro and Sebastian Wild.
   #
-  # The algorithm identifies strictly descending and non-descending subsequences, which are called
-  # natural runs. There is a stack of pending runs yet to be merged. Each newly found run is pushed
-  # onto the stack, and then some pairs of adjacent runs are merged until these two invariants are
-  # satisfied:
+  # This method forms a binary merge tree, where each internal node
+  # corresponds to a splitting point between the adjacent runs that have to
+  # be merged. If the array is visualized as the number line from 0 to 1, we
+  # want to find the dyadic fraction with smallest denominator that lies
+  # between the midpoints of the two to-be-merged slices. The exponent in the
+  # dyadic fraction indicates the desired depth in the binary merge tree this
+  # internal node wishes to have. This does not always correspond to the
+  # actual depth due to the inherent imbalance in runs, but we follow it as
+  # closely as possible.
   #
-  # 1. for every `i` in `1..runs.len()`: `runs[i - 1].len > runs[i].len`
-  # 2. for every `i` in `2..runs.len()`: `runs[i - 2].len > runs[i - 1].len + runs[i].len`
+  # As an optimization we rescale the number line from [0, 1) to [0, 2^62).
+  # Finding the simplest dyadic fraction between midpoints then corresponds
+  # to finding the most significant bit difference of the midpoints. We save
+  # `scale_factor = ceil(2^62 / n)` to perform this rescaling using a
+  # multiplication, avoiding having to repeatedly do integer divides. This
+  # rescaling isn't exact when n is not a power of two since we use integers
+  # and not reals, but the result is very close, and in fact when n < 2^30
+  # the resulting tree is equivalent as the approximation errors stay
+  # entirely in the lower order bits.
   #
-  # The invariants ensure that the total running time is `O(n * log(n))` worst-case.
-  protected def self.merge_sort!(v : Slice(T), comp) forall T
-    size = v.size
+  # Thus for the splitting point between two adjacent slices [a, b) and
+  # [b, c) the desired depth of the corresponding merge node is
+  # CLZ((a+b)*f ^ (b+c)*f), where CLZ counts the number of leading zeros in
+  # an integer and f is our scale factor. Note that we omitted the division
+  # by two in the midpoint calculations, as this simply shifts the bits by
+  # one position (and thus always adds one to the result), and we only care
+  # about the relative depths.
+  #
+  # `x = (a+b)*f` does not overflow: with a < n and b <= n we get
+  # `x < (2^62 / n + 1) * 2n = 2^63 + 2n`, which fits an unsigned 64-bit
+  # integer for any valid slice size.
+  @[AlwaysInline]
+  protected def self.merge_tree_scale_factor(n : Int32) : UInt64
+    ((1_u64 << 62) &+ n.to_u64 &- 1) // n.to_u64
+  end
 
-    # Short arrays get sorted in-place via insertion sort to avoid allocations.
-    if size <= MAX_INSERTION
-      if size >= 2
-        (size - 1).downto(0) { |i| insert_head!(v[i..], comp) }
-      end
+  # Note: output is < 64 when left < right as f*x and f*y must differ in some
+  # bit, and is <= 64 always.
+  @[AlwaysInline]
+  protected def self.merge_tree_depth(left, mid, right, scale_factor : UInt64) : Int32
+    x = left.to_u64 &+ mid.to_u64
+    y = mid.to_u64 &+ right.to_u64
+    ((scale_factor &* x) ^ (scale_factor &* y)).leading_zeros_count.to_i32!
+  end
+
+  # Approximates sqrt(n) as 2^(log2(n) / 2), with the exponent rounded up to
+  # compensate for the flooring integer log on average, followed by one
+  # iteration of Newton's method.
+  protected def self.sqrt_approx(n : Int32) : Int32
+    ilog = (n | 1).bit_length - 1
+    shift = (ilog + 1) // 2
+    ((1 << shift) + (n >> shift)) // 2
+  end
+
+  protected def self.stable_sort!(v : Slice(T), comp) forall T
+    size = v.size
+    return if size < 2
+
+    if size <= STABLE_SMALL_SORT
+      insertion_sort!(v.to_unsafe, size, comp)
       return
     end
 
-    # Allocate a buffer to use as scratch memory. We keep the length 0 so we can keep in it
-    # shallow copies of the contents of `v` without risking the dtors running on copies if
-    # `is_less` panics. When merging two sorted runs, this buffer holds a copy of the shorter run,
-    # which will always have length at most `len / 2`.
-    buf = Pointer(T).malloc(size // 2)
+    # Fully ascending and descending inputs are common enough to deserve
+    # finishing in n - 1 comparisons without allocating any scratch space.
+    # The detected first run is handed down to `drift_sort!` so it is never
+    # scanned twice.
+    first_run_len, first_run_reversed = find_natural_run(v, comp)
+    if first_run_len == size
+      v.reverse! if first_run_reversed
+      return
+    end
 
-    # In order to identify natural runs in `v`, we traverse it backwards. That might seem like a
-    # strange decision, but consider the fact that merges more often go in the opposite direction
-    # (forwards). According to benchmarks, merging forwards is slightly faster than merging
-    # backwards. To conclude, identifying runs by traversing backwards improves performance.
-    runs = [] of Range(Int32, Int32)
-    last = size
-    while last > 0
-      # Find the next natural run, and reverse it if it's strictly descending.
-      start = last - 1
-      if start > 0
-        start -= 1
-        if cmp(v[start + 1], v[start], comp) < 0
-          while start > 0 && cmp(v[start], v[start - 1], comp) < 0
-            start -= 1
+    scratch_len = Math.max(size - size // 2, Math.min(size, STABLE_MAX_FULL_ALLOC_BYTES // Math.max(sizeof(T), 1)))
+    scratch = Pointer(T).malloc(scratch_len)
+
+    # For small inputs quicksort is not yet beneficial: one or two
+    # small-sorts plus a single merge outperform it, so sort runs eagerly.
+    eager_sort = size <= STABLE_SMALL_SORT * 2
+    drift_sort!(v, scratch, scratch_len, eager_sort, first_run_len, first_run_reversed, comp)
+  end
+
+  # Identical to `drift_sort!` above, but using the comparator block.
+  protected def self.drift_sort!(v : Slice(T), scratch : Pointer(T), scratch_len, eager_sort, first_run_len, first_run_reversed, comp) forall T
+    size = v.size
+    return if size < 2
+
+    scale_factor = merge_tree_scale_factor(size)
+
+    min_good_run_len =
+      if size <= MIN_SQRT_RUN_LEN * MIN_SQRT_RUN_LEN
+        Math.min(size - size // 2, MIN_SQRT_RUN_LEN)
+      else
+        sqrt_approx(size)
+      end
+
+    runs = uninitialized StaticArray(Tuple(Int32, Bool), 66)
+    desired_depths = uninitialized StaticArray(Int32, 66)
+    stack_len = 0
+
+    scan_idx = 0
+    prev_run_len = 0
+    prev_sorted = true # Initial dummy run.
+
+    loop do
+      if scan_idx < size
+        next_run_len, next_sorted =
+          if scan_idx == 0 && first_run_len >= 0
+            adopt_run(v, first_run_len, first_run_reversed, min_good_run_len, eager_sort, comp)
+          else
+            create_run(v[scan_idx, size - scan_idx], min_good_run_len, eager_sort, comp)
           end
-          v[start...last].reverse!
-        else
-          while start > 0 && cmp(v[start], v[start - 1], comp) > 0
-            start -= 1
-          end
-        end
+        desired_depth = merge_tree_depth(scan_idx - prev_run_len, scan_idx, scan_idx + next_run_len, scale_factor)
+      else
+        next_run_len, next_sorted = 0, true
+        desired_depth = 0
       end
 
-      # Insert some more elements into the run if it's too short. Insertion sort is faster than
-      # merge sort on short sequences, so this significantly improves performance.
-      while start > 0 && last - start < MIN_RUN
-        start -= 1
-        insert_head!(v[start...last], comp)
+      while stack_len > 1 && desired_depths[stack_len - 1] >= desired_depth
+        left_run_len, left_sorted = runs[stack_len - 1]
+        merged_len = left_run_len + prev_run_len
+        merge_start = scan_idx - merged_len
+        prev_sorted = logical_merge!(v[merge_start, merged_len], scratch, scratch_len, left_run_len, left_sorted, prev_sorted, comp)
+        prev_run_len = merged_len
+        stack_len -= 1
       end
 
-      # Push this run onto the stack.
-      runs.push(start...last)
-      last = start
+      runs[stack_len] = {prev_run_len, prev_sorted}
+      desired_depths[stack_len] = desired_depth
+      stack_len += 1
 
-      # Merge some pairs of adjacent runs to satisfy the invariants.
-      while r = collapse(runs)
-        left = runs[r + 1]
-        right = runs[r]
-        merge!(v[left.begin...right.end], left.size, buf, comp)
-        runs[r] = left.begin...right.end
-        runs.delete_at(r + 1)
-      end
+      break if scan_idx >= size
+
+      scan_idx += next_run_len
+      prev_run_len = next_run_len
+      prev_sorted = next_sorted
+    end
+
+    unless prev_sorted
+      stable_quicksort!(v, scratch, scratch_len, comp)
     end
   end
 
-  # Inserts `v[0]` into pre-sorted sequence `v[1..]` so that whole `v[..]` becomes sorted.
-  #
-  # This is the integral subroutine of insertion sort.
-  protected def self.insert_head!(v, comp)
-    if v.size >= 2 && cmp(v[1], v[0], comp) < 0
-      x, v[0] = v[0], v[1]
-      (2...v.size).each do |i|
-        if cmp(v[i], x, comp) < 0
-          v[i - 1] = v[i]
-        else
-          v[i - 1] = x
-          return
-        end
-      end
-      v[v.size - 1] = x
+  protected def self.create_run(v : Slice(T), min_good_run_len, eager_sort, comp) forall T
+    if v.size >= min_good_run_len
+      run_len, was_reversed = find_natural_run(v, comp)
+      adopt_run(v, run_len, was_reversed, min_good_run_len, eager_sort, comp)
+    else
+      adopt_run(v, 0, false, min_good_run_len, eager_sort, comp)
     end
   end
 
-  # Merges non-decreasing runs `v[..mid]` and `v[mid..]` using `buf` as temporary storage, and
-  # stores the result into `v[..]`.
+  protected def self.adopt_run(v : Slice(T), run_len, was_reversed, min_good_run_len, eager_sort, comp) forall T
+    size = v.size
+    if run_len >= min_good_run_len
+      v[0, run_len].reverse! if was_reversed
+      return {run_len, true}
+    end
+
+    if eager_sort
+      run_len = Math.min(STABLE_SMALL_SORT, size)
+      insertion_sort!(v.to_unsafe, run_len, comp)
+      {run_len, true}
+    else
+      {Math.min(min_good_run_len, size), false}
+    end
+  end
+
+  protected def self.find_natural_run(v : Slice(T), comp) forall T
+    size = v.size
+    return {size, false} if size < 2
+
+    a = v.to_unsafe
+    run_len = 2
+    if cmp(a[1], a[0], comp) < 0
+      while run_len < size && cmp(a[run_len], a[run_len - 1], comp) < 0
+        run_len += 1
+      end
+      {run_len, true}
+    else
+      while run_len < size && cmp(a[run_len], a[run_len - 1], comp) >= 0
+        run_len += 1
+      end
+      {run_len, false}
+    end
+  end
+
+  protected def self.logical_merge!(v : Slice(T), scratch : Pointer(T), scratch_len, mid, left_sorted, right_sorted, comp) forall T
+    if v.size > scratch_len || left_sorted || right_sorted
+      stable_quicksort!(v[0, mid], scratch, scratch_len, comp) unless left_sorted
+      stable_quicksort!(v[mid..], scratch, scratch_len, comp) unless right_sorted
+      merge!(v, mid, scratch, comp)
+      true
+    else
+      false
+    end
+  end
+
+  protected def self.stable_quicksort!(v : Slice(T), scratch : Pointer(T), scratch_len, comp) forall T
+    # Limit the number of imbalanced partitions to `2 * floor(log2(len))`.
+    limit = 2 * ((v.size | 1).bit_length - 1)
+    stable_quicksort!(v, scratch, scratch_len, limit, Pointer(T).null, comp)
+  end
+
+  protected def self.stable_quicksort!(v : Slice(T), scratch : Pointer(T), scratch_len, limit, ancestor_pivot : Pointer(T), comp) forall T
+    raise "BUG: driftsort quicksort range exceeds the scratch space" if v.size > scratch_len
+
+    loop do
+      size = v.size
+
+      if size <= STABLE_SMALL_SORT
+        insertion_sort!(v.to_unsafe, size, comp)
+        return
+      end
+
+      if limit == 0
+        drift_sort!(v, scratch, scratch_len, true, -1, false, comp)
+        return
+      end
+      limit -= 1
+
+      pivot = v.unsafe_fetch(choose_stable_pivot(v, comp))
+
+      equal_partition = !ancestor_pivot.null? && cmp(ancestor_pivot.value, pivot, comp) >= 0
+
+      num_lt = 0
+      unless equal_partition
+        num_lt = stable_partition!(v, scratch, pivot, 0, comp)
+        equal_partition = num_lt == 0
+      end
+
+      if equal_partition
+        num_le = stable_partition!(v, scratch, pivot, 1, comp)
+        v = v[num_le..]
+        ancestor_pivot = Pointer(T).null
+        next
+      end
+
+      stable_quicksort!(v[num_lt..], scratch, scratch_len, limit, pointerof(pivot), comp)
+      v = v[0, num_lt]
+    end
+  end
+
+  protected def self.stable_partition!(v : Slice(T), scratch : Pointer(T), pivot : T, bound, comp) forall T
+    size = v.size
+
+    scan = v.to_unsafe
+    num_left = 0
+    scratch_rev = scratch + size
+
+    i = 0
+    while i < size
+      x = scan[i]
+      towards_left = cmp(x, pivot, comp) < bound
+      scratch_rev -= 1
+      dst = (towards_left ? scratch : scratch_rev) + num_left
+      dst.value = x
+      num_left += towards_left ? 1 : 0
+      i += 1
+    end
+
+    scan.copy_from(scratch, num_left)
+    num_right = size - num_left
+    dst = scan + num_left
+    src = scratch + size - 1
+    i = 0
+    while i < num_right
+      dst[i] = (src - i).value
+      i += 1
+    end
+
+    num_left
+  end
+
+  protected def self.choose_stable_pivot(v : Slice(T), comp) forall T
+    size = v.size
+    base = v.to_unsafe
+    len_div_8 = size // 8
+
+    a = base                 # [0, n/8)
+    b = base + len_div_8 * 4 # [4n/8, 5n/8)
+    c = base + len_div_8 * 7 # [7n/8, n)
+
+    median =
+      if size < PSEUDO_MEDIAN_REC_THRESHOLD
+        median3(a, b, c, comp)
+      else
+        median3_rec(a, b, c, len_div_8, comp)
+      end
+    (median - base).to_i32
+  end
+
+  protected def self.median3_rec(a : Pointer(T), b : Pointer(T), c : Pointer(T), n, comp) forall T
+    if n * 8 >= PSEUDO_MEDIAN_REC_THRESHOLD
+      n8 = n // 8
+      a = median3_rec(a, a + n8 * 4, a + n8 * 7, n8, comp)
+      b = median3_rec(b, b + n8 * 4, b + n8 * 7, n8, comp)
+      c = median3_rec(c, c + n8 * 4, c + n8 * 7, n8, comp)
+    end
+    median3(a, b, c, comp)
+  end
+
+  protected def self.median3(a : Pointer(T), b : Pointer(T), c : Pointer(T), comp) forall T
+    x = cmp(a.value, b.value, comp) < 0
+    y = cmp(a.value, c.value, comp) < 0
+    if x == y
+      z = cmp(b.value, c.value, comp) < 0
+      z != x ? c : b
+    else
+      a
+    end
+  end
+
+  # Merges non-decreasing runs `v[..mid]` and `v[mid..]` using `buf` as
+  # temporary storage (it must fit the shorter of the two runs), and stores
+  # the result into `v[..]`.
   protected def self.merge!(v, mid, buf, comp)
     size = v.size
 
@@ -620,32 +1125,6 @@ struct Slice(T)
       end
 
       (v + left).copy_from(buf, right)
-    end
-  end
-
-  # Examines the stack of runs and identifies the next pair of runs to merge. More specifically,
-  # if `r` is returned, that means `runs[r]` and `runs[r + 1]` must be merged next. If the
-  # algorithm should continue building a new run instead, `nil` is returned.
-  #
-  # TimSort is infamous for its buggy implementations, as described here:
-  # http://envisage-project.eu/timsort-specification-and-verification/
-  #
-  # The gist of the story is: we must enforce the invariants on the top four runs on the stack.
-  # Enforcing them on just top three is not sufficient to ensure that the invariants will still
-  # hold for *all* runs in the stack.
-  #
-  # This function correctly checks invariants for the top four runs. Additionally, if the top
-  # run starts at index 0, it will always demand a merge operation until the stack is fully
-  # collapsed, in order to complete the sort.
-  @[AlwaysInline]
-  protected def self.collapse(runs)
-    n = runs.size
-    if n >= 2 &&
-       (runs[n - 1].begin == 0 ||
-       runs[n - 2].size <= runs[n - 1].size ||
-       (n >= 3 && runs[n - 3].size <= runs[n - 2].size + runs[n - 1].size) ||
-       (n >= 4 && runs[n - 4].size <= runs[n - 3].size + runs[n - 2].size))
-      n >= 3 && runs[n - 3].size < runs[n - 1].size ? n - 3 : n - 2
     end
   end
 end

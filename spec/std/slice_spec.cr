@@ -1023,6 +1023,70 @@ describe "Slice" do
         end
       end
     end
+
+    describe "#sort! driftsort paths" do
+      # The stable sort lazily quicksorts regions without enough pre-existing
+      # order; these exercise its run detection, equal-element partition
+      # skipping, and fallback paths at sizes above the small-sort threshold.
+
+      it "stable sorts a large low-cardinality input" do
+        n = 10_000
+        slice = Slice.new(n) { |i| {(i &* 48271) % 5, i} }
+        slice.sort! { |x, y| x[0] <=> y[0] }
+        slice.each_cons_pair do |x, y|
+          (x[0] < y[0] || (x[0] == y[0] && x[1] < y[1])).should be_true
+        end
+      end
+
+      it "stable sorts an input with sorted runs separated by random gaps" do
+        rng = Random.new(20260611)
+        n = 8_192
+        arr = Array.new(n) { |i| (i % 700 < 600 ? i % 700 : rng.rand(n)) }
+        slice = Slice.new(n) { |i| {arr[i], i} }
+        slice.sort! { |x, y| x[0] <=> y[0] }
+        slice.each_cons_pair do |x, y|
+          (x[0] < y[0] || (x[0] == y[0] && x[1] < y[1])).should be_true
+        end
+      end
+
+      it "sorts large ascending, descending and all-equal inputs" do
+        n = 5_000
+        asc = Slice.new(n) { |i| {i, 0} }
+        asc.sort!
+        asc.to_a.should eq(Array.new(n) { |i| {i, 0} })
+
+        desc = Slice.new(n) { |i| {n - i, 0} }
+        desc.sort!
+        desc.to_a.should eq(Array.new(n) { |i| {i + 1, 0} })
+
+        equal = Slice.new(n) { |i| {7, i} }
+        equal.sort!
+        equal.to_a.should eq(Array.new(n) { |i| {7, i} })
+      end
+
+      it "sorts the default stable path for floats" do
+        rng = Random.new(20260611)
+        n = 30_000
+        arr = Array.new(n) { rng.rand(64).to_f64 / 2.0 }
+        slice = Slice.new(n) { |i| arr[i] }
+        slice.sort!
+        slice.to_a.should eq(arr.sort)
+      end
+
+      it "terminates and preserves all elements with an inconsistent block" do
+        n = 4_096
+        arr = Array.new(n) { |i| (i &* 48271) % n }
+        slice = Slice.new(n) { |i| arr[i] }
+        slice.sort! { |x, y| ((x ^ y) & 1) == 0 ? 1 : -1 }
+        slice.to_a.tally.should eq(arr.tally)
+      end
+
+      it "raises ArgumentError when a comparison returns nil, above the small-sort threshold" do
+        slice = Slice.new(100) { |i| (100 - i).to_f64 }
+        slice[50] = Float64::NAN
+        expect_raises(ArgumentError) { slice.sort! }
+      end
+    end
   end
 
   describe "<=>" do
