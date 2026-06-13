@@ -483,4 +483,10 @@ module Crystal::System::File
       LibC.SetFilePointerEx(handle, old_pos, nil, IO::Seek::Set)
     end
   end
+
+  # No copy-on-write clone fast path on Windows yet; the caller falls back to a
+  # regular copy.
+  def self.copy_clone?(src : ::File, dst : String) : Bool
+    false
+  end
 end
