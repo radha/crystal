@@ -1006,6 +1006,34 @@ describe "Slice" do
         slice.to_a.should eq(killer.sort)
       end
 
+      it "sorts an all-equal input" do
+        # The equal-element partition gathers the whole run ahead of an empty
+        # remainder; this must terminate without quadratic recursion.
+        [17, 128, 1000].each do |n|
+          slice = Slice.new(n, 7)
+          slice.unstable_sort!
+          slice.should eq(Slice.new(n, 7))
+        end
+      end
+
+      it "sorts large low-cardinality input (equal-element partition skip)" do
+        # Few distinct values exercise pdqsort's `partition_left` O(n log k)
+        # path, where runs of elements equal to the pivot are skipped.
+        rng = Random.new(20260613)
+        [2, 3, 8].each do |k|
+          n = 5_000
+          arr = Array.new(n) { rng.rand(0...k) }
+          ref = arr.sort
+          slice = Slice.new(n) { |i| arr[i] }
+          slice.unstable_sort!
+          slice.to_a.should eq(ref)
+
+          slice = Slice.new(n) { |i| arr[i] }
+          slice.unstable_sort! { |x, y| y <=> x }
+          slice.to_a.should eq(ref.reverse)
+        end
+      end
+
       it "matches stable sort on seeded random inputs, with and without a block" do
         rng = Random.new(20260611)
         50.times do
