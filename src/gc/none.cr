@@ -131,6 +131,11 @@ module GC
   {% end %}
 
   # :nodoc:
+  def self.start_mark_threads : Nil
+    # no-op: the `none` collector never marks
+  end
+
+  # :nodoc:
   def self.current_thread_stack_bottom : {Void*, Void*}
     {Pointer(Void).null, Pointer(Void).null}
   end

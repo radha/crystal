@@ -594,6 +594,9 @@ end
         # additional reinitialization
         ->Random::DEFAULT.new_seed,
         -> { Random.thread_default.new_seed },
+
+        # libgc resets to serial marking in a forked child; restart the markers:
+        ->GC.start_mark_threads,
       ] of -> Nil
     end
   end
