@@ -1822,6 +1822,43 @@ describe "File" do
         File.same_content?(src_path, out_path).should be_true
       end
     end
+
+    it "copies a large file" do
+      with_tempfile("cp-large-src.bin", "cp-large-out.bin") do |src_path, out_path|
+        bytes = Bytes.new(5 << 20) { |i| (i &* 31 &+ 7).to_u8! }
+        File.write(src_path, bytes)
+
+        File.copy(src_path, out_path)
+
+        File.size(out_path).should eq(bytes.size)
+        File.same_content?(src_path, out_path).should be_true
+      end
+    end
+
+    it "copies an empty file" do
+      with_tempfile("cp-empty-src.txt", "cp-empty-out.txt") do |src_path, out_path|
+        File.write(src_path, "")
+
+        File.copy(src_path, out_path)
+
+        File.exists?(out_path).should be_true
+        File.size(out_path).should eq(0)
+      end
+    end
+
+    it "produces a copy that is independent from the source" do
+      with_tempfile("cp-indep-src.txt", "cp-indep-out.txt") do |src_path, out_path|
+        File.write(src_path, "original")
+
+        File.copy(src_path, out_path)
+
+        # Mutating the source after the copy must not affect the destination,
+        # even when the copy was performed as a copy-on-write clone.
+        File.write(src_path, "changed!")
+
+        File.read(out_path).should eq("original")
+      end
+    end
   end
 
   describe File::Permissions do

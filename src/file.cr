@@ -653,9 +653,23 @@ class File < IO::FileDescriptor
   # File.copy("afile", "afile_copy")
   # File.info("afile_copy").permissions.value # => 0o600
   # ```
+  #
+  # On filesystems that support copy-on-write (such as APFS), the contents may
+  # be cloned (reflinked) rather than copied byte-for-byte, in which case
+  # additional metadata such as timestamps may also be preserved.
   def self.copy(src : String | Path, dst : String | Path) : Nil
     open_internal(src) do |s|
-      permissions = s.info.permissions
+      src_info = s.info
+      permissions = src_info.permissions
+
+      # Fast path: clone (reflink) the file on copy-on-write filesystems. This
+      # creates *dst* with the same contents and metadata (including permission
+      # bits) as *src* without copying any data. It only applies to regular
+      # files whose destination does not already exist.
+      if src_info.type.file?
+        return if Crystal::System::File.copy_clone?(s, dst.to_s)
+      end
+
       open_internal(dst, "wb", perm: permissions) do |d|
         # If permissions don't match, we opened a pre-existing file with
         # different permissions and need to change them explicitly.
@@ -664,7 +678,8 @@ class File < IO::FileDescriptor
           d.chmod(permissions)
         end
 
-        # TODO use sendfile or copy_file_range syscall. See #8926, #8919
+        # TODO: use the `copy_file_range` syscall on Linux for an in-kernel
+        # copy here. See #8926, #8919.
         IO.copy(s, d)
       end
     end

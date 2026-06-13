@@ -1,6 +1,14 @@
 require "c/sys/file"
 require "file/error"
 
+{% if flag?(:darwin) %}
+  lib LibC
+    # <sys/clonefile.h>: clones (reflinks) the file open as *src* to the path
+    # *dst* relative to the directory *dst_dirfd*.
+    fun fclonefileat(src : Int, dst_dirfd : Int, dst : Char*, flags : UInt32) : Int
+  end
+{% end %}
+
 # :nodoc:
 module Crystal::System::File
   def self.open(filename : String, mode : String, perm : Int32 | ::File::Permissions, blocking : Bool?) : {FileDescriptor::Handle, Bool}
@@ -221,5 +229,23 @@ module Crystal::System::File
     if code != 0
       raise ::File::Error.from_errno("Error truncating file", file: path)
     end
+  end
+
+  # Attempts to clone (reflink / copy-on-write) the regular file open as *src*
+  # to the path *dst*, returning `true` when the whole copy was performed this
+  # way. Returns `false` when cloning is not applicable — the destination
+  # already exists, the filesystem has no copy-on-write support, or the two
+  # paths live on different filesystems — and the caller must fall back to a
+  # regular copy. A clone copies the source's data and metadata (including its
+  # permission bits) without copying any data blocks.
+  def self.copy_clone?(src : ::File, dst : String) : Bool
+    {% if flag?(:darwin) %}
+      # `fclonefileat` only creates a new file: it fails with EEXIST when *dst*
+      # exists, ENOTSUP on a filesystem without clone support (e.g. not APFS),
+      # and EXDEV across filesystems. In all of these the caller falls back.
+      LibC.fclonefileat(src.fd, LibC::AT_FDCWD, dst.check_no_null_byte, 0) == 0
+    {% else %}
+      false
+    {% end %}
   end
 end
