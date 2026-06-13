@@ -7,6 +7,15 @@ require "file/error"
     # *dst* relative to the directory *dst_dirfd*.
     fun fclonefileat(src : Int, dst_dirfd : Int, dst : Char*, flags : UInt32) : Int
   end
+{% elsif flag?(:linux) && !flag?(:android) %}
+  lib LibC
+    # <unistd.h>: copies a range of data between two file descriptors in the
+    # kernel (Linux 4.5+, glibc 2.27+ / musl 1.2.2+; excluded on Android, where
+    # it is only exposed by the NDK from API 34). `off_in`/`off_out` are the
+    # 64-bit `loff_t*` offsets; passing null uses and advances each descriptor's
+    # own file offset.
+    fun copy_file_range(fd_in : Int, off_in : Int64*, fd_out : Int, off_out : Int64*, len : SizeT, flags : UInt) : SSizeT
+  end
 {% end %}
 
 # :nodoc:
@@ -248,4 +257,82 @@ module Crystal::System::File
       false
     {% end %}
   end
+
+  # Copies the contents of the regular file open as *src* to the regular file
+  # open as *dst* using an in-kernel copy, returning `true` when the copy was
+  # fully performed. Returns `false` when no in-kernel copy is available — and
+  # nothing has been written yet, so the caller falls back to `IO.copy`. Raises
+  # on an I/O error. Both descriptors are assumed to be at offset 0.
+  def self.copy_data(src : ::File, dst : ::File) : Bool
+    {% if flag?(:linux) && !flag?(:android) %}
+      copy_file_range(src, dst)
+    {% else %}
+      false
+    {% end %}
+  end
+
+  {% if flag?(:linux) && !flag?(:android) %}
+    # `copy_file_range` support cache: 0 = not probed, 1 = unavailable,
+    # 2 = available. Mirrors the strategy used by Rust's and Go's standard
+    # libraries: probe once, then never call an unsupported syscall again.
+    @@copy_file_range_support = Atomic(Int32).new(0)
+
+    private def self.copy_file_range(src : ::File, dst : ::File) : Bool
+      return false if @@copy_file_range_support.get == 1
+
+      written = 0_i64
+      # Every iteration ends in `return`, `raise` or `next`, so the loop never
+      # falls through (its type is `NoReturn`).
+      loop do
+        # Cap each round at 1 GiB (avoids EOVERFLOW on huge files); null offsets
+        # use and advance each descriptor's own file offset.
+        ret = LibC.copy_file_range(src.fd, Pointer(Int64).null, dst.fd, Pointer(Int64).null, 0x4000_0000, 0)
+
+        if ret > 0
+          @@copy_file_range_support.compare_and_set(0, 2)
+          written += ret.to_i64
+        elsif ret == 0
+          # A zero return is EOF once we have copied something. A zero on the
+          # very first call is either an empty source or the pre-5.19 silent
+          # failure on some virtual filesystems; fall back to a userspace copy.
+          return written > 0
+        else
+          errno = Errno.value
+          next if errno == Errno::EINTR
+
+          # Once any byte has been written the offsets have advanced, so we can
+          # no longer fall back to a fresh userspace copy — surface the error.
+          if written > 0
+            raise ::File::Error.from_os_error("Error copying file", errno, file: src.path, other: dst.path)
+          end
+
+          case errno
+          when Errno::EOVERFLOW
+            # The syscall works, the request was just too large; fall back.
+            return false
+          when Errno::ENOSYS, Errno::EOPNOTSUPP, Errno::EPERM
+            # Either the syscall is missing or a seccomp filter blocks it; probe
+            # with invalid descriptors to tell the two apart before giving up.
+            @@copy_file_range_support.set(probe_copy_file_range) if @@copy_file_range_support.get == 0
+            return false
+          when Errno::EXDEV, Errno::EINVAL, Errno::EBADF, Errno::EIO
+            # The syscall works, just not for this pair of files (cross-device,
+            # a non-regular file, an O_APPEND destination, ...); fall back.
+            @@copy_file_range_support.set(2) if @@copy_file_range_support.get == 0
+            return false
+          else
+            raise ::File::Error.from_os_error("Error copying file", errno, file: src.path, other: dst.path)
+          end
+        end
+      end
+    end
+
+    # Probes `copy_file_range` with invalid descriptors: a real syscall rejects
+    # them with EBADF, while a missing or seccomp-blocked one fails with
+    # ENOSYS/EPERM. Returns 2 (available) or 1 (unavailable).
+    private def self.probe_copy_file_range : Int32
+      LibC.copy_file_range(-1, Pointer(Int64).null, -1, Pointer(Int64).null, 1, 0)
+      Errno.value == Errno::EBADF ? 2 : 1
+    end
+  {% end %}
 end

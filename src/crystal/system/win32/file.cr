@@ -489,4 +489,10 @@ module Crystal::System::File
   def self.copy_clone?(src : ::File, dst : String) : Bool
     false
   end
+
+  # No in-kernel copy fast path on Windows yet; the caller falls back to
+  # `IO.copy`.
+  def self.copy_data(src : ::File, dst : ::File) : Bool
+    false
+  end
 end

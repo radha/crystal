@@ -671,16 +671,21 @@ class File < IO::FileDescriptor
       end
 
       open_internal(dst, "wb", perm: permissions) do |d|
+        dst_info = d.info
+
         # If permissions don't match, we opened a pre-existing file with
         # different permissions and need to change them explicitly.
         # The permission change does not have any effect on the open file descriptor d.
-        if d.info.permissions != permissions
+        if dst_info.permissions != permissions
           d.chmod(permissions)
         end
 
-        # TODO: use the `copy_file_range` syscall on Linux for an in-kernel
-        # copy here. See #8926, #8919.
-        IO.copy(s, d)
+        # Fast path: copy the contents with an in-kernel copy (`copy_file_range`)
+        # when both ends are regular files; otherwise fall back to a userspace
+        # copy.
+        kernel_copied = src_info.type.file? && dst_info.type.file? &&
+                        Crystal::System::File.copy_data(s, d)
+        IO.copy(s, d) unless kernel_copied
       end
     end
   end
