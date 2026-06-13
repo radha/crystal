@@ -59,6 +59,17 @@ module GC
   def self.disable
   end
 
+  def self.free_space_divisor : UInt64
+    0_u64
+  end
+
+  def self.free_space_divisor=(value : Int) : Int
+    value
+  end
+
+  def self.presize_heap(size : Int) : Nil
+  end
+
   def self.free(pointer : Void*) : Nil
     Crystal.trace :gc, "free"
 

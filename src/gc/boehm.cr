@@ -111,6 +111,14 @@ lib LibGC
   fun get_heap_usage_safe = GC_get_heap_usage_safe(heap_size : Word*, free_bytes : Word*, unmapped_bytes : Word*, bytes_since_gc : Word*, total_bytes : Word*)
   fun set_max_heap_size = GC_set_max_heap_size(Word)
 
+  # Heap-pacing knobs. A full collection is triggered roughly every
+  # `heap_size / free_space_divisor` bytes of allocation (default divisor 3);
+  # `GC_expand_hp` grows the heap immediately so early allocation doesn't trip
+  # repeated collections while the heap is still tiny.
+  fun set_free_space_divisor = GC_set_free_space_divisor(value : Word)
+  fun get_free_space_divisor = GC_get_free_space_divisor : Word
+  fun expand_hp = GC_expand_hp(number_of_bytes : SizeT) : Int
+
   fun get_prof_stats = GC_get_prof_stats(stats : ProfStats*, size : SizeT)
 
   fun get_start_callback = GC_get_start_callback : Void*
@@ -219,6 +227,53 @@ module GC
     end
   end
 
+  # Default initial heap floor applied at start-up unless overridden by the
+  # `CRYSTAL_GC_INITIAL_HEAP` environment variable (set it to `0` to disable).
+  # libgc's own default heap is only a few blocks, which forces a burst of
+  # collections during program start-up; an 8 MB floor avoids that at a
+  # negligible resident-memory cost (pages are committed lazily). See `.init`.
+  private DEFAULT_INITIAL_HEAP_SIZE = 8 * 1024 * 1024
+
+  # Applies heap-pacing tuning at start-up: an initial-heap floor and an optional
+  # free-space divisor override. The `CRYSTAL_GC_INITIAL_HEAP` and
+  # `CRYSTAL_GC_FREE_SPACE_DIVISOR` environment variables work on every platform,
+  # including Windows where libgc's own `GC_*` env vars are compiled out. Values
+  # accept an optional `k`/`m`/`g` (1024-based) suffix. Reads the raw C strings to
+  # avoid allocating during early init.
+  private def self.apply_heap_tuning : Nil
+    if divisor = env_size?("CRYSTAL_GC_FREE_SPACE_DIVISOR")
+      LibGC.set_free_space_divisor(LibGC::Word.new(divisor)) if divisor > 0
+    end
+
+    initial_heap = env_size?("CRYSTAL_GC_INITIAL_HEAP") || DEFAULT_INITIAL_HEAP_SIZE.to_u64
+    presize_heap(initial_heap) if initial_heap > 0
+  end
+
+  # Parses a non-negative size from the named environment variable, supporting an
+  # optional `k`/`m`/`g` (case-insensitive, 1024-based) suffix. Returns `nil`
+  # when the variable is unset; returns `0` for an unparseable or empty value.
+  private def self.env_size?(name : String) : UInt64?
+    ptr = LibC.getenv(name)
+    return nil if ptr.null?
+
+    value = 0_u64
+    i = 0
+    while (c = ptr[i]) != 0
+      if '0'.ord <= c <= '9'.ord
+        value = value &* 10 &+ (c - '0'.ord)
+      else
+        case c
+        when 'k'.ord, 'K'.ord then value &*= 1024
+        when 'm'.ord, 'M'.ord then value &*= 1024 &* 1024
+        when 'g'.ord, 'G'.ord then value &*= 1024 &* 1024 &* 1024
+        end
+        break
+      end
+      i &+= 1
+    end
+    value
+  end
+
   def self.init : Nil
     {% unless flag?(:win32) %}
       LibGC.set_handle_fork(1)
@@ -230,6 +285,8 @@ module GC
     # on the first wrapped `pthread_create`, which never happens in a
     # single-threaded program.
     start_mark_threads
+
+    apply_heap_tuning
 
     {% if flag?(:preview_mt) %}
       @@lock = Crystal::RWLock.new
@@ -336,6 +393,40 @@ module GC
 
   def self.disable
     LibGC.disable
+  end
+
+  # Returns the GC's free-space divisor.
+  #
+  # The collector triggers a full collection roughly every
+  # `heap_size / free_space_divisor` bytes of allocation. A larger divisor
+  # collects more often (lower memory use, more CPU); a smaller one collects
+  # less often (higher memory use, less CPU). The default is `3`.
+  def self.free_space_divisor : UInt64
+    LibGC.get_free_space_divisor.to_u64!
+  end
+
+  # Sets the GC's free-space divisor. See `.free_space_divisor`.
+  #
+  # This is the analog of Go's `GOGC`/`GODEBUG=gcpercent`: increasing the
+  # headroom (a smaller divisor) trades resident memory for less collector CPU
+  # on allocation-heavy workloads. *value* must be positive.
+  def self.free_space_divisor=(value : Int) : Int
+    raise ArgumentError.new("free_space_divisor must be positive") unless value > 0
+    LibGC.set_free_space_divisor(LibGC::Word.new(value))
+    value
+  end
+
+  # Grows the GC heap so that it is at least *size* bytes large.
+  #
+  # Presizing the heap up front avoids a burst of collections while the heap is
+  # still small during program start-up. Pages are reserved lazily by the OS, so
+  # the resident memory cost is only paid as the heap is actually used. No-op if
+  # the heap is already at least *size* bytes.
+  def self.presize_heap(size : Int) : Nil
+    current = stats.heap_size
+    target = UInt64.new(size)
+    LibGC.expand_hp(LibC::SizeT.new(target - current)) if target > current
+    nil
   end
 
   def self.free(pointer : Void*) : Nil

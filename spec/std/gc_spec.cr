@@ -34,5 +34,26 @@ describe "GC" do
         GC.start_mark_threads
       {% end %}
     end
+
+    it ".free_space_divisor round-trips" do
+      original = GC.free_space_divisor
+      begin
+        GC.free_space_divisor = 7
+        GC.free_space_divisor.should eq(7)
+      ensure
+        GC.free_space_divisor = original
+      end
+    end
+
+    it ".free_space_divisor= rejects non-positive values" do
+      expect_raises(ArgumentError) { GC.free_space_divisor = 0 }
+    end
+
+    it ".presize_heap grows the heap and never shrinks it" do
+      GC.presize_heap(0) # no-op, must not shrink
+      before = GC.stats.heap_size
+      GC.presize_heap(before + 16 * 1024 * 1024)
+      GC.stats.heap_size.should be >= before + 16 * 1024 * 1024
+    end
   {% end %}
 end
