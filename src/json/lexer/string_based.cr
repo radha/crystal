@@ -116,6 +116,80 @@ class JSON::Lexer::StringBased < JSON::Lexer
     end
   end
 
+  # Skips a string token (its contents are not needed) using the same
+  # word-at-a-time scan as `#consume_string`, but without materialising any
+  # value. A non-ASCII byte or an escape (`\`) hands off to the exact
+  # per-codepoint loop (`consume_string_skip_chars`); because the scan never
+  # advances `@reader.pos`, both fall back by simply re-scanning from the
+  # opening quote, keeping `@column_number`, the reader position and every
+  # raise byte-identical to the base `#consume_string_skip`.
+  private def consume_string_skip
+    string = @reader.string
+    ptr = string.to_unsafe
+    bytesize = string.bytesize
+    start_pos = current_pos
+    word_limit = bytesize &- 8
+
+    pos = start_pos + 1
+    while pos < bytesize
+      if pos <= word_limit
+        word = (ptr + pos).as(UInt64*).value
+        if string_scan_word(word) == 0
+          return consume_string_skip_chars(start_pos) if word & 0x8080808080808080_u64 != 0
+          pos &+= 8
+          next
+        end
+      end
+      byte = ptr[pos]
+      return consume_string_skip_chars(start_pos) if byte >= 0x80
+      break if byte < 0x20 || byte == 0x22 || byte == 0x5c
+      pos &+= 1
+    end
+
+    if pos == bytesize
+      @column_number += pos - start_pos
+      @reader.pos = pos
+      raise "Unterminated string"
+    end
+
+    case ptr[pos]
+    when 0x22 # '"'
+      @column_number += pos - start_pos + 1
+      @reader.pos = pos + 1
+      if pos + 1 != bytesize && ptr[pos + 1] == 0
+        unexpected_char
+      end
+    when 0x5c # '\\'
+      consume_string_skip_chars(start_pos)
+    else # control byte (< 0x20)
+      @column_number += pos - start_pos
+      @reader.pos = pos
+      unexpected_char
+    end
+  end
+
+  # The original, exact per-codepoint skip loop (identical to the base
+  # `#consume_string_skip`). Used unchanged whenever the string contains a
+  # non-ASCII byte or an escape, so column counting and every raise stay
+  # byte-identical. The reader is positioned at the opening quote on entry.
+  private def consume_string_skip_chars(start_pos)
+    while true
+      case next_char
+      when '\0'
+        raise "Unterminated string"
+      when '\\'
+        consume_string_escape_sequence
+      when '"'
+        next_char
+        break
+      else
+        if 0 <= current_char.ord < 32
+          unexpected_char
+        end
+      end
+    end
+  end
+
   # Returns a non-zero value when the word contains at least one byte that is
   # `"` (0x22), `\` (0x5C), or a control character (`< 0x20`). High bytes
   # (UTF-8 lead/continuation, `>= 0x80`) never match. False positives are

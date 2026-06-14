@@ -156,6 +156,54 @@ describe JSON::Lexer do
     comma.column_number.should eq(4)
   end
 
+  describe "skip mode (consume_string_skip SWAR)" do
+    it "tracks column across a SWAR word-skipped string" do
+      lexer = JSON::Lexer.new("[\"aaaaaaaaaaaaaaaa\",1]")
+      lexer.skip = true
+      lexer.next_token.kind.begin_array?.should be_true
+      lexer.next_token.kind.string?.should be_true
+      comma = lexer.next_token
+      comma.kind.comma?.should be_true
+      comma.column_number.should eq(20)
+    end
+
+    it "tracks column after a multibyte skipped string (fallback path)" do
+      lexer = JSON::Lexer.new("\"中\",1")
+      lexer.skip = true
+      lexer.next_token.kind.string?.should be_true
+      comma = lexer.next_token
+      comma.kind.comma?.should be_true
+      comma.column_number.should eq(4)
+    end
+
+    it "skips a string containing an escape sequence" do
+      lexer = JSON::Lexer.new("\"ab\\ncd\",1")
+      lexer.skip = true
+      lexer.next_token.kind.string?.should be_true
+      lexer.next_token.kind.comma?.should be_true
+    end
+
+    it "rejects a control byte in a skipped string at every word offset" do
+      ["\"\u0001\"", "\"abc\u0001\"", "\"aaaaaaaa\u0001\"", "\"aaaaaaaaaaaaaaaa\u0001\""].each do |doc|
+        lexer = JSON::Lexer.new(doc)
+        lexer.skip = true
+        expect_raises(JSON::ParseException) { loop { break if lexer.next_token.kind.eof? } }
+      end
+    end
+
+    it "rejects an embedded null after a skipped string's closing quote" do
+      lexer = JSON::Lexer.new("\"aaaaaaaaaaaaaaaa\"\u0000x")
+      lexer.skip = true
+      expect_raises(JSON::ParseException) { loop { break if lexer.next_token.kind.eof? } }
+    end
+
+    it "raises on an unterminated skipped string" do
+      lexer = JSON::Lexer.new("\"abcdefghijklmnop")
+      lexer.skip = true
+      expect_raises(JSON::ParseException, "Unterminated string") { loop { break if lexer.next_token.kind.eof? } }
+    end
+  end
+
   it_lexes_int "0", 0
   it_lexes_int "1", 1
   it_lexes_int "1234", 1234
