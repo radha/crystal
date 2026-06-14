@@ -602,4 +602,47 @@ class Socket < IO
   end
 end
 
+class IO
+  {% if flag?(:darwin) || flag?(:freebsd) || flag?(:dragonflybsd) || flag?(:linux) || flag?(:solaris) || flag?(:win32) %}
+    # Copies all contents from *src* to *dst* using the `sendfile(2)` syscall
+    # (`TransmitFile` on Windows), letting the kernel transfer the bytes without
+    # a user-space buffer round-trip. *src* must refer to a regular file;
+    # non-regular descriptors (pipes, sockets, ...) and at-EOF positions fall
+    # back to the generic buffered `IO.copy`. *src* is advanced to its end,
+    # matching `IO.copy`'s contract.
+    def self.copy(src : FileDescriptor, dst : ::Socket) : Int64
+      if (info = src.info).file?
+        offset = src.pos
+        count = info.size &- offset
+        return 0_i64 if count <= 0
+
+        sent = dst.sendfile(src, offset, count)
+        src.seek(offset &+ sent)
+        sent
+      else
+        copy_via_buffer(src, dst)
+      end
+    end
+
+    # :ditto:
+    #
+    # Copies at most *limit* bytes.
+    def self.copy(src : FileDescriptor, dst : ::Socket, limit : Int) : Int64
+      raise ArgumentError.new("Negative limit") if limit < 0
+
+      if (info = src.info).file?
+        offset = src.pos
+        count = Math.min(info.size &- offset, limit.to_i64)
+        return 0_i64 if count <= 0
+
+        sent = dst.sendfile(src, offset, count)
+        src.seek(offset &+ sent)
+        sent
+      else
+        copy_via_buffer(src, dst, limit)
+      end
+    end
+  {% end %}
+end
+
 require "./socket/*"

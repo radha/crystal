@@ -283,4 +283,80 @@ describe Socket, tags: "network" do
       end
     end
   end
+
+  describe "IO.copy to a socket" do
+    # `IO.copy(file, socket)` is specialized to use `Socket#sendfile` on
+    # supported platforms; these guard that it stays byte-identical to the
+    # generic buffered copy and honours `IO.copy`'s contract (src ends at EOF).
+    copy_test = ->(setup : File ->, limit : Int32?) {
+      server = TCPServer.new("127.0.0.1", 0)
+      port = server.local_address.port
+      eof_pos = -1_i64
+      begin
+        spawn do
+          conn = server.accept
+          File.open(datapath("test_file.txt")) do |file|
+            setup.call(file)
+            limit ? IO.copy(file, conn, limit) : IO.copy(file, conn)
+            eof_pos = file.pos
+          end
+        ensure
+          conn.try(&.close)
+        end
+
+        socket = TCPSocket.new("127.0.0.1", port)
+        {socket.gets_to_end, eof_pos}
+      ensure
+        server.close
+        socket.try(&.close)
+      end
+    }
+
+    contents = File.read(datapath("test_file.txt"))
+
+    it "copies the whole file and advances src to EOF" do
+      received, eof_pos = copy_test.call(->(_f : File) { }, nil)
+      received.should eq(contents)
+      eof_pos.should eq(contents.bytesize)
+    end
+
+    it "copies from the current position" do
+      received, eof_pos = copy_test.call(->(f : File) { f.seek(6) }, nil)
+      received.should eq(contents.byte_slice(6))
+      eof_pos.should eq(contents.bytesize)
+    end
+
+    it "copies from the current position after a buffered read" do
+      received, _ = copy_test.call(->(f : File) { f.gets(5) }, nil)
+      received.should eq(contents.byte_slice(5))
+    end
+
+    it "honours a byte limit" do
+      received, _ = copy_test.call(->(_f : File) { }, 5)
+      received.should eq(contents.byte_slice(0, 5))
+    end
+
+    it "falls back to the generic copy for a non-regular descriptor" do
+      server = TCPServer.new("127.0.0.1", 0)
+      port = server.local_address.port
+      reader, writer = IO.pipe
+      begin
+        spawn do
+          conn = server.accept
+          IO.copy(reader, conn)
+        ensure
+          conn.try(&.close)
+        end
+
+        writer.print("piped" * 100)
+        writer.close
+        socket = TCPSocket.new("127.0.0.1", port)
+        socket.gets_to_end.should eq("piped" * 100)
+      ensure
+        server.close
+        reader.close
+        socket.try(&.close)
+      end
+    end
+  end
 end
