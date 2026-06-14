@@ -128,6 +128,45 @@ describe IO::FileDescriptor do
     end
   end
 
+  describe "#gets_to_end presizing" do
+    # `IO::FileDescriptor` presizes the result buffer from the file size for
+    # regular files; these guard that the optimisation stays byte-identical to
+    # the generic path across sizes, partial reads, seeks and non-regular fds.
+    {0, 1, 64, 8192, 8193, 100_000}.each do |n|
+      it "reads #{n} bytes identically" do
+        data = String.build(n) { |s| n.times { |i| s << ('a'.ord + i % 26).chr } }
+        with_tempfile("gets_to_end_#{n}") do |path|
+          File.write(path, data)
+          File.open(path) { |f| f.gets_to_end }.should eq(data)
+          File.open(path) { |f| String.new(f.getb_to_end) }.should eq(data)
+        end
+      end
+    end
+
+    it "presizes from the current position after a partial read" do
+      data = ("0123456789" * 1000)
+      with_tempfile("gets_to_end_partial") do |path|
+        File.write(path, data)
+        File.open(path) do |f|
+          f.gets(5).should eq("01234")
+          f.gets_to_end.should eq(data[5..])
+        end
+        File.open(path) do |f|
+          f.seek(2000)
+          f.gets_to_end.should eq(data[2000..])
+        end
+      end
+    end
+
+    it "falls back to the generic path for non-regular descriptors" do
+      reader, writer = IO.pipe
+      writer << ("payload" * 100)
+      writer.close
+      reader.gets_to_end.should eq("payload" * 100)
+      reader.close
+    end
+  end
+
   describe "close_on_exec" do
     it "sets close on exec on the reopened standard descriptors" do
       unless STDIN.fd == Crystal::System::FileDescriptor::STDIN_HANDLE
