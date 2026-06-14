@@ -18,7 +18,19 @@ class JSON::Token
   property kind : Kind
   property string_value : String
 
+  # Set by the lexer when the integer value was accumulated during lexing and
+  # is known to fit in `Int64` (small enough that it cannot overflow). `nil`
+  # means it was not pre-computed and `int_value` must parse `raw_value`.
+  @parsed_int_value : Int64? = nil
+
+  # :nodoc:
+  def parsed_int_value=(@parsed_int_value : Int64?)
+  end
+
   def int_value : Int64
+    if value = @parsed_int_value
+      return value
+    end
     raw_value.to_i64
   rescue exc : ArgumentError
     raise ParseException.new(exc.message, line_number, column_number)
