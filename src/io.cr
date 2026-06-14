@@ -583,16 +583,23 @@ abstract class IO
   # ```
   def gets_to_end : String
     String.build do |str|
-      if decoder = decoder()
-        while true
-          decoder.read(self)
-          break if decoder.out_slice.empty?
+      gets_to_end_internal(str)
+    end
+  end
 
-          decoder.write(str)
-        end
-      else
-        IO.copy(self, str)
+  # Reads the rest of this `IO`'s data into *str*. Extracted from `#gets_to_end`
+  # so that subclasses which can cheaply estimate the remaining size (e.g.
+  # `IO::FileDescriptor` via `fstat`) may presize the builder before filling it.
+  protected def gets_to_end_internal(str : String::Builder) : Nil
+    if decoder = decoder()
+      while true
+        decoder.read(self)
+        break if decoder.out_slice.empty?
+
+        decoder.write(str)
       end
+    else
+      IO.copy(self, str)
     end
   end
 

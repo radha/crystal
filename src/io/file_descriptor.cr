@@ -160,6 +160,56 @@ class IO::FileDescriptor < IO
     @fd_lock.reference { system_info }
   end
 
+  # :nodoc:
+  #
+  # Reads the rest of this file into a `String`, presizing the builder from the
+  # number of bytes remaining when this descriptor refers to a regular file.
+  # This avoids the repeated doubling reallocations of the generic
+  # `IO#gets_to_end`. Non-regular descriptors (pipes, sockets, ttys) and any
+  # error fall back to the generic path.
+  def gets_to_end : String
+    if hint = remaining_size_hint
+      String.build(hint) do |str|
+        gets_to_end_internal(str)
+      end
+    else
+      super
+    end
+  end
+
+  # :nodoc:
+  #
+  # Like `#gets_to_end` but returns the raw bytes, presizing the backing
+  # `IO::Memory` from the file size when possible.
+  def getb_to_end : Bytes
+    io = IO::Memory.new(remaining_size_hint || 64)
+    IO.copy(self, io)
+    io.to_slice
+  end
+
+  # Returns the number of bytes remaining to be read as a presizing hint, or
+  # `nil` when it can't be cheaply determined (the descriptor isn't a regular
+  # file, is already at or past EOF, or `fstat`/`lseek` fails). The value is
+  # clamped to a valid `String`/`IO::Memory` capacity; it is only a hint, so an
+  # inaccurate estimate (e.g. a file being written concurrently) stays correct,
+  # just with an extra growth or shrink.
+  private def remaining_size_hint : Int32?
+    info = self.info
+    return nil unless info.file?
+
+    remaining = info.size - pos
+    return nil unless remaining > 0
+
+    # Clamp to a capacity that both `String::Builder` and `IO::Memory` can hold
+    # (`Int32`, with room for the builder's header + NUL). Files larger than
+    # this can't be read whole into a `String`/`Bytes` anyway, so they grow as
+    # before.
+    max = (Int32::MAX - String::HEADER_SIZE - 1).to_i64
+    remaining > max ? max.to_i32 : remaining.to_i32
+  rescue IO::Error
+    nil
+  end
+
   # Seeks to a given *offset* (in bytes) according to the *whence* argument.
   # Returns `self`.
   #
