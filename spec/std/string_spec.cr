@@ -1783,6 +1783,21 @@ describe "String" do
       # invalid UTF-8 bytes decode to the replacement char before deletion
       String.new(Bytes[0x61, 0xFF, 0x62]).delete('a').should eq("\u{FFFD}b")
     end
+
+    it "deletes by set via the ascii table fast path" do
+      ("abcdef" * 50).delete("a-c").should eq("def" * 50)
+      "hello world".delete("a-z", "^aeiou").should eq("eo o")
+      ("Hello, World! " * 20).delete("^A-Za-z").should eq("HelloWorld" * 20)
+      # non-ascii subject falls back to the per-char path
+      "café résumé".delete("a-z").should eq("é éé")
+    end
+
+    it "preserves the lazy inverted-range raise for sets" do
+      "".delete("z-a").should eq("")
+      expect_raises(ArgumentError, "Invalid range z-a") { "abc".delete("z-a") }
+      "xyz".delete("q", "z-a").should eq("xyz")
+      expect_raises(ArgumentError, "Invalid range z-a") { "xqz".delete("q", "z-a") }
+    end
   end
 
   describe "#reverse" do
@@ -2792,6 +2807,21 @@ describe "String" do
     it { "aabbcc".count('a').should eq(2) }
     it { "aabbcc".count(&.in?('a', 'b')).should eq(4) }
 
+    describe "by set (ascii table fast path)" do
+      # long all-ascii subject exercises the precomputed table path
+      it { ("abcde" * 100).count("a-c").should eq(300) }
+      it { ("Hello, World! " * 50).count("^a-zA-Z").should eq(50 * 4) }
+      it { ("aeiou xyz " * 40).count("aeiou", "^x").should eq(40 * 5) }
+      # the inverted-range ArgumentError is lazy / subject-dependent and must be
+      # preserved exactly by the fallback when the fast path bails
+      it { "".count("z-a").should eq(0) }
+      it { expect_raises(ArgumentError, "Invalid range z-a") { "abc".count("z-a") } }
+      it { "xyz".count("q", "z-a").should eq(0) }
+      it { expect_raises(ArgumentError, "Invalid range z-a") { "xqz".count("q", "z-a") } }
+      # non-ascii subject falls back to the per-char path
+      it { "café résumé".count("a-z").should eq(7) }
+    end
+
     describe "by char" do
       it { "".count('a').should eq(0) }
       it { "aabbcc".count('z').should eq(0) }
@@ -2827,6 +2857,21 @@ describe "String" do
     it { "hello".squeeze('λ').should eq("hello") }
     # consecutive invalid bytes each decode to the replacement char and squeeze
     it { String.new(Bytes[0x61, 0xFF, 0xFF, 0x62]).squeeze(Char::REPLACEMENT).should eq("a\u{FFFD}b") }
+
+    it "squeezes by set via the ascii table fast path" do
+      ("aaabbb" * 50).squeeze("a-c").should eq("ab" * 50)
+      ("z" * 500).squeeze("a-z").should eq("z")
+      "aaabbbccc".squeeze("a", "^b").should eq("abbbccc")
+      # non-ascii subject falls back to the per-char path
+      "aaàà".squeeze("a").should eq("aàà")
+    end
+
+    it "preserves the lazy inverted-range raise for sets" do
+      "".squeeze("z-a").should eq("")
+      expect_raises(ArgumentError, "Invalid range z-a") { "abc".squeeze("z-a") }
+      "xyz".squeeze("q", "z-a").should eq("xyz")
+      expect_raises(ArgumentError, "Invalid range z-a") { "xqz".squeeze("q", "z-a") }
+    end
   end
 
   describe "ljust" do

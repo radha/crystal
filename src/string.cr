@@ -2980,10 +2980,103 @@ class String
     count { |char| char == other }
   end
 
+  # Builds a 128-entry ASCII membership table for *set* following the exact
+  # grammar of `Char#in_set?` (negation with a leading `^`, ranges `a-z`,
+  # escaping with `\`), with negation already folded in so the result is the
+  # set of ASCII bytes for which `char.in_set?(set)` is true.
+  #
+  # Returns `nil` when *set* is not representable as a pure-ASCII table: any
+  # non-ASCII byte in the spec, or an inverted range (`z-a`). In those cases
+  # callers must fall back to the per-char `Char#in_set?` path, which also
+  # reproduces the *lazy*, subject-dependent `ArgumentError` that `in_set?`
+  # raises on an inverted range only when a subject char actually reaches it.
+  private def ascii_set_table_single(set : String) : StaticArray(Bool, 128)?
+    table = StaticArray(Bool, 128).new(false)
+    not_negated = true
+    range = false
+    previous = nil
+
+    set.each_char do |char|
+      return nil if char.ord >= 128
+
+      case char
+      when '^'
+        unless previous # beginning of set
+          not_negated = false
+          previous = char
+          next
+        end
+      when '-'
+        if previous && previous != '\\'
+          range = true
+
+          if previous == '^' # ^- at the beginning
+            previous = '^'
+            not_negated = true
+          end
+
+          next
+        else # at the beginning of the set or escaped
+          table['-'.ord] = true
+        end
+      end
+
+      if range && previous
+        return nil if previous > char # inverted range: defer to the in_set? fallback
+
+        (previous.ord..char.ord).each { |o| table[o] = true }
+
+        range = false
+      elsif char != '\\'
+        table[char.ord] = true
+      end
+
+      previous = char
+    end
+
+    table['-'.ord] = true if range
+    table['\\'.ord] = true if previous == '\\'
+
+    unless not_negated
+      128.times { |i| table[i] = !table[i] }
+    end
+
+    table
+  end
+
+  # Combines the per-set ASCII membership tables of *sets* with `&&` (mirroring
+  # the `sets.all?` semantics of `Char#in_set?(*sets)`). Returns `nil` if any
+  # set is not ASCII-table-representable, signalling callers to fall back.
+  private def ascii_set_table(sets) : StaticArray(Bool, 128)?
+    acc = StaticArray(Bool, 128).new(true)
+    sets.each do |set|
+      single = ascii_set_table_single(set)
+      return nil if single.nil?
+      s = single
+      128.times { |i| acc[i] = acc[i] && s[i] }
+    end
+    acc
+  end
+
   # Sets should be a list of strings following the rules
   # described at `Char#in_set?`. Returns the number of characters
   # in this string that match the given set.
   def count(*sets) : Int32
+    # Fast path: an all-ASCII subject against ASCII-representable sets reduces
+    # to a precomputed O(1) table lookup per byte instead of re-parsing every
+    # set for every character (`Char#in_set?` is O(set length) per char). The
+    # length guard keeps short subjects on the per-char path, where they beat
+    # the fixed cost of building the table.
+    if bytesize >= 32 && ascii_only? && (table = ascii_set_table(sets))
+      tbl = table.to_unsafe
+      ptr = to_unsafe
+      n = 0
+      bytesize.times do |i|
+        n &+= 1 if tbl[ptr[i]]
+      end
+      return n
+    end
+
     count(&.in_set?(*sets))
   end
 
@@ -3037,6 +3130,25 @@ class String
   # "aabbccdd".delete("a-c") # => "dd"
   # ```
   def delete(*sets) : String
+    # Fast path: an all-ASCII subject against ASCII-representable sets copies
+    # bytes through a precomputed table lookup with no per-char `in_set?`
+    # re-parse and no UTF-8 decoding (mirrors the `delete(char)` fast path).
+    if bytesize >= 32 && ascii_only? && (table = ascii_set_table(sets))
+      tbl = table.to_unsafe
+      return String.new(bytesize) do |buffer|
+        ptr = to_unsafe
+        count = 0
+        bytesize.times do |i|
+          byte = ptr[i]
+          unless tbl[byte]
+            buffer[count] = byte
+            count &+= 1
+          end
+        end
+        {count, count}
+      end
+    end
+
     delete(&.in_set?(*sets))
   end
 
@@ -3101,6 +3213,27 @@ class String
   # "a       bbb".squeeze         # => "a b"
   # ```
   def squeeze(*sets : String) : String
+    # Fast path: an all-ASCII subject against ASCII-representable sets collapses
+    # runs through a precomputed table lookup with no per-char `in_set?` re-parse
+    # and no UTF-8 decoding (mirrors the `squeeze(char)` fast path).
+    if bytesize >= 32 && ascii_only? && (table = ascii_set_table(sets))
+      tbl = table.to_unsafe
+      return String.new(bytesize) do |buffer|
+        ptr = to_unsafe
+        count = 0
+        prev_byte = -1
+        bytesize.times do |i|
+          byte = ptr[i]
+          unless tbl[byte] && byte.to_i == prev_byte
+            buffer[count] = byte
+            count &+= 1
+          end
+          prev_byte = byte.to_i
+        end
+        {count, count}
+      end
+    end
+
     squeeze(&.in_set?(*sets))
   end
 
