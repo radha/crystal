@@ -1562,44 +1562,34 @@ struct Time
   protected def year_month_day_day_year : {Int32, Int32, Int32, Int32}
     total_days = (offset_seconds // SECONDS_PER_DAY).to_i
 
-    num400 = total_days // DAYS_PER_400_YEARS
-    total_days -= num400 * DAYS_PER_400_YEARS
+    # Neri–Schneider branchless "civil from days" algorithm. The day count is
+    # shifted so the internal calendar starts on March 1st of the year before
+    # Crystal's `0001-01-01` epoch (306 days earlier). Counting months from
+    # March puts the leap day at the end of the internal year, which removes the
+    # per-month subtraction loop and the era-by-era year search.
+    days = total_days + 306
 
-    num100 = total_days // DAYS_PER_100_YEARS
-    if num100 == 4 # leap
-      num100 = 3
-    end
-    total_days -= num100 * DAYS_PER_100_YEARS
+    era = days // 146097
+    day_of_era = days - era * 146097                                                                    # [0, 146096]
+    year_of_era = (day_of_era - day_of_era // 1460 + day_of_era // 36524 - day_of_era // 146096) // 365 # [0, 399]
+    march_day_of_year = day_of_era - (365 * year_of_era + year_of_era // 4 - year_of_era // 100)        # [0, 365]
+    march_month = (5 * march_day_of_year + 2) // 153                                                    # [0, 11], 0 = March
+    day = march_day_of_year - (153 * march_month + 2) // 5 + 1                                          # [1, 31]
 
-    num4 = total_days // DAYS_PER_4_YEARS
-    total_days -= num4 * DAYS_PER_4_YEARS
+    # Shift back from the March-based internal calendar: months 0..9 map to
+    # March..December of `year_of_era`, months 10..11 to January/February of the
+    # following year.
+    month = march_month < 10 ? march_month + 3 : march_month - 9
+    year = era * 400 + year_of_era + (month <= 2 ? 1 : 0)
 
-    numyears = total_days // 365
-    if numyears == 4 # leap
-      numyears = 3
-    end
-    total_days -= numyears * 365
-
-    year = num400 * 400 + num100 * 100 + num4 * 4 + numyears + 1
-
-    ordinal_day_in_year = total_days + 1
-
-    if (numyears == 3) && ((num100 == 3) || !(num4 == 24)) # 31 dec leap year
-      days_per_month = DAYS_MONTH_LEAP
+    # Day of year. For January/February, `march_day_of_year` continues from the
+    # previous March (Jan 1st is day 306); otherwise add the 60 (61 in leap
+    # years) days of January and February that precede March 1st.
+    if month <= 2
+      ordinal_day_in_year = march_day_of_year - 305
     else
-      days_per_month = DAYS_MONTH
+      ordinal_day_in_year = march_day_of_year + (Time.leap_year?(year) ? 61 : 60)
     end
-
-    month = 1
-    while true
-      days_in_month = days_per_month[month]
-      break if total_days < days_in_month
-
-      total_days -= days_in_month
-      month += 1
-    end
-
-    day = total_days + 1
 
     {year, month, day, ordinal_day_in_year}
   end
