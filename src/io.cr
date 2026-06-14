@@ -1307,6 +1307,15 @@ abstract class IO
   # io2.to_s # => "hello"
   # ```
   def self.copy(src : IO, dst : IO) : Int64
+    copy_via_buffer(src, dst)
+  end
+
+  # :nodoc:
+  #
+  # The generic user-space buffered copy. Extracted so that specialized
+  # `IO.copy` overloads (e.g. file-to-socket `sendfile`) can fall back to it
+  # without re-dispatching to themselves.
+  def self.copy_via_buffer(src : IO, dst : IO) : Int64
     buffer = uninitialized UInt8[DEFAULT_BUFFER_SIZE]
     count = 0_i64
     while (len = src.read(buffer.to_slice).to_i32) > 0
@@ -1327,6 +1336,11 @@ abstract class IO
   # io2.to_s # => "hel"
   # ```
   def self.copy(src : IO, dst : IO, limit : Int) : Int64
+    copy_via_buffer(src, dst, limit)
+  end
+
+  # :nodoc:
+  def self.copy_via_buffer(src : IO, dst : IO, limit : Int) : Int64
     raise ArgumentError.new("Negative limit") if limit < 0
 
     limit = limit.to_i64
