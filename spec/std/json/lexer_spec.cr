@@ -181,4 +181,20 @@ describe JSON::Lexer do
   it_lexes_float "9876543212345678987654321.0", 9876543212345678987654321.0
   it_lexes_float "9876543212345678987654321e20", 9876543212345678987654321e20
   it_lexes_float "10.100000000000000000000", 10.1
+
+  # Integer value caching: <= 18 digits is accumulated during lexing, >= 19
+  # digits falls back to parsing raw_value. The boundary and Int64 extremes
+  # must all yield identical int_values.
+  it_lexes_int "999999999999999999", 999999999999999999   # 18 digits (cached)
+  it_lexes_int "-999999999999999999", -999999999999999999 # 18 digits (cached)
+  it_lexes_int "1000000000000000000", 1000000000000000000 # 19 digits (fallback)
+  it_lexes_int "9223372036854775807", Int64::MAX          # 19 digits (fallback)
+  it_lexes_int "-9223372036854775808", Int64::MIN         # fallback
+  it_lexes_int "100000000000000000", 100000000000000000   # 18 digits, leading 1
+
+  it "raises on an integer that overflows Int64" do
+    token = JSON::Lexer.new("99999999999999999999").next_token
+    token.kind.int?.should be_true
+    expect_raises(JSON::ParseException) { token.int_value }
+  end
 end

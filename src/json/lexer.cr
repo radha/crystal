@@ -222,14 +222,27 @@ abstract class JSON::Lexer
 
   private def consume_number
     number_start
+    # Cleared here so a float, a big integer, or a reused token never reports a
+    # stale cached value; set again only for an integer that fits in `Int64`.
+    @token.parsed_int_value = nil
 
+    negative = false
     if current_char == '-'
+      negative = true
       append_number_char
       next_char
     end
 
+    # Accumulate the integer magnitude while scanning so `Token#int_value` can
+    # skip a second pass over `raw_value`. Wrapping arithmetic never raises on
+    # overflow; the value is only used when `digits <= 18`, which always fits
+    # in `Int64` (10**18 - 1 < Int64::MAX) and negates without overflow.
+    magnitude = 0_i64
+    digits = 0
+
     case current_char
     when '0'
+      digits = 1
       append_number_char
       char = next_char
       case char
@@ -242,11 +255,16 @@ abstract class JSON::Lexer
       else
         @token.kind = :int
         number_end
+        cache_int_value(negative, magnitude, digits)
       end
     when '1'..'9'
+      magnitude = (current_char - '0').to_i64
+      digits = 1
       append_number_char
       char = next_char
       while '0' <= char <= '9'
+        magnitude = magnitude &* 10_i64 &+ (char - '0').to_i64
+        digits &+= 1
         append_number_char
         char = next_char
       end
@@ -259,9 +277,16 @@ abstract class JSON::Lexer
       else
         @token.kind = :int
         number_end
+        cache_int_value(negative, magnitude, digits)
       end
     else
       unexpected_char
+    end
+  end
+
+  private def cache_int_value(negative, magnitude, digits)
+    if digits <= 18
+      @token.parsed_int_value = negative ? -magnitude : magnitude
     end
   end
 
