@@ -537,6 +537,23 @@ describe Time do
     t.day_of_year.should eq(303)
   end
 
+  it "decomposes date boundaries (year/month/day/day_of_year)" do
+    # epoch and range extremes
+    Time.utc(1, 1, 1).day_of_year.should eq(1)
+    Time.utc(9999, 12, 31).day_of_year.should eq(365)
+    # leap day, end of leap year, and the following Jan/Feb
+    Time.utc(2016, 2, 29).day_of_year.should eq(60)
+    Time.utc(2016, 12, 31).day_of_year.should eq(366)
+    Time.utc(2017, 1, 1).day_of_year.should eq(1)
+    # century non-leap years and the 400-year leap year
+    Time.utc(1900, 3, 1).day_of_year.should eq(60)
+    Time.utc(2000, 3, 1).day_of_year.should eq(61)
+    Time.utc(2100, 12, 31).day_of_year.should eq(365)
+    [Time.utc(1900, 2, 28), Time.utc(2000, 2, 29), Time.utc(2100, 3, 1)].each do |t|
+      Time.utc(t.year, t.month, t.day).should eq(t)
+    end
+  end
+
   describe "#<=>" do
     it "compares" do
       t1 = Time.utc 2014, 10, 30, 21, 18, 13
