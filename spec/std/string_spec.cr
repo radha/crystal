@@ -441,6 +441,18 @@ describe "String" do
       it { "9223372036854775808".to_i64 { 0 }.should eq(0) }
 
       it { expect_raises(ArgumentError) { "18446744073709551616".to_i64 } }
+
+      # SWAR fast path: word-multiple and sub-word digit runs, leading zeros
+      # spanning several words, strict/whitespace/overflow at group boundaries.
+      it { "12345678".to_i64.should eq(12345678) }
+      it { "1234567890123456".to_i64.should eq(1234567890123456) }
+      it { "12345678901234".to_i64.should eq(12345678901234) }
+      it { "00000000000000001234".to_i64.should eq(1234) }
+      it { "00000000".to_i64.should eq(0) }
+      it { "12345678z".to_i64(strict: false).should eq(12345678) }
+      it { expect_raises(ArgumentError) { "12345678z".to_i64 } }
+      it { "  12345678901  ".to_i64.should eq(12345678901) }
+      it { expect_raises(ArgumentError) { "99999999999999999999".to_i64 } }
     end
 
     describe "to_u64" do
@@ -452,6 +464,12 @@ describe "String" do
       it { "18446744073709551615".to_u64?.should eq(18446744073709551615u64) }
       it { "18446744073709551616".to_u64?.should be_nil }
       it { "18446744073709551616".to_u64 { 0 }.should eq(0) }
+
+      # SWAR fast path boundaries
+      it { "12345678901234567890".to_u64.should eq(12345678901234567890u64) }
+      it { "18446744073709551614".to_u64.should eq(18446744073709551614u64) }
+      it { "99999999999999999999".to_u64?.should be_nil }
+      it { "000000000000000000001".to_u64.should eq(1) }
     end
 
     describe "to_i128" do

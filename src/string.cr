@@ -613,6 +613,7 @@ class String
     end
   end
 
+  @[AlwaysInline]
   private def to_unsigned_info(int_class, base, whitespace, underscore, prefix, strict, leading_zero_is_octal, unsigned)
     raise ArgumentError.new("Invalid base #{base}") unless 2 <= base <= 36 || base == 62
 
@@ -672,6 +673,18 @@ class String
       end
     end
 
+    # Fast path: a long run of base-10 digits into the 64-bit accumulator
+    # (`to_i64`/`to_u64`) is parsed eight bytes at a time. It runs on a copy of
+    # the cursor and returns a complete result, so the per-byte loop below — the
+    # sole path for every narrower accumulator, other base and short input — is
+    # left undisturbed (its `value`/`ptr` keep a single definition).
+    {% unless flag?(:big_endian) %}
+      if base == 10 && !underscore
+        fast = to_unsigned_info_swar(int_class, ptr, negative, whitespace, strict)
+        return fast if fast
+      end
+    {% end %}
+
     value = int_class.new(0)
     mul_overflow = ~(int_class.new(0)) // base
     invalid = false
@@ -724,6 +737,87 @@ class String
     end
 
     ToUnsignedInfo.new(value: value, negative: negative, invalid: invalid)
+  end
+
+  # Eight-ASCII-digits-at-a-time (SWAR) test: every byte must have high nibble
+  # 0x3 and, after adding 6, still have high nibble 0x3 (which excludes
+  # 0x3A-0x3F). The add is carry-free once the first test holds, so the two
+  # together accept exactly the bytes '0'-'9'.
+  @[AlwaysInline]
+  private def all_ascii_digits?(word : UInt64) : Bool
+    (word & 0xF0F0F0F0F0F0F0F0_u64) == 0x3030303030303030_u64 &&
+      ((word &+ 0x0606060606060606_u64) & 0xF0F0F0F0F0F0F0F0_u64) == 0x3030303030303030_u64
+  end
+
+  # Fast path for `#to_unsigned_info` parsing a run of base-10 digits into a
+  # `UInt64` (the accumulator for `to_i64`/`to_u64`). Folds eight little-endian
+  # digits at a time (Lemire) and finishes the sub-word tail with the same
+  # per-byte logic as the main loop. Returns `nil` to defer to that loop when
+  # fewer than eight bytes remain or the run does not start with eight digits,
+  # so short and non-numeric inputs never reach here. The pointer arrives just
+  # past any sign and a single leading zero. The generic overload below is the
+  # no-op used by the narrower accumulators, whose `value * 100_000_000` step
+  # would not fit.
+  @[AlwaysInline]
+  private def to_unsigned_info_swar(int_class : UInt64.class, ptr : UInt8*, negative, whitespace, strict) : ToUnsignedInfo(UInt64)?
+    content_end = to_unsafe + bytesize
+    return nil if content_end - ptr < 8
+    return nil unless all_ascii_digits?(ptr.as(UInt64*).value)
+
+    value = 0_u64
+    invalid = false
+
+    while content_end - ptr >= 8
+      word = ptr.as(UInt64*).value
+      break unless all_ascii_digits?(word)
+      v = word &- 0x3030303030303030_u64
+      v = (v &* 10) &+ (v >> 8)
+      chunk = (((v & 0x000000FF000000FF_u64) &* 0x000F424000000064_u64) &+
+               (((v >> 16) & 0x000000FF000000FF_u64) &* 0x0000271000000001_u64)) >> 32
+      # A group overflows exactly when the full base-10 value does (the first
+      # group never can, the accumulator starting at zero), matching the
+      # per-byte overflow flag.
+      if value > (UInt64::MAX &- chunk) // 100_000_000_u64
+        invalid = true
+        break
+      end
+      value = value &* 100_000_000_u64 &+ chunk
+      ptr += 8
+    end
+
+    # Per-byte tail for the remaining (< 8) digits, identical to the main loop.
+    digits = CHAR_TO_DIGIT.to_unsafe
+    while !invalid && ptr.value != 0
+      digit = digits[ptr.value]
+      break if digit == -1 || digit >= 10
+      if value > UInt64::MAX // 10
+        invalid = true
+        break
+      end
+      value &*= 10
+      old = value
+      value &+= digit
+      if value < old
+        invalid = true
+        break
+      end
+      ptr += 1
+    end
+
+    # At least eight digits were consumed, so `found_digit` is necessarily true;
+    # only the trailing-character / strict check remains.
+    unless ptr.value == 0
+      ptr += calc_excess_right if whitespace
+      invalid = true if strict && ptr.value != 0
+    end
+
+    ToUnsignedInfo.new(value: value, negative: negative, invalid: invalid)
+  end
+
+  # :nodoc:
+  @[AlwaysInline]
+  private def to_unsigned_info_swar(int_class, ptr : UInt8*, negative, whitespace, strict)
+    nil
   end
 
   # Returns the result of interpreting characters in this string as a floating point number (`Float64`).
