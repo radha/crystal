@@ -114,6 +114,48 @@ describe JSON::Lexer do
   it_errors_to_lex %("\\uD800")
   it_errors_to_lex %("\\uDC00")
   it_errors_to_lex %("\\uD800\\u0020")
+
+  # SWAR string scan: content lengths straddling the 8-byte word boundary.
+  it_lexes_string "\"\"", ""
+  it_lexes_string "\"aaaaaaa\"", "aaaaaaa"
+  it_lexes_string "\"aaaaaaaa\"", "aaaaaaaa"
+  it_lexes_string "\"aaaaaaaaa\"", "aaaaaaaaa"
+  it_lexes_string "\"aaaaaaaaaaaaaaa\"", "aaaaaaaaaaaaaaa"
+  it_lexes_string "\"aaaaaaaaaaaaaaaa\"", "aaaaaaaaaaaaaaaa"
+  it_lexes_string "\"aaaaaaaaaaaaaaaaa\"", "aaaaaaaaaaaaaaaaa"
+
+  # UTF-8 content takes the exact per-codepoint fallback (incl. at boundaries).
+  it_lexes_string "\"中文字符串\"", "中文字符串"
+  it_lexes_string "\"aaaaaaaa中aaaaaaaa\"", "aaaaaaaa中aaaaaaaa"
+  it_lexes_string "\"\u{1F600}\u{1F600}\u{1F600}\u{1F600}\"", "\u{1F600}\u{1F600}\u{1F600}\u{1F600}"
+  it_lexes_string "\"aaaaaaa中\"", "aaaaaaa中"
+
+  # A raw control byte inside a string is rejected (SWAR ctrl detection), at
+  # the start, mid-word, and across the 8-byte word boundary.
+  it_errors_to_lex "\"\u0001\""
+  it_errors_to_lex "\"abc\u0001\""
+  it_errors_to_lex "\"aaaaaaaa\u0001\""
+  it_errors_to_lex "\"aaaaaaaaaaaaaaaa\u0001\""
+
+  it "tracks column across a SWAR word-skipped string" do
+    # '[' col1, '"' col2, 16 'a' cols 3..18, '"' col19, ',' col20.
+    lexer = JSON::Lexer.new("[\"aaaaaaaaaaaaaaaa\",1]")
+    lexer.next_token.kind.begin_array?.should be_true
+    lexer.next_token.kind.string?.should be_true
+    comma = lexer.next_token
+    comma.kind.comma?.should be_true
+    comma.column_number.should eq(20)
+  end
+
+  it "tracks column after a multibyte string (fallback path)" do
+    # '"' col1, U+4E2D (1 codepoint) col2, '"' col3, ',' col4.
+    lexer = JSON::Lexer.new("\"中\",1")
+    lexer.next_token.kind.string?.should be_true
+    comma = lexer.next_token
+    comma.kind.comma?.should be_true
+    comma.column_number.should eq(4)
+  end
+
   it_lexes_int "0", 0
   it_lexes_int "1", 1
   it_lexes_int "1234", 1234
