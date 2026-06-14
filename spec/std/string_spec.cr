@@ -1752,6 +1752,20 @@ describe "String" do
       "foobar".delete('o').should eq("fbar")
       "foobar".delete('x').should eq("foobar")
     end
+
+    it "deletes an ascii char from an ascii string (byte fast path)" do
+      "hello world".delete('o').should eq("hell wrld")
+      "aaa".delete('a').should eq("")
+      "".delete('a').should eq("")
+    end
+
+    it "deletes via the fallback for non-ascii strings and targets" do
+      "café".delete('f').should eq("caé")
+      "ünïcödé".delete('a').should eq("ünïcödé")
+      "hello".delete('λ').should eq("hello")
+      # invalid UTF-8 bytes decode to the replacement char before deletion
+      String.new(Bytes[0x61, 0xFF, 0x62]).delete('a').should eq("\u{FFFD}b")
+    end
   end
 
   describe "#reverse" do
@@ -2445,6 +2459,22 @@ describe "String" do
       "aabbcc".tr("a", "いろは").should eq("いいbbcc")
     end
 
+    it "translates ascii strings via the byte fast path" do
+      # `#tr` maps characters literally; it does not expand `a-z` ranges
+      "hello".tr("aeiou", "*").should eq("h*ll*")
+      "hello world".tr("lo", "LO").should eq("heLLO wOrLd")
+      "crystal".tr("crystal", "CRYSTAL").should eq("CRYSTAL")
+    end
+
+    it "falls back for non-ascii receivers and ascii-to-non-ascii mappings" do
+      # multibyte receiver is not ascii-only, so the slow path handles it
+      "café".tr("abcdef", "ABCDEF").should eq("CAFé")
+      # ascii receiver but a non-ascii replacement is not byte-safe
+      "hello".tr("lo", "λμ").should eq("heλλμ")
+      # invalid UTF-8 bytes decode to the replacement char during translation
+      String.new(Bytes[0x61, 0xFF, 0x62]).tr("ab", "AB").should eq("A\u{FFFD}B")
+    end
+
     context "given no replacement characters" do
       it "acts as #delete" do
         "foo".tr("o", "").should eq("foo".delete("o"))
@@ -2762,6 +2792,17 @@ describe "String" do
     it { "a       bbb".squeeze.should eq("a b") }
     it { "a    bbb".squeeze(' ').should eq("a bbb") }
     it { "aaabbbcccddd".squeeze("b-d").should eq("aaabcd") }
+
+    # ascii char on an ascii string (byte fast path)
+    it { "aaabbbccc".squeeze('a').should eq("abbbccc") }
+    it { "  a  b  ".squeeze(' ').should eq(" a b ") }
+    it { "".squeeze('a').should eq("") }
+
+    # fallback for non-ascii strings and targets
+    it { "café  au  lait".squeeze(' ').should eq("café au lait") }
+    it { "hello".squeeze('λ').should eq("hello") }
+    # consecutive invalid bytes each decode to the replacement char and squeeze
+    it { String.new(Bytes[0x61, 0xFF, 0xFF, 0x62]).squeeze(Char::REPLACEMENT).should eq("a\u{FFFD}b") }
   end
 
   describe "ljust" do

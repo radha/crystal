@@ -2298,6 +2298,33 @@ class String
       end
     end
 
+    # Fast path: when this string is pure ASCII and the translation maps every
+    # ASCII byte to another single-byte (ASCII) value, the result is a direct
+    # byte-for-byte substitution with no UTF-8 decoding or per-char `IO` writes.
+    if ascii_only?
+      ascii_safe = true
+      i = 0
+      while i < 128
+        if table.to_unsafe[i] >= 0x80
+          ascii_safe = false
+          break
+        end
+        i &+= 1
+      end
+
+      if ascii_safe
+        return String.new(bytesize) do |buffer|
+          ptr = to_unsafe
+          bytesize.times do |j|
+            byte = ptr[j]
+            mapped = table.to_unsafe[byte]
+            buffer[j] = mapped >= 0 ? mapped.to_u8! : byte
+          end
+          {bytesize, bytesize}
+        end
+      end
+    end
+
     String.build(bytesize) do |buffer|
       each_char do |ch|
         if ch.ord < 256
@@ -2979,6 +3006,24 @@ class String
   # "aabbcc".delete('b') # => "aacc"
   # ```
   def delete(char : Char) : String
+    # Fast path: pure-ASCII string and ASCII target reduce to a byte-copy loop
+    # with no UTF-8 decoding or per-char `IO` writes.
+    if ascii_only? && char.ascii?
+      target = char.ord.to_u8!
+      return String.new(bytesize) do |buffer|
+        ptr = to_unsafe
+        count = 0
+        bytesize.times do |i|
+          byte = ptr[i]
+          unless byte == target
+            buffer[count] = byte
+            count &+= 1
+          end
+        end
+        {count, count}
+      end
+    end
+
     delete { |my_char| my_char == char }
   end
 
@@ -3018,6 +3063,27 @@ class String
   # "a    bbb".squeeze(' ') # => "a bbb"
   # ```
   def squeeze(char : Char) : String
+    # Fast path: pure-ASCII string and ASCII target collapse runs of *char* with
+    # a byte-copy loop, with no UTF-8 decoding or per-char `IO` writes.
+    if ascii_only? && char.ascii?
+      target = char.ord.to_u8!
+      return String.new(bytesize) do |buffer|
+        ptr = to_unsafe
+        count = 0
+        prev_was_target = false
+        bytesize.times do |i|
+          byte = ptr[i]
+          is_target = byte == target
+          unless is_target && prev_was_target
+            buffer[count] = byte
+            count &+= 1
+          end
+          prev_was_target = is_target
+        end
+        {count, count}
+      end
+    end
+
     squeeze { |my_char| char == my_char }
   end
 
