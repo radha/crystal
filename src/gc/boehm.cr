@@ -172,6 +172,17 @@ lib LibGC
     fun pthread_detach = GC_pthread_detach(thread : LibC::PthreadT) : LibC::Int
   {% end %}
 
+  # Parallel marking. libgc is compiled with `PARALLEL_MARK`, but the marker
+  # threads are only spawned lazily at the first `GC_pthread_create` or by an
+  # explicit `GC_start_mark_threads`. Single-threaded programs never trigger the
+  # former, so they mark on a single core forever; calling `GC_start_mark_threads`
+  # once at startup enables parallel marking (see `GC.init`). `GC_get_parallel`
+  # reports the number of marker threads (0 means serial marking).
+  {% if !flag?(:win32) && !flag?(:wasm32) && compare_versions(VERSION, "8.2.0") >= 0 %}
+    fun start_mark_threads = GC_start_mark_threads
+    fun get_parallel = GC_get_parallel : Int
+  {% end %}
+
   alias WarnProc = LibC::Char*, Word ->
   fun set_warn_proc = GC_set_warn_proc(WarnProc)
   $warn_proc = GC_current_warn_proc : WarnProc
@@ -224,6 +235,12 @@ module GC
       LibGC.set_handle_fork(1)
     {% end %}
     LibGC.init
+
+    # Enable parallel marking. libgc only spawns its marker threads lazily on
+    # the first wrapped `pthread_create`, so a program that never creates a
+    # thread (e.g. one built with `-Dwithout_mt`) would otherwise mark on a
+    # single core forever. Idempotent when the markers are already running.
+    start_mark_threads
 
     {% unless flag?(:without_mt) %}
       @@lock = Crystal::RWLock.new
@@ -499,6 +516,17 @@ module GC
   def self.unlock_write
     {% unless flag?(:without_mt) %}
       @@lock.write_unlock
+    {% end %}
+  end
+
+  # :nodoc:
+  #
+  # Starts (or restarts) the parallel marker threads. Idempotent: libgc ignores
+  # the call if marking is already parallel or if no extra markers are available.
+  # A no-op on platforms/libgc versions without the `GC_start_mark_threads` bind.
+  def self.start_mark_threads : Nil
+    {% if LibGC.has_method?(:start_mark_threads) %}
+      LibGC.start_mark_threads
     {% end %}
   end
 
