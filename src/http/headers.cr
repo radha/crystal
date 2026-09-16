@@ -12,10 +12,77 @@ struct HTTP::Headers
   # :nodoc:
   record Key, name : String do
     def hash(hasher)
-      name.each_byte do |c|
-        hasher = normalize_byte(c).hash(hasher)
+      # Normalize the name into a stack buffer and hash it in bulk: feeding
+      # the hasher one byte at a time costs a full permutation per byte,
+      # whereas `Hasher#bytes` consumes 8 bytes per permutation. Names longer
+      # than the buffer are hashed in fixed-size chunks so that equal keys
+      # still produce equal hashes.
+      buf = uninitialized UInt8[HASH_BUFFER_SIZE]
+      ptr = name.to_unsafe
+      remaining = name.bytesize
+
+      while remaining > 0
+        chunk = Math.min(remaining, HASH_BUFFER_SIZE)
+        normalize_into(ptr, buf.to_unsafe, chunk)
+        hasher = hasher.bytes(Slice.new(buf.to_unsafe, chunk))
+        ptr += chunk
+        remaining -= chunk
       end
+
       hasher
+    end
+
+    private HASH_BUFFER_SIZE = 64
+
+    # Writes the normalized form of `src[0, size]` to `dst`, eight bytes at a
+    # time. The final word overlaps the previous one when `size` is not a
+    # multiple of eight (normalization is idempotent, so the overlap is harmless).
+    private def normalize_into(src : UInt8*, dst : UInt8*, size : Int32) : Nil
+      if size < 8
+        size.times { |i| dst[i] = normalize_byte(src[i]) }
+        return
+      end
+
+      i = 0
+      while i + 8 <= size
+        write_u64(dst + i, normalize_word(read_u64(src + i)))
+        i += 8
+      end
+      if i < size
+        i = size - 8
+        write_u64(dst + i, normalize_word(read_u64(src + i)))
+      end
+    end
+
+    # Unaligned 8-byte load/store (both `memcpy`, so the compiler never
+    # assumes 8-byte alignment).
+    @[AlwaysInline]
+    private def read_u64(ptr : UInt8*) : UInt64
+      word = uninitialized UInt64
+      pointerof(word).as(UInt8*).copy_from(ptr, 8)
+      word
+    end
+
+    @[AlwaysInline]
+    private def write_u64(ptr : UInt8*, word : UInt64) : Nil
+      ptr.copy_from(pointerof(word).as(UInt8*), 8)
+    end
+
+    # Applies `normalize_byte` to all eight bytes of `word` at once.
+    @[AlwaysInline]
+    private def normalize_word(word : UInt64) : UInt64
+      low7 = word & 0x7F7F7F7F7F7F7F7F_u64
+      # Bytes >= 'A' (0x41): adding 0x3F sets bit 7 (no cross-byte carries since low7 <= 0x7F per byte)
+      ge_a = low7 &+ 0x3F3F3F3F3F3F3F3F_u64
+      # Bytes >= 'Z' + 1 (0x5B): adding 0x25 sets bit 7
+      gt_z = low7 &+ 0x2525252525252525_u64
+      upper = ge_a & ~gt_z & ~word & 0x8080808080808080_u64
+      word |= upper >> 2 # 0x80 >> 2 == 0x20: 'A'..'Z' => 'a'..'z'
+
+      # Bytes == '_' (0x5F): exact zero-byte test on `word ^ 0x5F`
+      x = word ^ 0x5F5F5F5F5F5F5F5F_u64
+      zero = ~(((x & 0x7F7F7F7F7F7F7F7F_u64) &+ 0x7F7F7F7F7F7F7F7F_u64) | x) & 0x8080808080808080_u64
+      word ^ ((zero >> 7) &* 0x72_u64) # 0x5F ^ 0x72 == 0x2D: '_' => '-'
     end
 
     def ==(key2)
@@ -44,7 +111,7 @@ struct HTTP::Headers
 
       return byte if char.ascii_lowercase? || char == '-' # Optimize the common case
       return byte + 32 if char.ascii_uppercase?
-      return '-'.ord if char == '_'
+      return '-'.ord.to_u8 if char == '_'
 
       byte
     end

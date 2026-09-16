@@ -106,6 +106,62 @@ describe HTTP::Headers do
     end
   end
 
+  describe "Key#hash" do
+    # Keys are normalized eight bytes at a time; cover every position within a
+    # word, the word/tail boundaries and the internal chunk size.
+    it "matches for names that differ only in case or '_' vs '-'" do
+      [1, 4, 7, 8, 9, 12, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 200].each do |len|
+        base = String.build { |io| len.times { |i| io << ((i % 5 == 4) ? '-' : ('a' + i % 26)) } }
+        variant = String.build do |io|
+          base.each_char_with_index do |c, i|
+            io << (c == '-' ? (i.odd? ? '_' : '-') : (i.odd? ? c.upcase : c))
+          end
+        end
+        a = HTTP::Headers::Key.new(base)
+        b = HTTP::Headers::Key.new(variant)
+        a.should eq(b), "len=#{len}"
+        a.hash.should eq(b.hash), "len=#{len}"
+      end
+    end
+
+    it "distinguishes names that differ in one byte at any position" do
+      base = "x" * 70
+      70.times do |i|
+        other = base.sub(i, 'y')
+        HTTP::Headers::Key.new(base).should_not eq HTTP::Headers::Key.new(other)
+        HTTP::Headers::Key.new(base).hash.should_not eq HTTP::Headers::Key.new(other).hash
+      end
+    end
+
+    it "only folds ASCII letters and '_'" do
+      # Neighbours of the folded ranges must stay distinct: '@' (0x40) / '[' (0x5B) / '`' / '{' / DEL / high bytes.
+      pairs = {
+        {"@", "`"}, {"[", "{"}, {"\u{5e}", "\u{7e}"}, {"\u{7f}", "\u{5f}"}, {"\u{c0}", "\u{e0}"}, {"\u{c1}", "\u{e1}"},
+        {"\u{5f}", "\u{2d}"}, # '_' and '-' *are* the same
+      }
+      pairs.each do |x, y|
+        a = HTTP::Headers::Key.new("k#{x}k")
+        b = HTTP::Headers::Key.new("k#{y}k")
+        if x == "\u{5f}"
+          a.should eq b
+          a.hash.should eq b.hash
+        else
+          a.should_not eq b
+          a.hash.should_not eq b.hash
+        end
+      end
+    end
+
+    it "looks up long header names case-insensitively" do
+      name = "X-" + "Very-Long-Header-Name-" * 6
+      name.bytesize.should be > 64
+      headers = HTTP::Headers{name => "v"}
+      headers[name.downcase].should eq "v"
+      headers[name.upcase.tr("-", "_")].should eq "v"
+      headers[name.downcase.sub(-1, 'x')]?.should be_nil
+    end
+  end
+
   it "dups" do
     headers = HTTP::Headers{"Foo" => "bar"}
     other = headers.dup
