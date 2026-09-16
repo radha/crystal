@@ -2825,9 +2825,38 @@ class String
         return gsub_ascii_char(char, replacement)
       end
 
+      if char.ascii? && (replacement.is_a?(String) || replacement.is_a?(Char)) && (ascii_only? || valid_encoding?)
+        return gsub_ascii_byte(char.ord.to_u8!, replacement.to_s)
+      end
+
       gsub { |my_char| char == my_char ? replacement : my_char }
     else
       self
+    end
+  end
+
+  # Replaces every *byte* (an ASCII character, so it can't be part of a
+  # multibyte sequence) with *replacement*, copying the runs between matches.
+  # The receiver must be valid UTF-8 and contain *byte* at least once.
+  private def gsub_ascii_byte(byte : UInt8, replacement : String) : String
+    slice = to_slice
+    count = slice.count(byte)
+    new_bytesize = bytesize + count * (replacement.bytesize - 1)
+    return "" if new_bytesize == 0
+
+    String.new(new_bytesize) do |buffer|
+      out = 0
+      last = 0
+      while index = slice.index(byte, last)
+        run = index - last
+        (to_unsafe + last).copy_to(buffer + out, run)
+        out += run
+        replacement.to_unsafe.copy_to(buffer + out, replacement.bytesize)
+        out += replacement.bytesize
+        last = index + 1
+      end
+      (to_unsafe + last).copy_to(buffer + out, bytesize - last)
+      {new_bytesize, 0}
     end
   end
 
@@ -2982,6 +3011,10 @@ class String
   # "hello".gsub({'e' => 'a', 'l' => 'd'}) # => "haddo"
   # ```
   def gsub(hash : Hash(Char, _)) : String
+    if (set = ascii_char_set(hash.each_key)) && (ascii_only? || valid_encoding?)
+      return gsub_ascii_set(set) { |char| hash[char]? || char }
+    end
+
     gsub do |char|
       hash[char]? || char
     end
@@ -2994,8 +3027,76 @@ class String
   # "hello".gsub({e: 'a', l: 'd'}) # => "haddo"
   # ```
   def gsub(tuple : NamedTuple) : String
+    if (set = ascii_key_set(tuple)) && (ascii_only? || valid_encoding?)
+      return gsub_ascii_set(set) { |char| tuple[char.to_s]? || char }
+    end
+
     gsub do |char|
       tuple[char.to_s]? || char
+    end
+  end
+
+  # Returns the ASCII set of *tuple*'s keys, or `nil` unless every key is a
+  # single ASCII character. `keys` is a compile-time `Tuple` of symbols, so
+  # this never touches the heap.
+  private def ascii_key_set(tuple : NamedTuple) : Tuple(UInt64, UInt64)?
+    ascii_char_set(tuple.keys.map { |key| (name = key.to_s).size == 1 ? name[0] : (return nil) })
+  end
+
+  # Returns the 128-bit membership set of *chars* as two words, or `nil` if any
+  # of them is not ASCII (a byte of a multibyte UTF-8 sequence never equals an
+  # ASCII byte, so such a set can be probed byte by byte on valid UTF-8).
+  private def ascii_char_set(chars) : Tuple(UInt64, UInt64)?
+    lo = 0_u64
+    hi = 0_u64
+    chars.each do |char|
+      return nil unless char.ascii?
+      ord = char.ord
+      if ord < 64
+        lo |= 1_u64 << ord
+      else
+        hi |= 1_u64 << (ord - 64)
+      end
+    end
+    {lo, hi}
+  end
+
+  private def ascii_set_includes?(set : Tuple(UInt64, UInt64), byte : UInt8) : Bool
+    if byte < 64
+      set[0].bit(byte) == 1
+    elsif byte < 128
+      set[1].bit(byte - 64) == 1
+    else
+      false
+    end
+  end
+
+  # Replaces every byte in *set* with the block's value for its char, copying
+  # the runs in between; returns `self` when no byte matches. The receiver
+  # must be valid UTF-8.
+  private def gsub_ascii_set(set : Tuple(UInt64, UInt64), &) : String
+    ptr = to_unsafe
+    size = bytesize
+
+    first = 0
+    while first < size && !ascii_set_includes?(set, ptr[first])
+      first &+= 1
+    end
+    return self if first == size
+
+    String.build(size + 16) do |buffer|
+      last = 0
+      index = first
+      while index < size
+        byte = ptr[index]
+        if ascii_set_includes?(set, byte)
+          buffer.write unsafe_byte_slice(last, index - last)
+          buffer << yield byte.unsafe_chr
+          last = index + 1
+        end
+        index += 1
+      end
+      buffer.write unsafe_byte_slice(last, size - last)
     end
   end
 
