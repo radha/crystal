@@ -128,7 +128,7 @@ struct Slice(T)
   # This method allocates memory for the slice copy and stores the return values
   # from calling `#clone` on each item.
   def clone
-    pointer = Pointer(T).malloc(size)
+    pointer = Pointer(T).malloc_uninitialized(size)
     copy = self.class.new(pointer, size)
     each_with_index do |item, i|
       copy[i] = item.clone
@@ -140,7 +140,7 @@ struct Slice(T)
   #
   # This method allocates memory for the slice copy and duplicates the values.
   def dup
-    pointer = Pointer(T).malloc(size)
+    pointer = Pointer(T).malloc_uninitialized(size)
     copy = self.class.new(pointer, size)
     copy.copy_from(self)
     copy

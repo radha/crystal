@@ -119,7 +119,9 @@ class Array(T)
     if initial_capacity == 0
       @buffer = Pointer(T).null
     else
-      @buffer = Pointer(T).malloc(initial_capacity)
+      # Slots past `@size` are never read before being assigned, so the
+      # buffer doesn't need to be cleared.
+      @buffer = Pointer(T).malloc_uninitialized(initial_capacity)
     end
   end
 
