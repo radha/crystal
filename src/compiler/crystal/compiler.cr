@@ -295,6 +295,7 @@ module Crystal
       program.flags << "release" if release?
       program.flags << "debug" unless debug.none?
       program.flags << "static" if static?
+      program.flags << "frame_pointers" unless frame_pointers.auto?
       program.user_flags.concat @flags
       program.flags.concat @flags
       program.define_crystal_constants

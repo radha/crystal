@@ -1,6 +1,68 @@
 require "../spec_helper"
 
+{% if flag?(:darwin) && !flag?(:interpreted) %}
+  # The frame-pointer walk that collects backtraces on Darwin must agree with
+  # libunwind (see `Exception::CallStack.unwind`).
+  struct Exception::CallStack
+    @[NoInline]
+    def self.spec_walks
+      {unwind_frame_pointers, unwind_libunwind}
+    end
+  end
+
+  private def frame_pointer_walk_matches_libunwind
+    fp, lu = Exception::CallStack.spec_walks
+    # The leading entries are walker-local (the walkers themselves and their
+    # call sites); compare from the first return address both agree on.
+    first = fp.index { |ip| lu.includes?(ip) }.not_nil!
+    fp_tail = Exception::CallStack.new(fp[first..]).printable_backtrace
+    lu_tail = Exception::CallStack.new(lu[lu.index(fp[first]).not_nil!..]).printable_backtrace
+    # libunwind stops before dyld's `start` (no unwind info registered for
+    # dyld); the frame-pointer walk reports it as the final frame.
+    fp_tail.pop if fp_tail.size == lu_tail.size + 1 && fp_tail.last.includes?("dyld")
+    fp_tail.should eq(lu_tail)
+    fp_tail.size.should be > 0
+  end
+
+  @[NoInline]
+  private def deep_frame_pointer_walk(n)
+    if n == 0
+      frame_pointer_walk_matches_libunwind
+      0
+    else
+      deep_frame_pointer_walk(n - 1) &+ 1
+    end
+  end
+{% end %}
+
 describe "Backtrace" do
+  {% if flag?(:darwin) && !flag?(:interpreted) %}
+    it "collects the same frames as libunwind by walking frame pointers" do
+      frame_pointer_walk_matches_libunwind
+      deep_frame_pointer_walk(40)
+    end
+
+    it "walks frame pointers inside a fiber" do
+      done = Channel(Exception?).new
+      spawn do
+        frame_pointer_walk_matches_libunwind
+        deep_frame_pointer_walk(20)
+        done.send(nil)
+      rescue ex
+        done.send(ex)
+      end
+      done.receive.should be_nil
+    end
+
+    it "keeps the raising frame in a rescued exception's backtrace" do
+      ex = expect_raises(Exception, "frame pointers") do
+        deep_frame_pointer_walk(3)
+        raise "frame pointers"
+      end
+      ex.backtrace.any?(&.includes?("call_stack_spec.cr")).should be_true
+    end
+  {% end %}
+
   it "prints file line:column", tags: %w[slow] do
     source_file = datapath("backtrace_sample")
 

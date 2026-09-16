@@ -171,6 +171,15 @@ lib LibIntrinsics
     fun va_end = "llvm.va_end.p0"(ap : Void*)
   {% end %}
 
+  # Both take the frame level as an immediate; only `0` (the current frame)
+  # is portable across targets.
+  {% if compare_versions(Crystal::LLVM_VERSION, "15.0.0") < 0 %}
+    fun frameaddress = "llvm.frameaddress.p0i8"(level : Int32) : Void*
+  {% else %}
+    fun frameaddress = "llvm.frameaddress.p0"(level : Int32) : Void*
+  {% end %}
+  fun returnaddress = "llvm.returnaddress"(level : Int32) : Void*
+
   {% if flag?(:i386) || flag?(:x86_64) %}
     {% if flag?(:interpreted) %} @[Primitive(:interpreter_intrinsics_pause)] {% end %}
     fun pause = "llvm.x86.sse2.pause"
