@@ -4396,95 +4396,6 @@ class String
     return unless 0 <= offset <= bytesize
     return offset if search.empty?
 
-    nsize = search.bytesize
-    # The last byte offset at which the needle still fits in the haystack.
-    limit = bytesize - nsize
-    return nil if offset > limit
-
-    first = search.to_unsafe.value
-    needle = search.to_unsafe
-    haystack = to_unsafe
-    bytes = to_slice
-    fails = 0
-    charged = 0_i64
-    start_offset = offset
-
-    # Anchor on the needle's first byte using `memchr` (`Slice#fast_index`),
-    # then confirm the whole needle with a `memcmp`. This skips over the bytes
-    # between candidate positions with SIMD instead of rolling a hash across
-    # every single one. On adversarially dense inputs — where the first byte
-    # matches almost everywhere but the full needle rarely does — fall back to
-    # a linear algorithm once the worst-case cost of the failed compares
-    # outgrows the distance scanned by this call. This is the hybrid strategy
-    # used by Go's `strings.Index`.
-    while offset <= limit
-      idx = bytes.fast_index(first, offset)
-      return nil if idx.nil? || idx > limit
-      return idx if (haystack + idx).memcmp(needle, nsize) == 0
-
-      offset = idx + 1
-      fails &+= 1
-      if fails >= 4 + ((offset - start_offset) >> 4)
-        # For a tiny needle a failed compare costs at most a few register
-        # compares, so a brute-force scan stays linear with a smaller
-        # constant than rolling a hash; Rabin-Karp protects longer needles,
-        # whose partial matches can make failed compares expensive.
-        if nsize <= 4
-          return byte_index_naive(search, offset)
-        else
-          return byte_index_rabin_karp(search, offset)
-        end
-      end
-      if nsize > 4
-        # Anchors recurring no faster than once per 16 bytes never grow
-        # `fails` past the cap above, yet a periodic haystack can still make
-        # every failed compare run the needle's full length — quadratic when
-        # the anchors also recur faster than every `nsize` bytes. Charging
-        # each failure at that worst case catches exactly this zone.
-        charged &+= nsize
-        if charged >= 4_i64 &* nsize &+ (offset - start_offset)
-          return byte_index_rabin_karp(search, offset)
-        end
-      end
-    end
-
-    nil
-  end
-
-  # Brute-force scan for *search* starting at byte *offset*, comparing bytes
-  # inline (no `memcmp` call). Used as the linear-time fallback for
-  # `#byte_index` on tiny needles once the memchr anchor has failed too many
-  # times on a dense haystack. The `nsize` guards are loop-invariant, so the
-  # optimizer unswitches this into a flat compare chain per needle size.
-  private def byte_index_naive(search : String, offset : Int32) : Int32?
-    nsize = search.bytesize
-    limit = bytesize - nsize
-    needle = search.to_unsafe
-    haystack = to_unsafe
-
-    b0 = needle[0]
-    b1 = nsize > 1 ? needle[1] : 0_u8
-    b2 = nsize > 2 ? needle[2] : 0_u8
-    b3 = nsize > 3 ? needle[3] : 0_u8
-
-    while offset <= limit
-      if haystack[offset] == b0 &&
-         (nsize <= 1 || haystack[offset + 1] == b1) &&
-         (nsize <= 2 || haystack[offset + 2] == b2) &&
-         (nsize <= 3 || haystack[offset + 3] == b3)
-        return offset
-      end
-      offset += 1
-    end
-
-    nil
-  end
-
-  # Searches for *search* starting at byte *offset* with the Rabin-Karp
-  # algorithm (https://en.wikipedia.org/wiki/Rabin%E2%80%93Karp_algorithm).
-  # Used as the linear-time fallback for `#byte_index` once the memchr anchor
-  # has failed too many times on a dense haystack.
-  private def byte_index_rabin_karp(search : String, offset : Int32) : Int32?
     scan_byte_index(search, offset) do |index|
       return index
     end
@@ -5619,45 +5530,172 @@ class String
     matches
   end
 
-  # Yields the byte indices of all occurrences of *search* in the string.
-  # Used by the `String` overloads of `#gsub`, `#scan`, and `#byte_index`.
+  # Yields the byte indices of all non-overlapping occurrences of *search* in
+  # the string, in ascending order. Used by the `String` overloads of `#gsub`,
+  # `#scan`, and `#byte_index`.
   #
   # *offset* must be within `0..bytesize` and *search* must not be empty.
+  #
+  # Anchors on the needle's first byte using `memchr` (`Slice#fast_index`),
+  # then confirms the whole needle with a `memcmp`. This skips over the bytes
+  # between candidate positions with SIMD instead of rolling a hash across
+  # every single one. On adversarially dense inputs — where the first byte
+  # matches almost everywhere but the full needle rarely does — the rest of
+  # the scan falls back to a linear algorithm once the worst-case cost of the
+  # failed compares outgrows the distance scanned by this call. This is the
+  # hybrid strategy used by Go's `strings.Index`.
   private def scan_byte_index(search : String, offset = 0, & : Int32 ->) : Nil
-    # Rabin-Karp algorithm
-    # https://en.wikipedia.org/wiki/Rabin%E2%80%93Karp_algorithm
+    nsize = search.bytesize
+    # The last byte offset at which the needle still fits in the haystack.
+    limit = bytesize - nsize
+    return if offset > limit
 
-    # calculate a rolling hash of this text (haystack)
-    pointer = head_pointer = to_unsafe + offset
-    hash_end_pointer = pointer + search.bytesize
-    end_pointer = to_unsafe + bytesize
-    hash = 0u32
-    return if hash_end_pointer > end_pointer
-    while pointer < hash_end_pointer
-      hash = hash &* PRIME_RK &+ pointer.value
-      pointer += 1
+    first = search.to_unsafe.value
+    needle = search.to_unsafe
+    haystack = to_unsafe
+    bytes = to_slice
+    fails = 0
+    charged = 0_i64
+    start_offset = offset
+
+    # wrapping subtraction so it simply goes negative (disabling the word
+    # probe) when the haystack is shorter than a word
+    word_limit = bytesize &- 8
+    first_word = first.to_u64 &* 0x0101010101010101_u64
+
+    while offset <= limit
+      # Before calling `memchr`, test the next machine word inline for the
+      # anchor byte (SWAR "has a zero byte" on the XOR with the broadcast
+      # byte): with densely repeated matches the next candidate is only a
+      # few bytes away, and the call setup would cost more than the bytes in
+      # between. Only the lowest flagged byte of the test is exact, and that
+      # is the one wanted (little-endian).
+      if offset <= word_limit
+        x = (haystack + offset).as(UInt64*).value ^ first_word
+        found = (x &- 0x0101010101010101_u64) & ~x & 0x8080808080808080_u64
+        if found != 0
+          idx = offset + (found.trailing_zeros_count >> 3)
+        else
+          idx = bytes.fast_index(first, offset + 8)
+          return if idx.nil?
+        end
+      else
+        idx = bytes.fast_index(first, offset)
+        return if idx.nil?
+      end
+      return if idx > limit
+
+      if (haystack + idx).memcmp(needle, nsize) == 0
+        yield idx
+        # no overlapping matches; advance past the matched string
+        offset = idx + nsize
+        next
+      end
+
+      offset = idx + 1
+      fails &+= 1
+      if fails >= 4 + ((offset - start_offset) >> 4)
+        # For a tiny needle a failed compare costs at most a few register
+        # compares, so a brute-force scan stays linear with a smaller
+        # constant than rolling a hash; Rabin-Karp protects longer needles,
+        # whose partial matches can make failed compares expensive.
+        if nsize <= 4
+          scan_byte_index_naive(search, offset) { |index| yield index }
+        else
+          scan_byte_index_rabin_karp(search, offset) { |index| yield index }
+        end
+        return
+      end
+      if nsize > 4
+        # Anchors recurring no faster than once per 16 bytes never grow
+        # `fails` past the cap above, yet a periodic haystack can still make
+        # every failed compare run the needle's full length — quadratic when
+        # the anchors also recur faster than every `nsize` bytes. Charging
+        # each failure at that worst case catches exactly this zone.
+        charged &+= nsize
+        if charged >= 4_i64 &* nsize &+ (offset - start_offset)
+          scan_byte_index_rabin_karp(search, offset) { |index| yield index }
+          return
+        end
+      end
     end
+  end
+
+  # Brute-force scan yielding every non-overlapping occurrence of *search*
+  # from byte *offset*, comparing bytes inline (no `memcmp` call). Used as the
+  # linear-time fallback of `#scan_byte_index` for tiny needles once the
+  # memchr anchor has failed too many times on a dense haystack. The `nsize`
+  # guards are loop-invariant, so the optimizer unswitches this into a flat
+  # compare chain per needle size.
+  private def scan_byte_index_naive(search : String, offset : Int32, & : Int32 ->) : Nil
+    nsize = search.bytesize
+    limit = bytesize - nsize
+    needle = search.to_unsafe
+    haystack = to_unsafe
+
+    b0 = needle[0]
+    b1 = nsize > 1 ? needle[1] : 0_u8
+    b2 = nsize > 2 ? needle[2] : 0_u8
+    b3 = nsize > 3 ? needle[3] : 0_u8
+
+    while offset <= limit
+      if haystack[offset] == b0 &&
+         (nsize <= 1 || haystack[offset + 1] == b1) &&
+         (nsize <= 2 || haystack[offset + 2] == b2) &&
+         (nsize <= 3 || haystack[offset + 3] == b3)
+        yield offset
+        offset += nsize
+      else
+        offset += 1
+      end
+    end
+  end
+
+  # Yields every non-overlapping occurrence of *search* from byte *offset*
+  # using the Rabin-Karp algorithm
+  # (https://en.wikipedia.org/wiki/Rabin%E2%80%93Karp_algorithm). Used as the
+  # linear-time fallback of `#scan_byte_index` once the memchr anchor has
+  # failed too many times on a dense haystack.
+  private def scan_byte_index_rabin_karp(search : String, offset : Int32, & : Int32 ->) : Nil
+    nsize = search.bytesize
+    needle = search.to_unsafe
+    end_pointer = to_unsafe + bytesize
+
+    # the window [head_pointer, pointer) holds the *nsize* haystack bytes
+    # covered by the rolling hash
+    head_pointer = to_unsafe + offset
+    pointer = head_pointer + nsize
+    return if pointer > end_pointer
 
     # calculate a rolling hash of search text (needle)
     search_hash = 0u32
     search.each_byte do |b|
       search_hash = search_hash &* PRIME_RK &+ b
     end
-    pow = PRIME_RK &** search.bytesize
+    pow = PRIME_RK &** nsize
+
+    # calculate a rolling hash of this text (haystack)
+    hash = 0u32
+    head_pointer.to_slice(nsize).each do |b|
+      hash = hash &* PRIME_RK &+ b
+    end
 
     while true
       # check hash equality and real string equality
-      if hash == search_hash && head_pointer.memcmp(search.to_unsafe, search.bytesize) == 0
+      if hash == search_hash && head_pointer.memcmp(needle, nsize) == 0
         yield offset
-        offset += search.bytesize
 
-        # no overlapping matches; advance past the matched string
-        search.bytesize.times do
-          hash = hash &* PRIME_RK &+ pointer.value &- pow &* head_pointer.value
-          pointer += 1
-          head_pointer += 1
+        # no overlapping matches; restart the window right past the match
+        # (rolling it forward byte by byte would read past the string's end
+        # when the match is its tail)
+        offset += nsize
+        head_pointer = pointer
+        pointer += nsize
+        return if pointer > end_pointer
+        hash = 0u32
+        head_pointer.to_slice(nsize).each do |b|
+          hash = hash &* PRIME_RK &+ b
         end
-
         next
       end
 
