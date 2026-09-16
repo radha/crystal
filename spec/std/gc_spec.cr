@@ -77,6 +77,10 @@ describe "GC" do
       {% end %}
     end
 
+    it "defaults the free-space divisor to 2" do
+      GC.free_space_divisor.should eq(2) unless ENV["CRYSTAL_GC_FREE_SPACE_DIVISOR"]?
+    end
+
     it ".free_space_divisor round-trips" do
       original = GC.free_space_divisor
       begin

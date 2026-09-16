@@ -380,16 +380,23 @@ module GC
   # negligible resident-memory cost (pages are committed lazily). See `.init`.
   private DEFAULT_INITIAL_HEAP_SIZE = 8 * 1024 * 1024
 
-  # Applies heap-pacing tuning at start-up: an initial-heap floor and an optional
-  # free-space divisor override. The `CRYSTAL_GC_INITIAL_HEAP` and
+  # Default free-space divisor applied at start-up unless overridden by the
+  # `CRYSTAL_GC_FREE_SPACE_DIVISOR` environment variable. libgc's own default of
+  # 3 lets the heap grow to only about 1.7 times the live data before the next
+  # collection, so allocation-heavy programs spend much of their time marking
+  # the same live set again and again. 2 lets it grow to about twice the live
+  # data, the ratio Go uses by default (`GOGC=100`). See `.free_space_divisor`.
+  private DEFAULT_FREE_SPACE_DIVISOR = 2
+
+  # Applies heap-pacing tuning at start-up: an initial-heap floor and the
+  # free-space divisor. The `CRYSTAL_GC_INITIAL_HEAP` and
   # `CRYSTAL_GC_FREE_SPACE_DIVISOR` environment variables work on every platform,
   # including Windows where libgc's own `GC_*` env vars are compiled out. Values
   # accept an optional `k`/`m`/`g` (1024-based) suffix. Reads the raw C strings to
   # avoid allocating during early init.
   private def self.apply_heap_tuning : Nil
-    if divisor = env_size?("CRYSTAL_GC_FREE_SPACE_DIVISOR")
-      LibGC.set_free_space_divisor(LibGC::Word.new(divisor)) if divisor > 0
-    end
+    divisor = env_size?("CRYSTAL_GC_FREE_SPACE_DIVISOR") || DEFAULT_FREE_SPACE_DIVISOR.to_u64
+    LibGC.set_free_space_divisor(LibGC::Word.new(divisor)) if divisor > 0
 
     initial_heap = env_size?("CRYSTAL_GC_INITIAL_HEAP") || DEFAULT_INITIAL_HEAP_SIZE.to_u64
     presize_heap(initial_heap) if initial_heap > 0
@@ -563,7 +570,8 @@ module GC
   # The collector triggers a full collection roughly every
   # `heap_size / free_space_divisor` bytes of allocation. A larger divisor
   # collects more often (lower memory use, more CPU); a smaller one collects
-  # less often (higher memory use, less CPU). The default is `3`.
+  # less often (higher memory use, less CPU). The default is `2` (libgc's own
+  # default is `3`); `CRYSTAL_GC_FREE_SPACE_DIVISOR` overrides it at start-up.
   def self.free_space_divisor : UInt64
     LibGC.get_free_space_divisor.to_u64!
   end
