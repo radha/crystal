@@ -2,6 +2,7 @@ module LLVM
   @[Flags]
   enum Attribute : UInt64
     Alignment
+    AllocKind
     AllocSize
     AlwaysInline
     ArgMemOnly
@@ -87,6 +88,7 @@ module LLVM
     private def self.load_llvm_kinds_from_names
       kinds = {} of Attribute => UInt32
       kinds[Alignment] = kind_for_name("align")
+      kinds[AllocKind] = kind_for_name("allockind") unless LibLLVM::IS_LT_150
       kinds[AllocSize] = kind_for_name("allocsize")
       kinds[AlwaysInline] = kind_for_name("alwaysinline")
       kinds[ArgMemOnly] = kind_for_name("argmemonly")

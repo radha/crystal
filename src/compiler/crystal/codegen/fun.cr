@@ -57,8 +57,30 @@ class Crystal::CodeGenVisitor
         new_fun.add_attribute(attrs, index + 1, param_type)
       end
     end
+    add_allocator_attributes(mangled_name, new_fun)
 
     typed_fun
+  end
+
+  # Marks the GC entry points and libgc's allocation functions as allocators
+  # for LLVM (see `ALLOCATOR_ATTRIBUTES`). Applied both where a function is
+  # defined and where it is declared in another module, since LLVM reads the
+  # attributes off the callee visible from the call site.
+  def add_allocator_attributes(mangled_name, func : LLVM::Function)
+    kind, size_arg = ALLOCATOR_ATTRIBUTES[mangled_name]? || return
+
+    # a `free` returns nothing to mark as `noalias`
+    func.add_attribute LLVM::Attribute::NoAlias, LLVM::AttributeIndex::ReturnIndex unless kind == ALLOC_KIND_FREE
+    if size_arg
+      # `allocsize(N)` packs the element-size argument index in the high word
+      # and "no element-count argument" (all ones) in the low word.
+      func.add_attribute LLVM::Attribute::AllocSize, value: (size_arg.to_u64 << 32) | 0xFFFF_FFFF_u64
+    end
+
+    {% unless LibLLVM::IS_LT_150 %}
+      func.add_attribute LLVM::Attribute::AllocKind, value: kind
+      func.add_attribute "alloc-family", value: "GC_malloc"
+    {% end %}
   end
 
   def codegen_fun(mangled_name, target_def, self_type, is_exported_fun = false, fun_module_info = type_module(self_type), is_fun_literal = false, is_closure = false)
@@ -394,6 +416,7 @@ class Crystal::CodeGenVisitor
       end
 
     setup_context_fun(mangled_name, target_def, llvm_args_types, llvm_return_type)
+    add_allocator_attributes(mangled_name, context.fun)
 
     if call_convention = target_def.call_convention
       context.fun.call_convention = call_convention
