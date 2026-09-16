@@ -44,9 +44,7 @@ module Base64
   def encode(data) : String
     slice = data.to_slice
     String.new(encode_size(slice.size, new_lines: true)) do |buf|
-      appender = buf.appender
-      encode_with_new_lines(slice) { |byte| appender << byte }
-      size = appender.size
+      size = encode_lines_raw(slice, buf)
       {size, size}
     end
   end
@@ -59,28 +57,7 @@ module Base64
   # Base64.encode("Now is the time for all good coders\nto learn Crystal", STDOUT)
   # ```
   def encode(data, io : IO)
-    count = 0
-    encode_with_new_lines(data.to_slice) do |byte|
-      io << byte.unsafe_chr
-      count += 1
-    end
-    io.flush
-    count
-  end
-
-  private def encode_with_new_lines(data, &)
-    inc = 0
-    to_base64(data.to_slice, CHARS_STD, pad: true) do |byte|
-      yield byte
-      inc += 1
-      if inc >= LINE_SIZE
-        yield NL
-        inc = 0
-      end
-    end
-    if inc > 0
-      yield NL
-    end
+    encode_to_io(data.to_slice, io) { |chunk, dst| encode_lines_raw(chunk, dst) }
   end
 
   # Returns the base64-encoded version of *data* with no newlines.
@@ -96,15 +73,13 @@ module Base64
   # Tm93IGlzIHRoZSB0aW1lIGZvciBhbGwgZ29vZCBjb2RlcnMKdG8gbGVhcm4gQ3J5c3RhbA==
   # ```
   def strict_encode(data) : String
-    strict_encode data, CHARS_STD, pad: true
+    strict_encode data, ENCODE_TABLE_STD, pad: true
   end
 
-  private def strict_encode(data, alphabet, pad = false)
+  private def strict_encode(data, table, pad = false)
     slice = data.to_slice
     String.new(encode_size(slice.size)) do |buf|
-      appender = buf.appender
-      to_base64(slice, alphabet, pad: pad) { |byte| appender << byte }
-      size = appender.size
+      size = encode_raw(slice, buf, table, pad)
       {size, size}
     end
   end
@@ -116,17 +91,11 @@ module Base64
   # Base64.strict_encode("Now is the time for all good coders\nto learn Crystal", STDOUT)
   # ```
   def strict_encode(data, io : IO)
-    strict_encode_to_io_internal(data, io, CHARS_STD, pad: true)
+    strict_encode_to_io_internal(data, io, ENCODE_TABLE_STD, pad: true)
   end
 
-  private def strict_encode_to_io_internal(data, io, alphabet, pad)
-    count = 0
-    to_base64(data.to_slice, alphabet, pad: pad) do |byte|
-      count += 1
-      io << byte.unsafe_chr
-    end
-    io.flush
-    count
+  private def strict_encode_to_io_internal(data, io, table, pad)
+    encode_to_io(data.to_slice, io) { |chunk, dst| encode_raw(chunk, dst, table, pad) }
   end
 
   # Returns the base64-encoded version of *data* using a urlsafe alphabet.
@@ -138,13 +107,7 @@ module Base64
   # The *padding* parameter defaults to `true`. When `false`, enough `=` characters
   # are not added to make the output divisible by 4.
   def urlsafe_encode(data, padding = true) : String
-    slice = data.to_slice
-    String.new(encode_size(slice.size)) do |buf|
-      appender = buf.appender
-      to_base64(slice, CHARS_SAFE, pad: padding) { |byte| appender << byte }
-      size = appender.size
-      {size, size}
-    end
+    strict_encode data, ENCODE_TABLE_SAFE, pad: padding
   end
 
   # Writes the base64-encoded version of *data* using a urlsafe alphabet to *io*.
@@ -153,26 +116,31 @@ module Base64
   #
   # The alphabet uses `'-'` instead of `'+'` and `'_'` instead of `'/'`.
   def urlsafe_encode(data, io : IO)
-    strict_encode_to_io_internal(data, io, CHARS_SAFE, pad: true)
+    strict_encode_to_io_internal(data, io, ENCODE_TABLE_SAFE, pad: true)
   end
 
   # Returns the base64-decoded version of *data* as a `Bytes`.
   # This will decode either the normal or urlsafe alphabets.
   def decode(data) : Bytes
     slice = data.to_slice
-    buf = Pointer(UInt8).malloc(decode_size(slice.size))
-    appender = buf.appender
-    from_base64(slice) { |byte| appender << byte }
-    appender.to_slice
+    capacity = decode_size(slice.size)
+    buf = Pointer(UInt8).malloc(capacity)
+    Slice.new(buf, decode_into(slice, buf, capacity))
   end
 
   # Writes the base64-decoded version of *data* to *io*.
   # This will decode either the normal or urlsafe alphabets.
   def decode(data, io : IO)
+    buffer = uninitialized UInt8[IO_CHUNK_DECODED]
+    dst = buffer.to_unsafe
     count = 0
-    from_base64(data.to_slice) do |byte|
-      io.write_byte byte
-      count += 1
+    size = from_base64(data.to_slice, dst, IO_CHUNK_DECODED) do |chunk_size|
+      io.write(Slice.new(dst, chunk_size))
+      count += chunk_size
+    end
+    if size > 0
+      io.write(Slice.new(dst, size))
+      count += size
     end
     io.flush
     count
@@ -182,11 +150,19 @@ module Base64
   # This will decode either the normal or urlsafe alphabets.
   def decode_string(data) : String
     slice = data.to_slice
-    String.new(decode_size(slice.size)) do |buf|
-      appender = buf.appender
-      from_base64(slice) { |byte| appender << byte }
-      {appender.size, 0}
+    capacity = decode_size(slice.size)
+    String.new(capacity) do |buf|
+      {decode_into(slice, buf, capacity), 0}
     end
+  end
+
+  # Decodes all of *data* into *dst*, which must hold *capacity* bytes,
+  # where *capacity* is `decode_size(data.size)`. Returns the number of
+  # bytes written.
+  private def decode_into(data : Bytes, dst : UInt8*, capacity : Int32) : Int32
+    # That capacity always holds the whole output, so `from_base64` never
+    # needs to hand over a filled buffer.
+    from_base64(data, dst, capacity) { }
   end
 
   private def encode_size(str_size, new_lines = false)
@@ -199,57 +175,154 @@ module Base64
     (str_size * 3 / 4.0).to_i + 4
   end
 
-  private def to_base64(data, chars, pad = false, &)
-    bytes = chars.to_unsafe
+  # Every 12 bits of input map to a pair of output characters, stored in
+  # memory order (first character in the low byte).
+  private ENCODE_TABLE_STD = Slice(UInt16).new(4096, read_only: true) do |i|
+    CHARS_STD.to_unsafe[i >> 6].to_u16 | (CHARS_STD.to_unsafe[i & 63].to_u16 << 8)
+  end
+  private ENCODE_TABLE_SAFE = Slice(UInt16).new(4096, read_only: true) do |i|
+    CHARS_SAFE.to_unsafe[i >> 6].to_u16 | (CHARS_SAFE.to_unsafe[i & 63].to_u16 << 8)
+  end
+
+  # Input bytes encoded per `IO` write: a multiple of 45 so that every chunk
+  # ends exactly at a line break (and at a full triple).
+  private IO_CHUNK_INPUT = 45 * 64
+  # Largest possible output for `IO_CHUNK_INPUT` bytes: 64 lines of 60
+  # characters plus a line feed each.
+  private IO_CHUNK_ENCODED = 61 * 64
+  # Decoded bytes buffered per `IO` write (a multiple of 3).
+  private IO_CHUNK_DECODED = 3 * 1024
+
+  # Encodes *data* in chunks into a stack buffer and writes each chunk to *io*
+  # as text. Returns the number of characters written.
+  private def encode_to_io(data : Bytes, io : IO, &) : Int32
+    buffer = uninitialized UInt8[IO_CHUNK_ENCODED]
+    dst = buffer.to_unsafe
+    count = 0
+    while data.size > 0
+      chunk = data[0, Math.min(data.size, IO_CHUNK_INPUT)]
+      size = yield chunk, dst
+      io.write_string(Slice.new(dst, size))
+      count += size
+      data += chunk.size
+    end
+    io.flush
+    count
+  end
+
+  # Encodes *data* into *dst* with line feeds after every 60 characters and
+  # after the last one. Returns the number of bytes written.
+  private def encode_lines_raw(data : Bytes, dst : UInt8*) : Int32
+    table = ENCODE_TABLE_STD.to_unsafe
+    src = data.to_unsafe
     size = data.size
-    cstr = data.to_unsafe
-    return if cstr.null? || size == 0
-    endcstr = cstr + size - size % 3 - 3
+    start = dst
 
-    # process bunch of full triples
-    while cstr < endcstr
-      n = cstr.as(UInt32*).value.byte_swap
-      yield bytes[(n >> 26) & 63]
-      yield bytes[(n >> 20) & 63]
-      yield bytes[(n >> 14) & 63]
-      yield bytes[(n >> 8) & 63]
-      cstr += 3
+    # Full lines: 45 input bytes give 60 characters. The 4-byte load of the
+    # last triple of a line reads one byte into the next line, so the last
+    # (possibly full) line goes through `encode_raw`, which never reads past
+    # the end.
+    while size > 45
+      {% for i in 0...15 %}
+        dst = encode_triple(src, dst, table)
+        src += 3
+      {% end %}
+      dst.value = NL
+      dst += 1
+      size -= 45
     end
 
-    # process last full triple manually, because reading UInt32 not correct for guarded memory
-    if size >= 3
-      n = (cstr.value.to_u32 << 16) | ((cstr + 1).value.to_u32 << 8) | (cstr + 2).value
-      yield bytes[(n >> 18) & 63]
-      yield bytes[(n >> 12) & 63]
-      yield bytes[(n >> 6) & 63]
-      yield bytes[(n) & 63]
-      cstr += 3
+    if size > 0
+      dst += encode_raw(Slice.new(src, size), dst, ENCODE_TABLE_STD, pad: true)
+      dst.value = NL
+      dst += 1
     end
 
-    # process last partial triple
-    pd = size % 3
-    if pd == 1
-      n = (cstr.value.to_u32 << 16)
-      yield bytes[(n >> 18) & 63]
-      yield bytes[(n >> 12) & 63]
-      if pad
-        yield PAD
-        yield PAD
+    (dst - start).to_i32
+  end
+
+  # Encodes the triple at *src* into four characters at *dst*, loading four
+  # bytes at once. Returns the advanced *dst*.
+  @[AlwaysInline]
+  private def encode_triple(src : UInt8*, dst : UInt8*, table : UInt16*) : UInt8*
+    n = src.as(UInt32*).value.byte_swap
+    dst.as(UInt32*).value = table[n >> 20].to_u32 | (table[(n >> 8) & 0xFFF].to_u32 << 16)
+    dst + 4
+  end
+
+  # Encodes *data* into *dst* without line feeds, padding the last group
+  # with `=` if *pad*. Returns the number of bytes written.
+  private def encode_raw(data : Bytes, dst : UInt8*, table : Slice(UInt16), pad : Bool) : Int32
+    size = data.size
+    src = data.to_unsafe
+    start = dst
+    return 0 if src.null? || size == 0
+    table = table.to_unsafe
+
+    full = size // 3
+    if full > 0
+      # All full triples but the last one: reading 4 bytes stays in bounds
+      stop = src + (full - 1) * 3
+      while src < stop
+        dst = encode_triple(src, dst, table)
+        src += 3
       end
-    elsif pd == 2
-      n = (cstr.value.to_u32 << 16) | ((cstr + 1).value.to_u32 << 8)
-      yield bytes[(n >> 18) & 63]
-      yield bytes[(n >> 12) & 63]
-      yield bytes[(n >> 6) & 63]
-      yield PAD if pad
+
+      # The last full triple, without reading past the end
+      n = (src[0].to_u32 << 16) | (src[1].to_u32 << 8) | src[2]
+      dst.as(UInt32*).value = table[n >> 12].to_u32 | (table[n & 0xFFF].to_u32 << 16)
+      dst += 4
+      src += 3
+    end
+
+    case size - full * 3
+    when 1
+      n = src[0].to_u32 << 4
+      dst.as(UInt16*).value = table[n]
+      dst += 2
+      if pad
+        dst[0] = PAD
+        dst[1] = PAD
+        dst += 2
+      end
+    when 2
+      n = (src[0].to_u32 << 10) | (src[1].to_u32 << 2)
+      dst.as(UInt16*).value = table[n >> 6]
+      dst[2] = table[(n & 63) << 6].to_u8! # low byte: the character for `n & 63`
+      dst += 3
+      if pad
+        dst.value = PAD
+        dst += 1
+      end
+    end
+
+    (dst - start).to_i32
+  end
+
+  private INVALID = UInt32::MAX
+
+  # Decoded value of each byte; `INVALID` for bytes outside both alphabets.
+  private DECODE_TABLE = Array(UInt32).new(size: 256) do |i|
+    case i.unsafe_chr
+    when 'A'..'Z' then (i - 0x41).to_u32
+    when 'a'..'z' then (i - 0x47).to_u32
+    when '0'..'9' then (i + 0x04).to_u32
+    when '+', '-' then 0x3E_u32
+    when '/', '_' then 0x3F_u32
+    else               INVALID
     end
   end
 
-  # Processes the given data and yields each byte.
-  private def from_base64(data : Bytes, &block : UInt8 -> Nil)
+  # Decodes *data* into the *capacity* bytes at *dst*. Whenever the buffer
+  # cannot take the next group (and before raising), the number of bytes
+  # written so far is yielded and decoding restarts at *dst*. Returns the
+  # number of bytes written since the last yield. *capacity* must be at
+  # least 6.
+  private def from_base64(data : Bytes, dst : UInt8*, capacity : Int32, &) : Int32
     size = data.size
     bytes = data.to_unsafe
     bytes_begin = bytes
+    table = DECODE_TABLE.to_unsafe
 
     # Get the position of the last valid base64 character (rstrip '\n', '\r' and '=')
     while (size > 0) && (sym = bytes[size - 1]) && sym.in?(NL, NR, PAD)
@@ -258,16 +331,31 @@ module Base64
 
     # Process combinations of four characters until there aren't any left
     fin = bytes + size - 4
-    while true
-      break if bytes > fin
-
-      # Move the pointer by one byte until there is a valid base64 character
-      while bytes.value.in?(NL, NR)
-        bytes += 1
+    cur = dst
+    # Four bytes (a decoded group plus one scratch byte) fit at *cur* iff
+    # `cur <= cur_stop`
+    cur_stop = dst + (capacity - 4)
+    while bytes <= fin
+      if cur > cur_stop
+        yield (cur - dst).to_i32
+        cur = dst
       end
-      break if bytes > fin
 
-      yield_decoded_chunk_bytes(bytes[0], bytes[1], bytes[2], bytes[3], chunk_pos: bytes - bytes_begin)
+      value = (table[bytes[0]] << 18) | (table[bytes[1]] << 12) | (table[bytes[2]] << 6) | table[bytes[3]]
+      # Any `INVALID` entry sets the high bits (shifts wrap); line breaks are
+      # `INVALID` too, so a group never starts with one
+      if value > 0xFFFFFF
+        # Move the pointer by one byte until there is a valid base64 character
+        if bytes.value.in?(NL, NR)
+          bytes += 1
+          next
+        end
+        yield (cur - dst).to_i32
+        raise_unexpected(bytes, bytes - bytes_begin, 4)
+      end
+      # The three decoded bytes in memory order, plus a scratch zero byte
+      cur.as(UInt32*).value = value.byte_swap >> 8
+      cur += 3
       bytes += 4
     end
 
@@ -278,41 +366,45 @@ module Base64
 
     # If the amount of base64 characters is not divisible by 4, the remainder of the previous loop is handled here
     unread_bytes = (fin - bytes) % 4
+    if unread_bytes > 0 && cur > cur_stop + 2
+      yield (cur - dst).to_i32
+      cur = dst
+    end
     case unread_bytes
     when 1
+      yield (cur - dst).to_i32
       raise Base64::Error.new("Wrong size")
     when 2
-      yield_decoded_chunk_bytes(bytes[0], bytes[1], chunk_pos: bytes - bytes_begin)
+      value = (table[bytes[0]] << 6) | table[bytes[1]]
+      if value > 0xFFF
+        yield (cur - dst).to_i32
+        raise_unexpected(bytes, bytes - bytes_begin, 2)
+      end
+      cur[0] = (value >> 4).to_u8!
+      cur += 1
     when 3
-      yield_decoded_chunk_bytes(bytes[0], bytes[1], bytes[2], chunk_pos: bytes - bytes_begin)
+      value = (table[bytes[0]] << 12) | (table[bytes[1]] << 6) | table[bytes[2]]
+      if value > 0x3FFFF
+        yield (cur - dst).to_i32
+        raise_unexpected(bytes, bytes - bytes_begin, 3)
+      end
+      cur[0] = (value >> 10).to_u8!
+      cur[1] = (value >> 2).to_u8!
+      cur += 2
     end
+
+    (cur - dst).to_i32
   end
 
-  # This macro decodes the given chunk of (2-4) base64 characters.
-  # The argument chunk_pos is only used for the resulting error message.
-  # The resulting bytes are then each yielded.
-  private macro yield_decoded_chunk_bytes(*bytes, chunk_pos)
-    %buffer = 0_u32
-    {% for byte, i in bytes %}
-      %decoded = DECODE_TABLE.unsafe_fetch({{byte}})
-      %buffer = (%buffer << 6) + %decoded
-      raise Base64::Error.new("Unexpected byte 0x#{{{byte}}.to_s(16)} at #{{{chunk_pos}} + {{i}}}") if %decoded == 255_u8
-    {% end %}
-
-    # Each byte in the buffer is shifted to rightmost position of the buffer, then casted to a UInt8
-    {% for i in 2..(bytes.size) %}
-      yield (%buffer >> {{ (4 - bytes.size) * 2 + (8 * (bytes.size - i)) }}).to_u8!
-    {% end %}
-  end
-
-  private DECODE_TABLE = Array(UInt8).new(size: 256) do |i|
-    case i.unsafe_chr
-    when 'A'..'Z' then (i - 0x41).to_u8!
-    when 'a'..'z' then (i - 0x47).to_u8!
-    when '0'..'9' then (i + 0x04).to_u8!
-    when '+', '-' then 0x3E_u8
-    when '/', '_' then 0x3F_u8
-    else               255_u8
+  # Raises for the first invalid byte among the *count* bytes at *bytes*,
+  # where *pos* is the position of *bytes* in the input.
+  private def raise_unexpected(bytes : UInt8*, pos : Int64, count : Int32) : NoReturn
+    table = DECODE_TABLE.to_unsafe
+    count.times do |i|
+      if table[bytes[i]] == INVALID
+        raise Base64::Error.new("Unexpected byte 0x#{bytes[i].to_s(16)} at #{pos + i}")
+      end
     end
+    raise Base64::Error.new("Unexpected byte")
   end
 end
