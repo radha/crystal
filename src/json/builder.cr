@@ -175,31 +175,65 @@ class JSON::Builder
       fin = cursor + slice.bytesize
 
       while cursor < fin
-        byte = cursor.value
-        code = table[byte]
-        if code == 0_u8
-          cursor += 1
-          next
+        # Skip whole machine words that contain nothing to escape: for the
+        # typical string (text, no control bytes, no quotes) this is the
+        # entire scan. A word that needs a closer look is handed to the
+        # per-byte loop below, which then returns here for the next word.
+        while cursor + sizeof(UInt64) <= fin && escape_free_word?(cursor.as(UInt64*).value)
+          cursor += sizeof(UInt64)
         end
 
-        @io.write_string Slice.new(start, cursor - start)
-        if code == UNICODE_ESCAPE
-          @io << "\\u00"
-          @io << '0' if byte < 0x10
-          byte.to_s(@io, 16)
-        else
-          # Emit the two-byte `\x` escape in a single write rather than two
-          # separate `IO#<<` (each of which would UTF-8-encode a Char).
-          pair = uninitialized UInt8[2]
-          pair.to_unsafe[0] = 0x5c_u8 # '\\'
-          pair.to_unsafe[1] = code
-          @io.write_string pair.to_slice
+        stop = cursor + sizeof(UInt64) < fin ? cursor + sizeof(UInt64) : fin
+        while cursor < stop
+          byte = cursor.value
+          code = table[byte]
+          if code == 0_u8
+            cursor += 1
+            next
+          end
+
+          @io.write_string Slice.new(start, cursor - start)
+          if code == UNICODE_ESCAPE
+            @io << "\\u00"
+            @io << '0' if byte < 0x10
+            byte.to_s(@io, 16)
+          else
+            # Emit the two-byte `\x` escape in a single write rather than two
+            # separate `IO#<<` (each of which would UTF-8-encode a Char).
+            pair = uninitialized UInt8[2]
+            pair.to_unsafe[0] = 0x5c_u8 # '\\'
+            pair.to_unsafe[1] = code
+            @io.write_string pair.to_slice
+          end
+          cursor += 1
+          start = cursor
         end
-        cursor += 1
-        start = cursor
       end
 
       @io.write_string Slice.new(start, cursor - start)
+    end
+
+    # Whether none of the eight bytes in *word* needs escaping, i.e. no byte
+    # is below `0x20`, equal to `"` (0x22), `\\` (0x5c) or DEL (0x7f) — exactly
+    # the bytes with a non-zero `ESCAPE_TABLE` entry. Bytes `>= 0x80` never
+    # match, so multibyte UTF-8 passes through untouched.
+    #
+    # Each test is the classic SWAR "has a zero byte" / "has a byte less than
+    # n" predicate: a borrow from a matching byte may set the flag of a higher
+    # byte as well, but a flag is never set unless some byte matches, which
+    # is all that is needed to decide whether to look at the word byte by byte.
+    @[AlwaysInline]
+    private def escape_free_word?(word : UInt64) : Bool
+      ones = 0x0101010101010101_u64
+      highs = 0x8080808080808080_u64
+
+      below_0x20 = (word &- ones &* 0x20_u64) & ~word & highs
+      quote = word ^ (ones &* 0x22_u64)
+      backslash = word ^ (ones &* 0x5c_u64)
+      del = word ^ (ones &* 0x7f_u64)
+      zero_byte = (quote &- ones) & ~quote | (backslash &- ones) & ~backslash | (del &- ones) & ~del
+
+      (below_0x20 | zero_byte & highs) == 0
     end
   end
 

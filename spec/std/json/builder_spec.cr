@@ -85,6 +85,38 @@ describe JSON::Builder do
     assert_built(%<"héllo · 日本語 · 😀">) { string("héllo · 日本語 · 😀") }
   end
 
+  it "escapes bytes at every offset across word boundaries" do
+    # The escaper skips clean 8-byte words at a time; make sure a byte that
+    # needs escaping is caught at every position of a word, both when the word
+    # is complete and when it is a short tail, and that nothing else is touched.
+    escapes = {0x00 => "\\u0000", 0x08 => "\\b", 0x1f => "\\u001f", 0x22 => "\\\"", 0x5c => "\\\\", 0x7f => "\\u007f"}
+    (0..20).each do |len|
+      (0...len).each do |pos|
+        escapes.each do |byte, expected|
+          bytes = Bytes.new(len) { |i| ('a'.ord + i).to_u8 }
+          bytes[pos] = byte.to_u8
+          plain = String.new(bytes)
+          expected_json = %<"#{plain[0, pos]}#{expected}#{plain[pos + 1..]}">
+          assert_built(expected_json) { string(plain) }
+        end
+      end
+    end
+  end
+
+  it "leaves clean words untouched next to escaped ones" do
+    # Neighbouring bytes 0x20/0x21/0x23/0x5b/0x5d/0x7e and high (multibyte)
+    # bytes sit right beside the escaped values; none of them may be mistaken
+    # for an escape.
+    neighbours = String.new(Bytes[0x20, 0x21, 0x23, 0x5b, 0x5d, 0x7e, 0xc3, 0xa9, 0x20, 0x21, 0x23, 0x5b, 0x5d, 0x7e, 0xc3, 0xa9])
+    assert_built(%<"#{neighbours}">) { string(neighbours) }
+
+    long = "The quick brown fox jumps over the lazy dog. " * 50
+    assert_built(%<"#{long}">) { string(long) }
+
+    mixed = "#{long}\"#{long}\\#{long}\n#{long}"
+    assert_built(%<"#{long}\\"#{long}\\\\#{long}\\n#{long}">) { string(mixed) }
+  end
+
   it "errors if writing before document start" do
     json = JSON::Builder.new(IO::Memory.new)
     expect_raises JSON::Error, "Write before start_document" do
