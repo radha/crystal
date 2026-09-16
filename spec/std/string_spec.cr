@@ -1564,6 +1564,10 @@ describe "String" do
       "abc".byte_index("abc").should eq(0)   # needle == haystack
       "abc".byte_index("c", -1).should eq(2)
       "".byte_index("a").should be_nil
+      # a needle ending in NUL must not match the string's NUL terminator
+      "ab".byte_index("b\0").should be_nil
+      "ab\0".byte_index("b\0").should eq(1)
+      "\0".byte_index("\0").should eq(0)
     end
 
     it "gets byte index of regex" do
@@ -2177,6 +2181,35 @@ describe "String" do
       result.should eq("fa be")
     end
 
+    it "gsubs with string on sparse and dense haystacks (memchr-anchor / naive and RK cutover)" do
+      # Sparse: rare first byte, one memchr hit per match.
+      (("a" * 4_096 + "needle") * 4).gsub("needle", "N").should eq(("a" * 4_096 + "N") * 4)
+      # Dense: the needle's first byte recurs every few bytes, so the anchor
+      # fails too often and the rest of the replacement runs on the
+      # brute-force (tiny needle) or Rabin-Karp (longer needle) fallback.
+      {"aab", "aaaaaaaab"}.each do |needle|
+        miss = needle.sub("b", "c")
+        hay = (miss * 3 + needle) * 200
+        hay.gsub(needle, "X").should eq((miss * 3 + "X") * 200)
+        hay.gsub(needle) { "Y" }.should eq((miss * 3 + "Y") * 200)
+        str = miss * 200
+        str.gsub(needle, "X").should be(str)
+      end
+      # Sparse anchors failing deep into the needle (charged-cost cutover).
+      block = "a" + "b" * 19
+      needle = block + "abbbc"
+      (block * 1_000 + needle + block).gsub(needle, "X").should eq(block * 1_000 + "X" + block)
+    end
+
+    it "gsubs with string ending in NUL without matching the terminator" do
+      str = "ab"
+      str.gsub("b\0", "X").should be(str)
+      "ab\0".gsub("b\0", "X").should eq("aX")
+      "a\0\0".gsub("\0\0", "X").should eq("aX")
+      "a\0".gsub("\0") { "X" }.should eq("aX")
+      "\0".gsub("\0") { "X" }.should eq("X")
+    end
+
     it "gsubs with char hash" do
       str = "hello"
       str.gsub({'e' => 'a', 'l' => 'd'}).should eq("haddo")
@@ -2703,6 +2736,43 @@ describe "String" do
       "".scan("").should eq([] of String)
       "a".scan("").should eq([] of String)
       "".scan("a").should eq([] of String)
+    end
+
+    it "scans strings with adjacent and tail matches" do
+      "abab".scan("ab").should eq(["ab", "ab"])
+      "xab".scan("ab").should eq(["ab"])
+      "aaaa".scan("aa").should eq(["aa", "aa"])
+      "aaaaa".scan("aa").should eq(["aa", "aa"])
+      ("ab" * 1_000).scan("ab").size.should eq(1_000)
+      ("a" * 4_096 + "needle").scan("needle").should eq(["needle"])
+    end
+
+    it "scans strings on dense haystacks (memchr-anchor / naive and RK cutover)" do
+      # The needle's first byte recurs every few bytes while the whole needle
+      # only matches once per block, so the anchor fails too often and the
+      # rest of the scan falls back to the brute-force (tiny needle) or
+      # Rabin-Karp (longer needle) yielder, which must keep every match.
+      {"aab", "aaaaaaaab"}.each do |needle|
+        miss = needle.sub("b", "c")
+        ((miss * 3 + needle) * 200).scan(needle).size.should eq(200)
+        ((needle + "a") * 200).scan(needle).size.should eq(200)
+        (miss * 200).scan(needle).should eq([] of String)
+      end
+      # The anchor recurs every 20 bytes (too sparse for the fails guard)
+      # and every candidate matches 24 of the needle's 25 bytes, tripping
+      # the charged-cost fallback to Rabin-Karp.
+      block = "a" + "b" * 19
+      needle = block + "abbbc"
+      (block * 1_000).scan(needle).should eq([] of String)
+      (block * 1_000 + needle + block * 10 + needle).scan(needle).should eq([needle, needle])
+    end
+
+    it "scans strings ending in NUL without matching the terminator" do
+      "\0".scan("\0").should eq(["\0"])
+      "a\0a\0".scan("\0").should eq(["\0", "\0"])
+      "\0\0\0".scan("\0\0").should eq(["\0\0"])
+      "ab".scan("b\0").should eq([] of String)
+      "ab\0".scan("b\0").should eq(["b\0"])
     end
 
     it "does with number and string" do
