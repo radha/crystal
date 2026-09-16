@@ -557,6 +557,38 @@ struct Pointer(T)
     malloc(size.to_u64)
   end
 
+  # Allocates `size * sizeof(T)` bytes from the system's heap and returns a
+  # pointer to the first byte from that memory, like `malloc`, but without
+  # clearing it: the contents are undefined until written.
+  #
+  # Skipping the clearing pays off when every element is about to be
+  # overwritten anyway, for example when copying or building a buffer.
+  #
+  # If `T` may contain pointers into the GC heap the memory is cleared all the
+  # same, exactly as with `malloc`, since the GC would otherwise trace garbage.
+  #
+  # The memory is allocated by the `GC`, so when there are
+  # no pointers to this memory, it will be automatically freed.
+  #
+  # ```
+  # ptr = Pointer(Int32).malloc_uninitialized(10)
+  # ptr[0] = 1 # must be written before it is read
+  # ```
+  #
+  # If the memory can't be allocated (out of memory), the program aborts with
+  # an error message written to the standard error.
+  def self.malloc_uninitialized(size : Int) : self
+    {% if T.has_inner_pointers? %}
+      malloc(size)
+    {% else %}
+      if size < 0
+        raise ArgumentError.new("Negative Pointer#malloc size")
+      end
+
+      GC.malloc_atomic(size.to_u64 * sizeof(T)).as(self)
+    {% end %}
+  end
+
   # Allocates `size * sizeof(T)` bytes from the system's heap initialized
   # to *value* and returns a pointer to the first byte from that memory.
   # The memory is allocated by the `GC`, so when there are
@@ -597,7 +629,8 @@ struct Pointer(T)
   # ptr[3] # => 13
   # ```
   def self.malloc(size : Int, & : Int32 -> T) : Pointer(T)
-    ptr = Pointer(T).malloc(size)
+    # every slot is assigned below, so there is no need to clear the memory
+    ptr = Pointer(T).malloc_uninitialized(size)
     ptr.fill(size) { |i| yield i }
   end
 

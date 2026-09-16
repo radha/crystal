@@ -18,6 +18,29 @@ describe "Pointer" do
     end
   end
 
+  describe ".malloc_uninitialized" do
+    it "allocates writable memory for pointer-free types" do
+      ptr = Pointer(Int32).malloc_uninitialized(4)
+      4.times { |i| ptr[i] = i * 10 }
+      4.times { |i| ptr[i].should eq(i * 10) }
+    end
+
+    it "clears the memory for types with inner pointers" do
+      ptr = Pointer(String?).malloc_uninitialized(8)
+      8.times { |i| ptr[i].should be_nil }
+    end
+
+    it "accepts a zero size" do
+      Pointer(UInt8).malloc_uninitialized(0).should_not be_nil
+    end
+
+    it "raises on a negative size" do
+      expect_raises(ArgumentError, "Negative Pointer#malloc size") do
+        Pointer(Int32).malloc_uninitialized(-1)
+      end
+    end
+  end
+
   it "does malloc with value from block" do
     p1 = Pointer.malloc(4) { |i| i }
     4.times do |i|
