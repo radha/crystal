@@ -88,4 +88,27 @@ describe "ECR" do
   it ".render" do
     ECR.render("#{__DIR__}/../data/test_template2.ecr").should eq("123")
   end
+
+  describe "render program" do
+    it "wraps the program in a String.build presized from the literal text" do
+      literal = "<h1>hello world, this is literal text</h1>"
+      program = ECR.process_string "#{literal}<%= 1 %>", "foo.cr", "io", render: true
+      program.should eq <<-CRYSTAL
+        ::String.build(#{literal.bytesize * 2}) do |io|
+        io << #{literal.inspect}
+        #<loc:push>(#<loc:"foo.cr",1,#{literal.size + 4}> 1 )#<loc:pop>.to_s io
+        end\n
+        CRYSTAL
+    end
+
+    it "never presizes below the default String.build capacity" do
+      ECR.process_string("a<%= 1 %>", "foo.cr", "io", render: true).should start_with("::String.build(64) do |io|\n")
+      ECR.process_string("<%= 1 %>", "foo.cr", "io", render: true).should start_with("::String.build(64) do |io|\n")
+    end
+
+    it "counts literal text after whitespace suppression" do
+      program = ECR.process_string "#{"x" * 40}\n  <%- 1 -%>\n#{"y" * 40}\n", "foo.cr", "io", render: true
+      program.should start_with("::String.build(#{(40 + 1 + 40 + 1) * 2}) do |io|\n")
+    end
+  end
 end
