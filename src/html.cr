@@ -14,8 +14,24 @@ module HTML
     '\'' => "&#39;",
   }
 
+  # Byte classes for `.escape`: 0 = copied verbatim, otherwise the index of
+  # the replacement in `ESCAPE_REPLACEMENTS`.
+  private ESCAPE_CODES = StaticArray(UInt8, 256).new do |byte|
+    case byte
+    when '&'.ord  then 1_u8
+    when '<'.ord  then 2_u8
+    when '>'.ord  then 3_u8
+    when '"'.ord  then 4_u8
+    when '\''.ord then 5_u8
+    else               0_u8
+    end
+  end
+  private ESCAPE_REPLACEMENTS = {"", "&amp;", "&lt;", "&gt;", "&quot;", "&#39;"}
+
   # Escapes special characters in HTML, namely
   # `&`, `<`, `>`, `"` and `'`.
+  #
+  # Returns *string* itself when it contains none of them.
   #
   # ```
   # require "html"
@@ -23,7 +39,31 @@ module HTML
   # HTML.escape("Crystal & You") # => "Crystal &amp; You"
   # ```
   def self.escape(string : String) : String
-    string.gsub(SUBSTITUTIONS)
+    ptr = string.to_unsafe
+    bytesize = string.bytesize
+
+    # Invalid UTF-8 sequences are normalized to U+FFFD, as the char-based
+    # implementation always did; that path is only taken for invalid input.
+    unless string.ascii_only? || string.valid_encoding?
+      return string.gsub(SUBSTITUTIONS)
+    end
+
+    first = escape_scan(ptr, 0, bytesize)
+    return string if first == bytesize
+
+    extra = 0
+    index = first
+    while index < bytesize
+      code = ESCAPE_CODES.unsafe_fetch(ptr[index])
+      extra &+= ESCAPE_REPLACEMENTS[code].bytesize &- 1 unless code == 0
+      index &+= 1
+    end
+    new_bytesize = bytesize &+ extra
+
+    String.new(new_bytesize) do |buffer|
+      out = escape_copy(ptr, bytesize, buffer, first)
+      {out, 0}
+    end
   end
 
   # Same as `escape(string)` but outputs the result to
@@ -44,23 +84,50 @@ module HTML
   #
   # The slice is assumed to be valid UTF-8.
   def self.escape(string : Bytes, io : IO) : Nil
+    ptr = string.to_unsafe
+    bytesize = string.size
     last_copy_at = 0
-    string.each_with_index do |byte, index|
-      str = case byte
-            when '&'  then "&amp;"
-            when '<'  then "&lt;"
-            when '>'  then "&gt;"
-            when '"'  then "&quot;"
-            when '\'' then "&#39;"
-            else
-              next
-            end
 
+    while (index = escape_scan(ptr, last_copy_at, bytesize)) < bytesize
       io.write_string(string[last_copy_at, index &- last_copy_at])
+      io << ESCAPE_REPLACEMENTS[ESCAPE_CODES.unsafe_fetch(ptr[index])]
       last_copy_at = index &+ 1
-      io << str
     end
-    io.write_string(string[last_copy_at, string.size &- last_copy_at])
+
+    io.write_string(string[last_copy_at, bytesize &- last_copy_at])
+  end
+
+  # Returns the index of the first byte in `ptr[from, size]` that needs
+  # escaping, or *size* if there is none.
+  private def self.escape_scan(ptr : UInt8*, from : Int32, size : Int32) : Int32
+    index = from
+    while index < size && ESCAPE_CODES.unsafe_fetch(ptr[index]) == 0
+      index &+= 1
+    end
+    index
+  end
+
+  # Copies `ptr[0, size]` into *buffer* replacing special bytes, given that the
+  # first special byte is at *first*. Returns the number of bytes written.
+  private def self.escape_copy(ptr : UInt8*, size : Int32, buffer : UInt8*, first : Int32) : Int32
+    out = 0
+    last = 0
+    index = first
+    while index < size
+      code = ESCAPE_CODES.unsafe_fetch(ptr[index])
+      if code != 0
+        run = index &- last
+        (ptr + last).copy_to(buffer + out, run)
+        out &+= run
+        replacement = ESCAPE_REPLACEMENTS[code]
+        replacement.to_unsafe.copy_to(buffer + out, replacement.bytesize)
+        out &+= replacement.bytesize
+        last = index &+ 1
+      end
+      index &+= 1
+    end
+    (ptr + last).copy_to(buffer + out, size &- last)
+    out &+ (size &- last)
   end
 
   # These replacements permit compatibility with old numeric entities that

@@ -10,6 +10,44 @@ describe "HTML" do
     it "escapes dangerous characters from a string" do
       HTML.escape("< & > ' \"").should eq("&lt; &amp; &gt; &#39; &quot;")
     end
+
+    it "returns the same string when nothing needs escaping" do
+      string = "safe_string"
+      HTML.escape(string).should be(string)
+      HTML.escape("").should be_empty
+    end
+
+    it "escapes specials at the edges and adjacent to each other" do
+      HTML.escape("&").should eq("&amp;")
+      HTML.escape("<a>").should eq("&lt;a&gt;")
+      HTML.escape("a<<b").should eq("a&lt;&lt;b")
+      HTML.escape("\"'").should eq("&quot;&#39;")
+    end
+
+    it "preserves multibyte characters around escaped ones" do
+      HTML.escape("ü<ß>€").should eq("ü&lt;ß&gt;€")
+      HTML.escape("ü<ß>€").size.should eq(11)
+      HTML.escape("日本語").should eq("日本語")
+    end
+
+    it "replaces invalid UTF-8 with U+FFFD like the char-based path did" do
+      HTML.escape("\xff<\xfe").should eq("\uFFFD&lt;\uFFFD")
+      HTML.escape("\xffab").should eq("\uFFFDab")
+    end
+
+    it "escapes to an IO and from bytes" do
+      io = IO::Memory.new
+      HTML.escape("ü<a>&'\"", io)
+      io.to_s.should eq("ü&lt;a&gt;&amp;&#39;&quot;")
+
+      io = IO::Memory.new
+      HTML.escape("plain".to_slice, io)
+      io.to_s.should eq("plain")
+
+      io = IO::Memory.new
+      HTML.escape("".to_slice, io)
+      io.to_s.should eq("")
+    end
   end
 
   pending_wasm32 describe: ".unescape" do
