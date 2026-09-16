@@ -5,17 +5,28 @@ module ECR
 
   DefaultBufferName = "__str__"
 
+  # `ECR.render` presizes its `String.build` to this multiple of the template's
+  # literal text: the output is at least the literal text, so the buffer never
+  # shrinks in `String::Builder#to_s`, and a template whose interpolations add
+  # up to as much again as its literal text renders without a single realloc.
+  private RENDER_CAPACITY_FACTOR = 2
+
   # :nodoc:
-  def process_file(filename, buffer_name = DefaultBufferName) : String
-    process_string File.read(filename), filename, buffer_name
+  #
+  # With *render* the generated program is wrapped in a `String.build` block
+  # over *buffer_name*, presized from the template's literal text (this is what
+  # `ECR.render` embeds).
+  def process_file(filename, buffer_name = DefaultBufferName, *, render = false) : String
+    process_string File.read(filename), filename, buffer_name, render: render
   end
 
   # :nodoc:
-  def process_string(string, filename, buffer_name = DefaultBufferName) : String
+  def process_string(string, filename, buffer_name = DefaultBufferName, *, render = false) : String
     lexer = Lexer.new string
     token = lexer.next_token
+    literal_bytesize = 0
 
-    String.build do |str|
+    program = String.build do |str|
       while true
         case token.type
         when .string?
@@ -23,6 +34,7 @@ module ECR
           token = lexer.next_token
 
           string = suppress_leading_indentation(token, string)
+          literal_bytesize += string.bytesize
 
           str << buffer_name
           str << " << "
@@ -63,6 +75,11 @@ module ECR
         end
       end
     end
+
+    return program unless render
+
+    capacity = Math.max(64, literal_bytesize * RENDER_CAPACITY_FACTOR)
+    "::String.build(#{capacity}) do |#{buffer_name}|\n#{program}end\n"
   end
 
   private def suppress_leading_indentation(token, string)

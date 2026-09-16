@@ -89,18 +89,18 @@ module ECR
   # rendered # => "Hello World!"
   # ```
   #
-  # The `ECR.render` basically generates this Crystal code:
+  # The `ECR.render` basically generates this Crystal code, with the
+  # `String.build` capacity derived from the amount of literal text in the
+  # template so that typical renders need no buffer growth:
   #
   # ```
-  # String.build do |io|
-  #   io << "Hello "
-  #   io << name
-  #   io << '!'
+  # String.build(64) do |__str__|
+  #   __str__ << "Hello "
+  #   __str__ << name
+  #   __str__ << '!'
   # end
   # ```
   macro render(filename)
-    ::String.build do |%io|
-      ::ECR.embed({{filename}}, %io)
-    end
+    \{{ run("ecr/process", {{filename}}, "__str__", "--render") }}
   end
 end
