@@ -1,4 +1,18 @@
 require "spec"
+
+{% if flag?(:gc_precise) %}
+  class GCSpecPreciseNode
+    getter value : Int32
+    getter next : GCSpecPreciseNode?
+    getter payload : Int64
+    @a = 0x7fff_ffff_ffff_0000_i64
+    @b = 1.5
+
+    def initialize(@value, @next)
+      @payload = @value.to_i64 * 3
+    end
+  end
+{% end %}
 require "./spec_helper"
 
 describe "GC" do
@@ -83,6 +97,37 @@ describe "GC" do
       GC.presize_heap(before + 16 * 1024 * 1024)
       GC.stats.heap_size.should be >= before + 16 * 1024 * 1024
     end
+
+    {% if flag?(:gc_precise) %}
+      describe ".malloc_object" do
+        it "returns cleared memory" do
+          ptr = GC.malloc_object(64).as(UInt64*)
+          8.times { |i| ptr[i].should eq(0) }
+        end
+
+        it "keeps objects alive through precisely marked pointers" do
+          # a long chain reachable only through instance variables, with
+          # pointer-free payload around every link
+          head = GCSpecPreciseNode.new(0, nil)
+          200_000.times { |i| head = GCSpecPreciseNode.new(i + 1, head) }
+
+          3.times { GC.collect }
+          # allocate garbage so freed memory would get reused and corrupted
+          100_000.times { |i| GCSpecPreciseNode.new(-1, nil) }
+          GC.collect
+
+          node = head
+          count = 0
+          while node
+            node.value.should eq(200_000 - count)
+            node.payload.should eq(node.value.to_i64 * 3)
+            node = node.next
+            count += 1
+          end
+          count.should eq(200_001)
+        end
+      end
+    {% end %}
 
     describe ".shrink_atomic" do
       it "keeps the allocation when libgc would reclaim nothing" do

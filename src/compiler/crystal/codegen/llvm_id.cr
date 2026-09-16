@@ -28,6 +28,10 @@ module Crystal
   class LLVMId
     getter id_to_metaclass : Hash(Int32, Int32)
 
+    # Every type that has been given an id, with its `{min, max}` pair; the
+    # type's own id is `max`.
+    getter ids : Hash(Type, {Int32, Int32})
+
     def initialize(program)
       @ids = {} of Type => {Int32, Int32}
       @id_to_metaclass = {} of Int32 => Int32
@@ -161,6 +165,12 @@ module Crystal
 
     private def put_id(type, min, max)
       @ids[type] = {min, max}
+    end
+
+    # Number of ids handed out so far (ids start at 0 with `Nil`), i.e. one
+    # more than the largest id in use.
+    def id_count : Int32
+      @next_id + 1
     end
 
     private def next_id

@@ -68,6 +68,11 @@ module GC
     realloc(pointer, size)
   end
 
+  # :nodoc:
+  def self.malloc_object(size : LibC::SizeT) : Void*
+    malloc(size)
+  end
+
   def self.collect
   end
 
