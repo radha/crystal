@@ -41,6 +41,24 @@ fun __crystal_malloc_atomic64(size : UInt64) : Void*
   GC.malloc_atomic(LibC::SizeT.new(size))
 end
 
+{% if flag?(:gc_precise) %}
+  # :nodoc:
+  #
+  # Allocates a class instance whose instance variables may hold pointers, so
+  # that the collector can mark it precisely (see `GC.malloc_object`). Codegen
+  # uses it in place of `__crystal_malloc64` for such objects when it is
+  # defined, and relies on it returning cleared memory as well.
+  fun __crystal_malloc_object64(size : UInt64) : Void*
+    {% if flag?(:bits32) %}
+      if size > UInt32::MAX
+        raise ArgumentError.new("Given size is bigger than UInt32::MAX")
+      end
+    {% end %}
+
+    GC.malloc_object(LibC::SizeT.new(size))
+  end
+{% end %}
+
 # :nodoc:
 fun __crystal_realloc64(ptr : Void*, size : UInt64) : Void*
   {% if flag?(:bits32) %}

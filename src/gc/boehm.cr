@@ -170,6 +170,18 @@ lib LibGC
 
   fun size = GC_size(addr : Void*) : LibC::SizeT
 
+  # Custom object kinds marked through a callback (see `GC.malloc_object`).
+  # `struct GC_ms_entry` (the mark stack) is opaque here: its pointers are only
+  # passed through to `GC_mark_and_push`.
+  alias MarkProc = Word*, Void*, Void*, Word -> Void*
+  fun new_free_list = GC_new_free_list : Void**
+  fun new_kind = GC_new_kind(free_list : Void**, mark_descriptor_template : Word, add_size_to_descriptor : Int, clear_new_objects : Int) : LibC::UInt
+  fun new_proc = GC_new_proc(proc : MarkProc) : LibC::UInt
+  fun generic_malloc = GC_generic_malloc(size : SizeT, kind : Int) : Void*
+  fun mark_and_push = GC_mark_and_push(obj : Void*, mark_stack_ptr : Void*, mark_stack_limit : Void*, src : Void**) : Void*
+  $least_plausible_heap_addr = GC_least_plausible_heap_addr : Void*
+  $greatest_plausible_heap_addr = GC_greatest_plausible_heap_addr : Void*
+
   # Boehm GC requires to use its own thread manipulation routines instead of pthread's or Win32's
   {% if flag?(:win32) %}
     fun beginthreadex = GC_beginthreadex(security : Void*, stack_size : LibC::UInt, start_address : Void* -> LibC::UInt,
@@ -204,9 +216,105 @@ lib LibGC
   fun do_blocking = GC_do_blocking(FnType, Void*) : Void*
 end
 
+{% if flag?(:gc_precise) %}
+  # Emitted by the compiler (`CodeGenVisitor#define_gc_layouts`): a table
+  # indexed by type id of `i32 n, i32 word_offset[n]` lists, or null.
+  lib LibCrystalMain
+    $gc_layouts = __crystal_gc_layouts : Int32**
+    $gc_layouts_count = __crystal_gc_layouts_count : Int32
+  end
+
+  # :nodoc:
+  #
+  # libgc mark procedure for objects allocated by `GC.malloc_object`. Runs on
+  # libgc's marker threads while the world is stopped: it must not allocate,
+  # raise, or touch the rest of the runtime.
+  #
+  # Pushes the words the compiler listed for the object's type; a type without
+  # a precise layout, or a free-list object (libgc may hand those over too;
+  # their first word is a link, not a type id) is scanned conservatively, word
+  # by word, which is exactly what the regular marker would do.
+  fun __crystal_gc_mark_object(addr : LibGC::Word*, mark_stack_ptr : Void*, mark_stack_limit : Void*, env : LibGC::Word) : Void*
+    lo = LibGC.least_plausible_heap_addr.address
+    hi = LibGC.greatest_plausible_heap_addr.address
+
+    type_id = addr.as(Int32*).value
+    layout = Pointer(Int32).null
+    if 0 <= type_id < LibCrystalMain.gc_layouts_count
+      layout = LibCrystalMain.gc_layouts[type_id]
+    end
+
+    if layout.null?
+      words = LibGC.size(addr.as(Void*)) // sizeof(Void*)
+      i = 0
+      while i < words
+        candidate = addr[i]
+        if lo <= candidate <= hi
+          mark_stack_ptr = LibGC.mark_and_push(Pointer(Void).new(candidate), mark_stack_ptr, mark_stack_limit, (addr + i).as(Void**))
+        end
+        i += 1
+      end
+    else
+      count = layout[0]
+      i = 1
+      while i <= count
+        offset = layout[i]
+        candidate = addr[offset]
+        if lo <= candidate <= hi
+          mark_stack_ptr = LibGC.mark_and_push(Pointer(Void).new(candidate), mark_stack_ptr, mark_stack_limit, (addr + offset).as(Void**))
+        end
+        i += 1
+      end
+    end
+
+    mark_stack_ptr
+  end
+{% end %}
+
 module GC
   {% unless flag?(:without_mt) %}
     @@lock = uninitialized Crystal::RWLock
+  {% end %}
+
+  {% if flag?(:gc_precise) %}
+    # The libgc object kind for precisely marked class instances; 0 (libgc's
+    # pointer-free kind, never used for objects here) until `.init` registered
+    # it.
+    @@object_kind = 0
+
+    # :nodoc:
+    #
+    # Allocates a class instance whose instance variables may hold pointers.
+    # Codegen calls this (through `__crystal_malloc_object64`) instead of
+    # `malloc` when the program is compiled with `-Dgc_precise`.
+    #
+    # The object goes into a dedicated libgc kind whose mark procedure,
+    # `__crystal_gc_mark_object`, only follows the words the compiler knows may
+    # hold pointers, so integers and floats stored in objects can no longer keep
+    # unrelated memory alive, and the marker skips them altogether.
+    #
+    # Objects of a custom kind bypass libgc's thread-local free lists and are
+    # handed out under the allocation lock, so this trades allocation speed
+    # for cheaper, more precise collections. Returns cleared memory, like
+    # `malloc`.
+    def self.malloc_object(size : LibC::SizeT) : Void*
+      kind = @@object_kind
+      # before `.init` registered the kind
+      return malloc(size) if kind == 0
+
+      Crystal.trace :gc, "malloc", size: size, precise: 1 do
+        ptr = LibGC.generic_malloc(size, kind)
+        oom(size) if ptr.null? && size != 0
+        ptr
+      end
+    end
+
+    private def self.register_object_kind : Nil
+      proc_index = LibGC.new_proc(->__crystal_gc_mark_object(LibGC::Word*, Void*, Void*, LibGC::Word))
+      # `GC_MAKE_PROC(proc_index, env: 0)`: the index tagged as `GC_DS_PROC`
+      descriptor = LibGC::Word.new((proc_index.to_u64 << 2) | 2)
+      @@object_kind = LibGC.new_kind(LibGC.new_free_list, descriptor, 0, 1).to_i
+    end
   {% end %}
 
   # :nodoc:
@@ -317,6 +425,10 @@ module GC
       LibGC.set_handle_fork(1)
     {% end %}
     LibGC.init
+
+    {% if flag?(:gc_precise) %}
+      register_object_kind
+    {% end %}
 
     # Enable parallel marking. libgc only spawns its marker threads lazily on
     # the first wrapped `pthread_create`, so a program that never creates a

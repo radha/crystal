@@ -13,11 +13,18 @@ module Crystal
   RAISE_CAST_FAILED_NAME = "__crystal_raise_cast_failed"
   MALLOC_NAME            = "__crystal_malloc64"
   MALLOC_ATOMIC_NAME     = "__crystal_malloc_atomic64"
+  MALLOC_OBJECT_NAME     = "__crystal_malloc_object64"
   REALLOC_NAME           = "__crystal_realloc64"
 
   GET_EXCEPTION_NAME = "__crystal_get_exception"
   ONCE_INIT          = "__crystal_once_init"
   ONCE               = "__crystal_once"
+
+  # Globals read by the runtime's precise object marker (see `GC.malloc_object`
+  # and `define_gc_layouts`): a table indexed by type id of pointer-word
+  # offset lists, and its length.
+  GC_LAYOUTS_NAME       = "__crystal_gc_layouts"
+  GC_LAYOUTS_COUNT_NAME = "__crystal_gc_layouts_count"
 
   # LLVM's `allockind` bits (`llvm::AllocFnKind`).
   ALLOC_KIND_ALLOC         = 1_u64 << 0
@@ -41,6 +48,7 @@ module Crystal
     MALLOC_NAME               => {ALLOC_KIND_ALLOC | ALLOC_KIND_ZEROED, 0},
     "__crystal_malloc_atomic" => {ALLOC_KIND_ALLOC | ALLOC_KIND_UNINITIALIZED, 0},
     MALLOC_ATOMIC_NAME        => {ALLOC_KIND_ALLOC | ALLOC_KIND_UNINITIALIZED, 0},
+    MALLOC_OBJECT_NAME        => {ALLOC_KIND_ALLOC | ALLOC_KIND_ZEROED, 0},
     "__crystal_realloc"       => {ALLOC_KIND_REALLOC, 1},
     REALLOC_NAME              => {ALLOC_KIND_REALLOC, 1},
     "GC_malloc"               => {ALLOC_KIND_ALLOC | ALLOC_KIND_ZEROED, 0},
@@ -301,6 +309,7 @@ module Crystal
     @call_location : Location?
 
     @malloc_fun : LLVMTypedFunction?
+    @malloc_object_fun : LLVMTypedFunction?
     @malloc_atomic_fun : LLVMTypedFunction?
     @realloc_fun : LLVMTypedFunction?
     @raise_overflow_fun : LLVMTypedFunction?
@@ -529,7 +538,7 @@ module Crystal
 
       def visit(node : FunDef)
         case node.name
-        when MALLOC_NAME, MALLOC_ATOMIC_NAME, REALLOC_NAME, RAISE_NAME,
+        when MALLOC_NAME, MALLOC_ATOMIC_NAME, MALLOC_OBJECT_NAME, REALLOC_NAME, RAISE_NAME,
              @codegen.personality_name, GET_EXCEPTION_NAME, RAISE_OVERFLOW_NAME,
              RAISE_CAST_FAILED_NAME, ONCE_INIT, ONCE
           @codegen.accept node
@@ -571,6 +580,9 @@ module Crystal
       @unused_fun_defs.each do |node|
         codegen_fun node.real_name, node.external, @program, is_exported_fun: true
       end
+
+      # must come last: type ids are handed out lazily during codegen
+      define_gc_layouts
 
       env_dump = ENV["DUMP"]?
       case env_dump
@@ -2289,7 +2301,7 @@ module Crystal
       else
         if type.is_a?(InstanceVarContainer) && !type.struct? &&
            type.all_instance_vars.each_value.any? &.type.has_inner_pointers?
-          type_ptr, cleared = malloc_cleared struct_type
+          type_ptr, cleared = malloc_object_cleared struct_type
         else
           type_ptr = malloc_atomic struct_type
         end
@@ -2369,6 +2381,14 @@ module Crystal
       generic_malloc(type) { crystal_malloc_fun }
     end
 
+    # Allocates a class instance whose instance variables may hold pointers.
+    # Uses the prelude's precise object allocator when it defines one (the
+    # `gc_precise` flag, see `GC.malloc_object`), else plain `GC.malloc`.
+    # Also returns whether the memory is known to be cleared.
+    def malloc_object_cleared(type) : {LLVM::Value, Bool}
+      generic_malloc(type) { crystal_malloc_object_fun || crystal_malloc_fun }
+    end
+
     def malloc_atomic(type)
       generic_malloc(type) { crystal_malloc_atomic_fun }[0]
     end
@@ -2418,6 +2438,15 @@ module Crystal
       @malloc_fun ||= typed_fun?(@main_mod, MALLOC_NAME)
       if malloc_fun = @malloc_fun
         check_main_fun MALLOC_NAME, malloc_fun
+      else
+        nil
+      end
+    end
+
+    def crystal_malloc_object_fun
+      @malloc_object_fun ||= typed_fun?(@main_mod, MALLOC_OBJECT_NAME)
+      if malloc_fun = @malloc_object_fun
+        check_main_fun MALLOC_OBJECT_NAME, malloc_fun
       else
         nil
       end

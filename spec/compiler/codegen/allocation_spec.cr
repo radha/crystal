@@ -112,6 +112,55 @@ describe "Code gen: allocation" do
     end
   end
 
+  describe "precise object layouts" do
+    it "emits pointer-word offsets per class when the precise object allocator exists" do
+      ir = codegen(<<-CRYSTAL, single_module: true).to_s
+        #{ALLOCATORS}
+
+        fun __crystal_malloc_object64(size : UInt64) : Void*
+          Pointer(Void).new(0_u64)
+        end
+
+        class Foo
+          @a = 1_i64
+          @p = Pointer(Int32).new(0_u64)
+          @s : Foo?
+          @t = {2_i64, Pointer(Int32).new(0_u64)}
+        end
+
+        class Bar
+          @x = 1
+        end
+
+        Foo.new
+        Bar.new
+        CRYSTAL
+
+      # the layout follows the struct: word 0 type id, 1 @s, 2 @a, 3 @p,
+      # 4-5 @t (whose pointer is its second word)
+      ir.should contain(%(%Foo = type { i32, ptr, i64, ptr, %"Tuple(Int64, Pointer(Int32))" }))
+      ir.should match(/@"?__crystal_gc_layouts\.\d+"? = private constant \[4 x i32\] \[i32 3, i32 1, i32 3, i32 5\]/)
+      ir.should contain("@__crystal_gc_layouts_count = constant i32")
+      ir.should match(/@__crystal_gc_layouts = constant ptr @"?__crystal_gc_layouts\.table"?/)
+      ir.should match(/call .*@__crystal_malloc_object64\(/)
+      ir.should match(/call .*@__crystal_malloc_atomic64\(/)
+    end
+
+    it "emits no layouts without the precise object allocator" do
+      ir = codegen(<<-CRYSTAL, single_module: true).to_s
+        #{ALLOCATORS}
+
+        class Foo
+          @p = Pointer(Int32).new(0_u64)
+        end
+
+        Foo.new
+        CRYSTAL
+
+      ir.should_not contain("__crystal_gc_layouts")
+    end
+  end
+
   describe "allocator attributes" do
     it "marks the GC entry points as allocators" do
       ir = codegen(<<-CRYSTAL, single_module: true).to_s
