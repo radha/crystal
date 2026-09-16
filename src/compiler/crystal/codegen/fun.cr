@@ -83,6 +83,21 @@ class Crystal::CodeGenVisitor
     {% end %}
   end
 
+  # Frame pointer preservation, applied to every function with a body,
+  # including the synthetic `__crystal_main` (see `CodeGenVisitor#initialize`).
+  # `Exception::CallStack` relies on complete frame-pointer chains on Darwin and
+  # when `--frame-pointers` is set (see `Exception::CallStack.unwind`).
+  def add_frame_pointer_attribute(func : LLVM::Function)
+    if @frame_pointers.always?
+      func.add_attribute "frame-pointer", value: "all"
+    elsif @program.has_flag?("darwin") || @program.has_flag?("solaris")
+      # Disable frame pointer elimination, as it causes issues during stack unwind
+      func.add_target_dependent_attribute "frame-pointer", "all"
+    elsif @frame_pointers.non_leaf?
+      func.add_attribute "frame-pointer", value: "non-leaf"
+    end
+  end
+
   def codegen_fun(mangled_name, target_def, self_type, is_exported_fun = false, fun_module_info = type_module(self_type), is_fun_literal = false, is_closure = false)
     old_position = insert_block
     old_entry_block = @entry_block
@@ -127,14 +142,7 @@ class Crystal::CodeGenVisitor
           context.fun.add_attribute LLVM::Attribute::UWTable, value: @program.has_flag?("aarch64") ? LLVM::UWTableKind::Sync : LLVM::UWTableKind::Async
         {% end %}
 
-        if @frame_pointers.always?
-          context.fun.add_attribute "frame-pointer", value: "all"
-        elsif @program.has_flag?("darwin") || @program.has_flag?("solaris")
-          # Disable frame pointer elimination, as it causes issues during stack unwind
-          context.fun.add_target_dependent_attribute "frame-pointer", "all"
-        elsif @frame_pointers.non_leaf?
-          context.fun.add_attribute "frame-pointer", value: "non-leaf"
-        end
+        add_frame_pointer_attribute context.fun
 
         new_entry_block
 

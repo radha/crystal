@@ -432,7 +432,7 @@ class Crystal::Command
           compiler.debug = Crystal::Debug::None
         end
 
-        opts.on("--frame-pointers auto|always|non-leaf", "Control the preservation of frame pointers") do |value|
+        opts.on("--frame-pointers auto|always|non-leaf", "Control the preservation of frame pointers (always/non-leaf also define the `frame_pointers` flag)") do |value|
           if frame_pointers = FramePointers.parse?(value)
             compiler.frame_pointers = frame_pointers
           else

@@ -36,8 +36,85 @@ struct Exception::CallStack
     {% end %}
   end
 
+  # Whether every frame on the stack is guaranteed to keep a frame pointer, so
+  # the call stack can be collected by walking the frame-pointer chain instead
+  # of asking libunwind to interpret the unwind tables of every frame.
+  #
+  # Codegen forces frame pointers on Darwin (see `Crystal::CodeGenVisitor`),
+  # where the system libraries keep them as well; elsewhere the walk is only
+  # enabled by `--frame-pointers=always|non-leaf`, which also defines the
+  # `frame_pointers` compile-time flag.
+  private FRAME_POINTER_UNWIND = {{ (flag?(:darwin) || flag?(:frame_pointers)) && (flag?(:aarch64) || flag?(:x86_64)) && !flag?(:interpreted) }}
+
   {% if flag?(:interpreted) %} @[Primitive(:interpreter_call_stack_unwind)] {% end %}
   protected def self.unwind : Array(Void*)
+    {% if FRAME_POINTER_UNWIND %}
+      unwind_frame_pointers
+    {% else %}
+      unwind_libunwind
+    {% end %}
+  end
+
+  {% if FRAME_POINTER_UNWIND %}
+    # Returns the address this method returns to, i.e. an instruction pointer
+    # inside its (non-inlined) caller.
+    @[NoInline]
+    private def self.return_address : Void*
+      LibIntrinsics.returnaddress(0)
+    end
+
+    # Collects the call stack by walking the chain of saved frame pointers.
+    #
+    # On AArch64 and x86-64 a frame stores `[saved frame pointer, return
+    # address]` at the frame pointer, so every step is two loads: this is
+    # around two orders of magnitude cheaper than `LibUnwind.backtrace`, which
+    # has to locate and interpret each frame's unwind information (on Darwin
+    # that even means parsing the image's load commands for every step).
+    #
+    # The result mirrors `.unwind_libunwind`: the first entry is an
+    # instruction pointer inside the frame that called `.unwind`, followed by
+    # the return address of every frame up the stack, stopping at the first
+    # null return address (`Fiber#makecontext` and thread entry points reset
+    # the link register). The walk never leaves the current stack: frames must
+    # move towards the stack bottom, stay aligned and fit inside the stack
+    # bounds, so a foreign frame without a frame pointer ends the walk instead
+    # of dereferencing garbage.
+    protected def self.unwind_frame_pointers : Array(Void*)
+      callstack = Array(Void*).new(32)
+      callstack << return_address
+
+      frame = LibIntrinsics.frameaddress(0).as(Void**)
+      bottom = Fiber.current?.try(&.@stack.bottom) || Pointer(Void).new(UInt64::MAX)
+
+      while true
+        ip = frame[1]
+        break if ip.null?
+        callstack << strip_pointer_authentication(ip)
+
+        next_frame = frame[0].as(Void**)
+        break if next_frame.address <= frame.address # frames must grow towards the stack bottom
+        break if next_frame.address & 0xF != 0        # both ABIs keep frames 16-byte aligned
+        break if (next_frame + 2).as(Void*) > bottom  # the saved pair must be readable
+        frame = next_frame
+      end
+
+      callstack
+    end
+
+    # Return addresses saved by arm64e frames (Darwin system libraries, e.g.
+    # `_pthread_start`) carry a pointer authentication code in the bits above
+    # the virtual address range, which libunwind strips for us; do the same so
+    # the bottom frames of a thread keep resolving.
+    private def self.strip_pointer_authentication(ip : Void*) : Void*
+      {% if flag?(:darwin) && flag?(:aarch64) %}
+        Pointer(Void).new(ip.address & 0x0000_7FFF_FFFF_FFFF_u64)
+      {% else %}
+        ip
+      {% end %}
+    end
+  {% end %}
+
+  protected def self.unwind_libunwind : Array(Void*)
     callstack = Array(Void*).new(32)
     backtrace_fn = ->(context : LibUnwind::Context, data : Void*) do
       bt = data.as(typeof(callstack))
