@@ -63,6 +63,11 @@ module GC
     ptr
   end
 
+  # :nodoc:
+  def self.shrink_atomic(pointer : Void*, size : LibC::SizeT) : Void*
+    realloc(pointer, size)
+  end
+
   def self.collect
   end
 

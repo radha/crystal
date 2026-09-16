@@ -158,6 +158,18 @@ module GC
 
   # :nodoc:
   #
+  # Shrinks a pointer-free allocation (one made with `malloc_atomic`) to *size*
+  # bytes. Behaves like `realloc`, except that the collector is free to keep the
+  # allocation as is when shrinking it would reclaim no memory.
+  #
+  # *size* must not exceed the current size of the allocation, and the memory
+  # must never contain pointers into the GC heap.
+  def self.shrink_atomic(pointer : T*, size : Int) : T* forall T
+    shrink_atomic(pointer.as(Void*), LibC::SizeT.new(size)).as(T*)
+  end
+
+  # :nodoc:
+  #
   # Marks the thread as doing a call that doesn't involve the GC, for example a
   # blocking syscall such as `nanosleep` or `pthread_cond_timedwait`.
   #

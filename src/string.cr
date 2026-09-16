@@ -277,7 +277,7 @@ class String
 
     # Try to reclaim some memory if capacity is bigger than what was requested
     if bytesize < capacity
-      str = GC.realloc(str, bytesize.to_u32 + HEADER_SIZE + 1)
+      str = GC.shrink_atomic(str, bytesize.to_u32 + HEADER_SIZE + 1)
     end
 
     set_crystal_type_id(str)

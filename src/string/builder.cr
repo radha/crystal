@@ -107,7 +107,8 @@ class String::Builder < IO
 
     # Try to reclaim some memory if capacity is bigger than what we need
     if @capacity > real_bytesize
-      resize_to_capacity(real_bytesize)
+      @capacity = real_bytesize
+      @buffer = GC.shrink_atomic(@buffer, real_bytesize)
     end
 
     String.set_crystal_type_id(@buffer)

@@ -238,6 +238,33 @@ module GC
     end
   end
 
+  # libgc's heap block size (`HBLKSIZE`). Objects larger than half a block
+  # occupy whole blocks. libgc doesn't export the value; 4 KB is its default
+  # on every supported target.
+  private HBLKSIZE = 4096_u64
+
+  # :nodoc:
+  #
+  # `GC_realloc` only moves an object to a smaller one when the requested size
+  # drops below half of its slot: the granule-rounded size for small objects,
+  # the block-rounded size for whole-block ones. Above that threshold it hands
+  # back the very same pointer after clearing the now unused tail. That
+  # clearing only exists to keep stale words of *pointer-bearing* objects from
+  # being traced, so for a pointer-free allocation it is pure overhead (hundreds
+  # of kilobytes for a big `String::Builder`) and the call can be skipped.
+  #
+  # Below the threshold the object really does move and memory is reclaimed,
+  # so the regular `realloc` is used.
+  def self.shrink_atomic(ptr : Void*, size : LibC::SizeT) : Void*
+    slot = LibGC.size(ptr).to_u64
+    if slot > HBLKSIZE // 2
+      slot = (slot + HBLKSIZE - 1) & ~(HBLKSIZE - 1)
+    end
+    return ptr if size >= slot // 2
+
+    realloc(ptr, size)
+  end
+
   # Default initial heap floor applied at start-up unless overridden by the
   # `CRYSTAL_GC_INITIAL_HEAP` environment variable (set it to `0` to disable).
   # libgc's own default heap is only a few blocks, which forces a burst of

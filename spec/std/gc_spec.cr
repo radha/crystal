@@ -83,5 +83,30 @@ describe "GC" do
       GC.presize_heap(before + 16 * 1024 * 1024)
       GC.stats.heap_size.should be >= before + 16 * 1024 * 1024
     end
+
+    describe ".shrink_atomic" do
+      it "keeps the allocation when libgc would reclaim nothing" do
+        # small object: 64-byte slot, keeping >= 32 bytes returns the same pointer
+        ptr = GC.malloc_atomic(64).as(UInt8*)
+        ptr.fill(64, 0xAB_u8)
+        GC.shrink_atomic(ptr, 40).should eq(ptr)
+        ptr[39].should eq(0xAB_u8)
+
+        # whole-block object: 1 MiB, keeping >= 512 KiB returns the same pointer
+        big = GC.malloc_atomic(1 << 20).as(UInt8*)
+        big.fill(1 << 20, 0xCD_u8)
+        GC.shrink_atomic(big, 600_000).should eq(big)
+        big[599_999].should eq(0xCD_u8)
+      end
+
+      it "reallocates and preserves the contents when shrinking below half" do
+        ptr = GC.malloc_atomic(1 << 16).as(UInt8*)
+        ptr.fill(1 << 16, 0xEF_u8)
+        small = GC.shrink_atomic(ptr, 100)
+        100.times { |i| small[i].should eq(0xEF_u8) }
+        # the shrunk slot really is smaller
+        LibGC.size(small.as(Void*)).should be < (1 << 16)
+      end
+    end
   {% end %}
 end
