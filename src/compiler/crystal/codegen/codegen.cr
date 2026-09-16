@@ -14,9 +14,41 @@ module Crystal
   MALLOC_NAME            = "__crystal_malloc64"
   MALLOC_ATOMIC_NAME     = "__crystal_malloc_atomic64"
   REALLOC_NAME           = "__crystal_realloc64"
-  GET_EXCEPTION_NAME     = "__crystal_get_exception"
-  ONCE_INIT              = "__crystal_once_init"
-  ONCE                   = "__crystal_once"
+
+  GET_EXCEPTION_NAME = "__crystal_get_exception"
+  ONCE_INIT          = "__crystal_once_init"
+  ONCE               = "__crystal_once"
+
+  # LLVM's `allockind` bits (`llvm::AllocFnKind`).
+  ALLOC_KIND_ALLOC         = 1_u64 << 0
+  ALLOC_KIND_REALLOC       = 1_u64 << 1
+  ALLOC_KIND_FREE          = 1_u64 << 2
+  ALLOC_KIND_UNINITIALIZED = 1_u64 << 3
+  ALLOC_KIND_ZEROED        = 1_u64 << 4
+
+  # Allocator attributes for the GC entry points and the libgc functions behind
+  # them, keyed by function name: the `allockind` bits and the index of the
+  # size argument (`nil` when there is none). With these LLVM treats the
+  # functions like `malloc`: it can drop allocations whose result is never
+  # used, fold loads from freshly cleared memory and knows the result aliases
+  # nothing else.
+  #
+  # `zeroed` may only be claimed for allocators that clear memory: `GC.malloc`
+  # documents that it does (and codegen relies on it, see
+  # `pre_initialize_aggregate`), `GC.malloc_atomic` does not.
+  ALLOCATOR_ATTRIBUTES = {
+    "__crystal_malloc"        => {ALLOC_KIND_ALLOC | ALLOC_KIND_ZEROED, 0},
+    MALLOC_NAME               => {ALLOC_KIND_ALLOC | ALLOC_KIND_ZEROED, 0},
+    "__crystal_malloc_atomic" => {ALLOC_KIND_ALLOC | ALLOC_KIND_UNINITIALIZED, 0},
+    MALLOC_ATOMIC_NAME        => {ALLOC_KIND_ALLOC | ALLOC_KIND_UNINITIALIZED, 0},
+    "__crystal_realloc"       => {ALLOC_KIND_REALLOC, 1},
+    REALLOC_NAME              => {ALLOC_KIND_REALLOC, 1},
+    "GC_malloc"               => {ALLOC_KIND_ALLOC | ALLOC_KIND_ZEROED, 0},
+    "GC_malloc_uncollectable" => {ALLOC_KIND_ALLOC | ALLOC_KIND_ZEROED, 0},
+    "GC_malloc_atomic"        => {ALLOC_KIND_ALLOC | ALLOC_KIND_UNINITIALIZED, 0},
+    "GC_realloc"              => {ALLOC_KIND_REALLOC, 1},
+    "GC_free"                 => {ALLOC_KIND_FREE, nil},
+  }
 
   class Program
     def run(code, filename : String? = nil, debug = Debug::Default)
@@ -2251,22 +2283,27 @@ module Crystal
 
     def allocate_aggregate(type)
       struct_type = llvm_struct_type(type)
+      cleared = false
       if type.passed_by_value?
         type_ptr = alloca struct_type
       else
         if type.is_a?(InstanceVarContainer) && !type.struct? &&
            type.all_instance_vars.each_value.any? &.type.has_inner_pointers?
-          type_ptr = malloc struct_type
+          type_ptr, cleared = malloc_cleared struct_type
         else
           type_ptr = malloc_atomic struct_type
         end
       end
 
-      pre_initialize_aggregate(type, struct_type, type_ptr)
+      pre_initialize_aggregate(type, struct_type, type_ptr, cleared: cleared)
     end
 
-    def pre_initialize_aggregate(type, struct_type, ptr)
-      memset ptr, int8(0), size_t(struct_type.size)
+    # *cleared* tells whether *ptr* is already known to hold zeros (memory
+    # fresh from `GC.malloc`), in which case clearing it again is skipped.
+    # Stack slots, `GC.malloc_atomic` memory, the libc fallback and memory
+    # handed in by the user (`Reference.pre_initialize`) must still be cleared.
+    def pre_initialize_aggregate(type, struct_type, ptr, *, cleared = false)
+      memset ptr, int8(0), size_t(struct_type.size) unless cleared
       run_instance_vars_initializers(type, type, ptr)
 
       unless type.struct?
@@ -2322,43 +2359,58 @@ module Crystal
     end
 
     def malloc(type)
+      malloc_cleared(type)[0]
+    end
+
+    # Allocates *type* with `GC.malloc` and also returns whether the memory is
+    # known to be cleared: `GC.malloc` documents that it returns zeroed memory,
+    # the libc `malloc` fallback (only used without the prelude) does not.
+    def malloc_cleared(type) : {LLVM::Value, Bool}
       generic_malloc(type) { crystal_malloc_fun }
     end
 
     def malloc_atomic(type)
-      generic_malloc(type) { crystal_malloc_atomic_fun }
+      generic_malloc(type) { crystal_malloc_atomic_fun }[0]
     end
 
-    def generic_malloc(type, &)
+    def generic_malloc(type, &) : {LLVM::Value, Bool}
       size = type.size
 
       if malloc_fun = yield
         pointer = call malloc_fun, size
+        from_gc = true
       else
         pointer = call c_malloc_fun, size_t(size)
+        from_gc = false
       end
 
-      pointer_cast pointer, type.pointer
+      {pointer_cast(pointer, type.pointer), from_gc}
     end
 
     def array_malloc(type, count)
-      generic_array_malloc(type, count) { crystal_malloc_fun }
+      generic_array_malloc(type, count, gc_clears: true) { crystal_malloc_fun }
     end
 
     def array_malloc_atomic(type, count)
-      generic_array_malloc(type, count) { crystal_malloc_atomic_fun }
+      generic_array_malloc(type, count, gc_clears: false) { crystal_malloc_atomic_fun }
     end
 
-    def generic_array_malloc(type, count, &)
+    # *gc_clears* says whether the yielded GC allocator returns zeroed memory
+    # (`GC.malloc` does, `GC.malloc_atomic` doesn't). The memory is cleared here
+    # only when the allocator didn't already do it, which includes the libc
+    # `malloc` fallback used without the prelude.
+    def generic_array_malloc(type, count, *, gc_clears : Bool, &)
       size = builder.mul type.size, count
 
       if malloc_fun = yield
         pointer = call malloc_fun, size
+        cleared = gc_clears
       else
         pointer = call c_malloc_fun, size_t(size)
+        cleared = false
       end
 
-      memset pointer, int8(0), size_t(size)
+      memset pointer, int8(0), size_t(size) unless cleared
       pointer_cast pointer, type.pointer
     end
 

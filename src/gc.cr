@@ -16,6 +16,10 @@ fun __crystal_realloc(pointer : Void*, size : UInt32) : Void*
 end
 
 # :nodoc:
+#
+# Must return cleared memory: codegen skips its own clearing of objects and
+# buffers allocated through this function (they still get zeroed via
+# `GC.malloc`), and tells LLVM so via `allockind("alloc,zeroed")`.
 fun __crystal_malloc64(size : UInt64) : Void*
   {% if flag?(:bits32) %}
     if size > UInt32::MAX
