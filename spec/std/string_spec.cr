@@ -2102,6 +2102,15 @@ describe "String" do
       "/ä".gsub('/', '-').should eq("-ä")
     end
 
+    it "gsubs char with string in non-ascii and invalid strings" do
+      "ü&ß&".gsub('&', "&amp;").should eq("ü&amp;ß&amp;")
+      "ü&ß".gsub('&', 'é').should eq("üéß")
+      "\xff&".gsub('&', "&amp;").should eq("\uFFFD&amp;")
+      "a&b".gsub('&', "").should eq("ab")
+      "&".gsub('&', "&amp;").should eq("&amp;")
+      "aüa".gsub('ü', "ue").should eq("auea")
+    end
+
     it "gsubs char with string depending on the char" do
       replaced = "foobar".gsub do |char|
         case char
@@ -2215,9 +2224,35 @@ describe "String" do
       str.gsub({'e' => 'a', 'l' => 'd'}).should eq("haddo")
     end
 
+    it "gsubs with char hash (nop)" do
+      str = "hello"
+      str.gsub({'x' => 'a', 'y' => "b"}).should be(str)
+      "".gsub({'x' => 'a'}).should eq("")
+    end
+
+    it "gsubs with char hash around multibyte and invalid chars" do
+      "ü<ß>€".gsub({'<' => "&lt;", '>' => "&gt;"}).should eq("ü&lt;ß&gt;€")
+      "aüb".gsub({'ü' => "ue", 'a' => 'A'}).should eq("Aueb")
+      "\xff<\xfe".gsub({'<' => "&lt;"}).should eq("\uFFFD&lt;\uFFFD")
+      "\xffab".gsub({'<' => "&lt;"}).should eq("\uFFFDab")
+    end
+
+    it "gsubs with char hash with any value type" do
+      "a1b1".gsub({'1' => 2}).should eq("a2b2")
+      "a&b".gsub({'&' => ""}).should eq("ab")
+      "&&".gsub({'&' => "&amp;"}).should eq("&amp;&amp;")
+    end
+
     it "gsubs with char named tuple" do
       str = "hello"
       str.gsub({e: 'a', l: 'd'}).should eq("haddo")
+    end
+
+    it "gsubs with char named tuple (nop)" do
+      str = "hello"
+      str.gsub({x: 'a'}).should be(str)
+      "ü<ß".gsub({"<": "&lt;"}).should eq("ü&lt;ß")
+      "\xff<".gsub({"<": "&lt;"}).should eq("\uFFFD&lt;")
     end
 
     it "gsubs with regex and hash" do
