@@ -83,16 +83,32 @@ class CSV::Builder
   # :nodoc:
   def quote_cell(value : String) : Nil
     append_cell do
-      @io << @quote_char
-      value.each_char do |char|
-        case char
-        when @quote_char
-          @io << @quote_char << @quote_char
-        else
-          @io << char
+      quote_char = @quote_char
+      @io << quote_char
+      if quote_char.ascii? && value.valid_encoding?
+        # In valid UTF-8 an ASCII byte is always a whole character, so the
+        # runs between quote characters can be written as-is instead of one
+        # character at a time.
+        quote_byte = quote_char.ord.to_u8!
+        slice = value.to_slice
+        pos = 0
+        while quote_pos = value.byte_index(quote_byte, pos)
+          @io.write_string(slice[pos, quote_pos - pos])
+          @io << quote_char << quote_char
+          pos = quote_pos + 1
+        end
+        @io.write_string(slice[pos, slice.size - pos])
+      else
+        value.each_char do |char|
+          case char
+          when quote_char
+            @io << quote_char << quote_char
+          else
+            @io << char
+          end
         end
       end
-      @io << @quote_char
+      @io << quote_char
     end
   end
 

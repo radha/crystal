@@ -129,6 +129,16 @@ describe CSV do
       end, %("1","doesn't"," , ","he said ""no"""\n))
     end
 
+    it "quotes cells with non-ASCII content, invalid UTF-8 and non-ASCII quote characters" do
+      assert_prints(CSV.build(quoting: CSV::Builder::Quoting::ALL) do |csv|
+        csv.row "", %(""), %(a"b"c), "héllo \"wörld\" 日本", "\xFFa\"b"
+      end, %("","""""","a""b""c","héllo ""wörld"" 日本","�a""b"\n))
+
+      assert_prints(CSV.build(quote_char: 'é', quoting: CSV::Builder::Quoting::ALL) do |csv|
+        csv.row "héllo", "abc", "\xFF"
+      end, "éhéélloé,éabcé,é�é\n")
+    end
+
     it "builds with inside quoted chars and symbols" do
       assert_prints(CSV.build(quoting: CSV::Builder::Quoting::NONE) do |csv|
         csv.row 'c', '\'', '"', :sym, :"s'm", :"s\"m"
