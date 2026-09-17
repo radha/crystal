@@ -2369,7 +2369,12 @@ describe "String" do
     assert_prints "á".dump, %("\\u00E1")
     assert_prints "\u{81}".dump, %("\\u0081")
     assert_prints "\u{1F48E}".dump, %("\\u{1F48E}")
-    assert_prints "\uF8FF".dump, %("\\uF8FF")       # private use character (Co)
+    assert_prints "\uF8FF".dump, %("\\uF8FF") # private use character (Co)
+    assert_prints "abc\"def\\ghi\#{jkl#mno".dump, %("abc\\"def\\\\ghi\\\#{jkl#mno")
+    assert_prints "abcá def\xFFghi\n".dump, %("abc\\u00E1 def\\xFFghi\\n")
+    assert_prints "abcá def\xFFghi\n".inspect, %("abcá def\\xFFghi\\n")
+    assert_prints "\xC3abc\xE2\x82abc".inspect, %("\\xC3abc\\xE2\\x82abc")
+    assert_prints (" ~" * 40).inspect, %(") + " ~" * 40 + %(")
     assert_prints "\u202A".dump, %("\\u202A")       # bidi control character (Cf)
     assert_prints "\u{110BD}".dump, %("\\u{110BD}") # Format character > U+FFFF (Cf)
     assert_prints "\u00A0".dump, %("\\u00A0")       # white space (Zs)
@@ -3606,6 +3611,29 @@ describe "String" do
       {% for bytes in INVALID_UTF8_BYTE_SEQUENCES %}
         String.new(Bytes{{ bytes }}).valid_encoding?.should be_false
       {% end %}
+    end
+
+    it "valid_encoding? around word and block boundaries" do
+      ascii = "a" * 64
+      ascii.valid_encoding?.should be_true
+      ("a" * 7).valid_encoding?.should be_true
+      ("a" * 65).valid_encoding?.should be_true
+      (ascii + "é" + ascii).valid_encoding?.should be_true
+      (ascii * 3 + "\u{10FFFF}").valid_encoding?.should be_true
+      (ascii * 3 + "\u{10FFFF}" + ascii * 3).valid_encoding?.should be_true
+
+      # an ASCII block or word right after an incomplete multibyte sequence
+      String.new(Bytes[0xC3] + ascii.to_slice).valid_encoding?.should be_false
+      String.new(Bytes[0xE2, 0x82] + ("a" * 8).to_slice).valid_encoding?.should be_false
+      String.new(ascii.to_slice + Bytes[0xF0, 0x9F] + ascii.to_slice).valid_encoding?.should be_false
+      # a stray byte at each position relative to the block and word scans
+      {0, 7, 8, 63, 64, 65, 127, 128, 130}.each do |pos|
+        bytes = ("a" * 131).to_slice.dup
+        bytes[pos] = 0xFF_u8
+        String.new(bytes).valid_encoding?.should be_false
+        bytes[pos] = 0x80_u8
+        String.new(bytes).valid_encoding?.should be_false
+      end
     end
 
     it "scrubs" do
