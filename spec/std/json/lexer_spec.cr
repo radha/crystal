@@ -85,6 +85,25 @@ private def it_errors_to_lex(string, *, file = __FILE__, line = __LINE__)
   end
 end
 
+# Lexes *string* from an `IO::Memory`, a buffered `File` with a tiny buffer
+# (so plain-ASCII runs cross buffer refills), and a `File` with a UTF-8
+# decoder (which disables the IO-based lexer's peek fast path).
+private def each_io_lexer(string, &)
+  yield JSON::Lexer.new(IO::Memory.new(string)), "IO::Memory"
+  File.tempfile("json_lexer_spec") do |file|
+    file.print string
+    file.flush
+    File.open(file.path) do |io|
+      io.buffer_size = 16
+      yield JSON::Lexer.new(io), "File"
+    end
+    File.open(file.path) do |io|
+      io.set_encoding("UTF-8", invalid: :skip)
+      yield JSON::Lexer.new(io), "File with decoder"
+    end
+  end
+end
+
 describe JSON::Lexer do
   it_lexes "", :EOF, expected_to_s: "<EOF>"
   it_lexes "{", :begin_object
@@ -245,4 +264,59 @@ describe JSON::Lexer do
     token.kind.int?.should be_true
     expect_raises(JSON::ParseException) { token.int_value }
   end
+
+  describe "IO-based lexer plain-ASCII runs" do
+    it "lexes runs that end at escapes, quotes, non-ASCII and control bytes" do
+      value = "aaaaaaaa" * 3 + "\"q\" \\ " + "b" * 17 + "中" + "c" * 9 + "\n" + "d" * 8 + "\u{1F600}"
+      json = "[" + value.to_json + ",1]"
+      each_io_lexer(json) do |lexer, label|
+        lexer.next_token.kind.begin_array?.should be_true
+        token = lexer.next_token
+        token.kind.string?.should(be_true, label)
+        token.string_value.should eq(value), label
+        comma = lexer.next_token
+        comma.kind.comma?.should be_true
+        # "[" + the quoted value's codepoints + the following comma
+        comma.column_number.should eq(1 + value.to_json.size + 1), label
+        lexer.next_token.kind.int?.should be_true
+      end
+    end
+
+    it "skips strings with runs in skip mode" do
+      value_json = ("x" * 40 + "\\n" + "y" * 10 + "é").to_json
+      json = "[" + value_json + ",2]"
+      each_io_lexer(json) do |lexer, label|
+        lexer.next_token.kind.begin_array?.should be_true
+        lexer.skip = true
+        lexer.next_token.kind.string?.should(be_true, label)
+        lexer.skip = false
+        comma = lexer.next_token
+        comma.kind.comma?.should be_true
+        comma.column_number.should eq(1 + value_json.size + 1), label
+        lexer.next_token.int_value.should eq(2)
+      end
+    end
+
+    it "still rejects control bytes, invalid UTF-8 and unterminated strings after a run" do
+      each_io_lexer("\"" + "a" * 20 + "\"") do |lexer, label|
+        expect_raises(JSON::ParseException, "Unexpected char") { lexer.next_token }
+      end
+      each_io_lexer("\"" + "a" * 20) do |lexer, label|
+        expect_raises(JSON::ParseException, "Unterminated string") { lexer.next_token }
+      end
+      lexer = JSON::Lexer.new(IO::Memory.new(("\"" + "a" * 20).to_slice + Bytes[0xFF, 0x22]))
+      expect_raises(InvalidByteSequenceError) { lexer.next_token }
+    end
+
+    it "pools object keys lexed as runs" do
+      lexer = JSON::Lexer.new(IO::Memory.new(%({"longer_than_eight_bytes":1,"longer_than_eight_bytes":2})))
+      lexer.next_token
+      first = lexer.next_token_expect_object_key.string_value
+      3.times { lexer.next_token }
+      second = lexer.next_token_expect_object_key.string_value
+      first.should eq("longer_than_eight_bytes")
+      first.should be(second)
+    end
+  end
+
 end
