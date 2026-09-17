@@ -37,6 +37,13 @@ class JSON::Token
   end
 
   def float_value : Float64
+    if source = @raw_source
+      # Parse straight out of the source string; the lexer has already
+      # validated the number's syntax, so this only fails if `String#to_f64`
+      # would too, which then raises with its usual message.
+      value = Float::FastFloat.to_f64?(source.to_unsafe + @raw_start, source.to_unsafe + @raw_end)
+      return value if value
+    end
     raw_value.to_f64
   rescue exc : ArgumentError
     raise ParseException.new(exc.message, line_number, column_number)
@@ -71,7 +78,40 @@ class JSON::Token
     @column_number = column_number.to_i64
   end
 
-  property raw_value : String
+  @raw_value : String
+
+  # Set by the string-based lexer instead of `raw_value=`: the number's bytes
+  # are the range `@raw_start...@raw_end` of `@raw_source`, and the substring
+  # is only built if `raw_value` is read.
+  @raw_source : String?
+  @raw_start : Int32
+  @raw_end : Int32
+
+  def raw_value : String
+    if source = @raw_source
+      @raw_value = source.byte_slice(@raw_start, @raw_end - @raw_start)
+      @raw_source = nil
+    end
+    @raw_value
+  end
+
+  def raw_value=(@raw_value : String)
+    @raw_source = nil
+  end
+
+  # :nodoc:
+  def set_raw_range(@raw_source : String, @raw_start : Int32, @raw_end : Int32) : Nil
+  end
+
+  # :nodoc:
+  #
+  # The source string and byte range of the raw value while it has not been
+  # built as a substring, or `nil` once it has (or was set directly).
+  def raw_range : {String, Int32, Int32}?
+    if source = @raw_source
+      {source, @raw_start, @raw_end}
+    end
+  end
 
   def initialize
     @kind = :EOF
@@ -79,6 +119,9 @@ class JSON::Token
     @column_number = 0
     @string_value = ""
     @raw_value = ""
+    @raw_source = nil
+    @raw_start = 0
+    @raw_end = 0
   end
 
   def to_s(io : IO) : Nil

@@ -319,4 +319,43 @@ describe JSON::Lexer do
     end
   end
 
+  describe "lazy raw number values" do
+    it "builds raw_value only when read, and keeps it after the lexer advances" do
+      lexer = JSON::Lexer.new("[123, 45.5e1]")
+      lexer.next_token
+      int = lexer.next_token
+      int.raw_range.should eq({"[123, 45.5e1]", 1, 4})
+      int.int_value.should eq(123)
+      int.raw_range.should eq({"[123, 45.5e1]", 1, 4})
+      int.raw_value.should eq("123")
+      int.raw_range.should be_nil
+      lexer.next_token.kind.comma?.should be_true
+      lexer.next_token.kind.float?.should be_true
+      # the comma and the float share the token object; the float's range replaced the int's
+      lexer.token.float_value.should eq(455.0)
+      lexer.token.raw_value.should eq("45.5e1")
+      lexer.token.float_value.should eq(455.0)
+    end
+
+    it "parses floats straight from the source and falls back for huge integers" do
+      token = JSON::Lexer.new("-0.0").next_token
+      token.float_value.should eq(-0.0)
+      (1 / token.float_value).should eq(-Float64::INFINITY)
+      token.raw_range.should_not be_nil
+      token = JSON::Lexer.new("99999999999999999999").next_token
+      expect_raises(JSON::ParseException) { token.int_value }
+      token.raw_value.should eq("99999999999999999999")
+      token = JSON::Lexer.new(IO::Memory.new("1.25")).next_token
+      token.raw_range.should be_nil
+      token.raw_value.should eq("1.25")
+      token.float_value.should eq(1.25)
+    end
+
+    it "clears the range when raw_value is assigned" do
+      token = JSON::Lexer.new("7").next_token
+      token.raw_value = "8"
+      token.raw_range.should be_nil
+      token.raw_value.should eq("8")
+    end
+  end
 end

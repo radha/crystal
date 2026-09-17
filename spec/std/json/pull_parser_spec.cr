@@ -341,6 +341,31 @@ describe JSON::PullParser do
     assert_raw %([1,"hello",true,false,null,[1,2,3]])
     assert_raw %({"foo":[1,2,{"bar":[1,"hello",true,false,1.5]}]})
     assert_raw %({"foo":"bar"})
+
+    it "exposes raw_value for numbers from strings and IOs, before and after advancing" do
+      json = "[10, 2.5, 99999999999999999999]"
+      {JSON::PullParser.new(json), JSON::PullParser.new(IO::Memory.new(json))}.each do |pull|
+        pull.read_begin_array
+        pull.raw_value.should eq("10")
+        pull.read_int.should eq(10)
+        pull.raw_value.should eq("2.5")
+        pull.read_float.should eq(2.5)
+        pull.raw_value.should eq("99999999999999999999")
+        pull.read?(UInt128).should eq(UInt128.new("99999999999999999999"))
+        pull.read_end_array
+      end
+    end
+
+    it "reads raw numbers into a builder without changing them" do
+      pull = JSON::PullParser.new(%([1, -0, 1.5e+300, 0.000001, "x"]))
+      JSON.build { |json| pull.read_raw(json) }.should eq(%([1,-0,1.5e+300,0.000001,"x"]))
+    end
+
+    it "rejects floats that overflow but still exposes them raw" do
+      pull = JSON::PullParser.new("1e999")
+      expect_raises(JSON::ParseException, "Invalid Float64") { pull.float_value }
+      pull.read_raw.should eq("1e999")
+    end
   end
 
   describe "#read?" do
