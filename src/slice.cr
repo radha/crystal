@@ -286,9 +286,8 @@ struct Slice(T)
   # slice[1..3]?  # => Slice[11, 12, 13]
   # slice[1..33]? # => nil
   # ```
-  def []?(range : Range)
-    start, count = Indexable.range_to_index_and_count(range, size) || return nil
-    self[start, count]?
+  def []?(range : Range) : Slice(T)?
+    range_to_subslice(range) { return nil }
   end
 
   # Returns a new slice with the elements in the given range.
@@ -318,8 +317,39 @@ struct Slice(T)
   # slice[1..33] # raises IndexError
   # ```
   def [](range : Range) : Slice(T)
-    start, count = Indexable.range_to_index_and_count(range, size) || raise IndexError.new
-    self[start, count]
+    range_to_subslice(range) { raise IndexError.new }
+  end
+
+  # Resolves *range* against this slice in one pass and builds the subslice.
+  # Yields when the range falls outside the slice; the block must not return
+  # normally. An inclusive end at or past `size` is rejected before the `+ 1`
+  # so an end of `Int::MAX` cannot overflow.
+  private def range_to_subslice(range : Range, &)
+    size = @size
+
+    start = range.begin
+    if start.nil?
+      start = 0
+    else
+      start += size if start < 0
+      yield unless 0 <= start <= size
+    end
+
+    finish = range.end
+    if finish.nil?
+      count = size - start
+    else
+      finish += size if finish < 0
+      if range.excludes_end?
+        yield if finish > size
+      else
+        yield if finish >= size
+        finish += 1
+      end
+      count = finish > start ? finish - start : 0
+    end
+
+    Slice.new(@pointer + start, count, read_only: @read_only)
   end
 
   @[AlwaysInline]

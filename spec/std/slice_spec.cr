@@ -158,6 +158,56 @@ describe "Slice" do
     slice[-6..-5]?.should be_nil
   end
 
+  it "does [] and []? with range edge cases" do
+    slice = Slice.new(4) { |i| i + 1 }
+
+    slice[..].to_unsafe.should eq(slice.to_unsafe)
+    slice[..].size.should eq(4)
+    slice[2..].should eq(Slice[3, 4])
+    slice[..1].should eq(Slice[1, 2])
+    slice[...1].should eq(Slice[1])
+    slice[0..-1].should eq(Slice[1, 2, 3, 4])
+    slice[0...-1].should eq(Slice[1, 2, 3])
+    slice[1..-2].should eq(Slice[2, 3])
+
+    # start at the end yields an empty slice
+    slice[4..].size.should eq(0)
+    slice[4..].to_unsafe.should eq(slice.to_unsafe + 4)
+    slice[4..3].size.should eq(0)
+    slice[4...4].size.should eq(0)
+
+    # end before start yields an empty slice at start
+    slice[2..0].size.should eq(0)
+    slice[2..0].to_unsafe.should eq(slice.to_unsafe + 2)
+    slice[2...2].size.should eq(0)
+    slice[1..-10].size.should eq(0)
+    slice[1...-10].size.should eq(0)
+
+    # end beyond the slice
+    expect_raises(IndexError) { slice[0..4] }
+    slice[0...4].should eq(Slice[1, 2, 3, 4])
+    expect_raises(IndexError) { slice[0...5] }
+    expect_raises(IndexError) { slice[0..Int32::MAX] }
+    expect_raises(IndexError) { slice[0...Int32::MAX] }
+    slice[0..Int32::MAX]?.should be_nil
+    slice[0...Int32::MAX]?.should be_nil
+
+    # start beyond the slice
+    expect_raises(IndexError) { slice[5..] }
+    expect_raises(IndexError) { slice[5..6] }
+    expect_raises(IndexError) { slice[-5..] }
+    slice[5..]?.should be_nil
+    slice[-5..]?.should be_nil
+    slice[5..4]?.should be_nil
+
+    # other integer types
+    slice[1_i64..2_i64].should eq(Slice[2, 3])
+    slice[1_u8...3_u8].should eq(Slice[2, 3])
+
+    # read-only propagates
+    Slice.new(4, 0, read_only: true)[1..].read_only?.should be_true
+  end
+
   it "does [] with start and count" do
     slice = Slice.new(4) { |i| i + 1 }
 
