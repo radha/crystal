@@ -6100,7 +6100,24 @@ class String
 
   private def dump_or_inspect_unquoted(io, &)
     reader = Char::Reader.new(self)
+    bytes = to_unsafe
     while reader.has_next?
+      # Printable ASCII other than `"`, `\\` and `#` is written unchanged by
+      # both `#inspect` and `#dump`, so copy such runs whole instead of
+      # decoding and escaping one character at a time. The reader always
+      # sits on a character boundary here, and each ASCII byte is a whole
+      # character, so resuming it after the run is exact.
+      start = reader.pos
+      finish = start
+      while finish < @bytesize && dump_or_inspect_plain_byte?(bytes[finish])
+        finish += 1
+      end
+      if finish > start
+        io.write_string(Slice.new(bytes + start, finish - start))
+        reader.pos = finish
+        next
+      end
+
       current_char = reader.current_char
       case current_char
       when '"'  then io << "\\\""
@@ -6134,6 +6151,14 @@ class String
       end
       reader.next_char
     end
+  end
+
+  # Whether *byte* is printed as itself by `#inspect` and `#dump`: printable
+  # ASCII (`0x20..0x7E`) except the quote, backslash and `#` that start an
+  # escape sequence or an interpolation.
+  @[AlwaysInline]
+  private def dump_or_inspect_plain_byte?(byte : UInt8) : Bool
+    0x20 <= byte <= 0x7E && byte != 0x22 && byte != 0x5C && byte != 0x23
   end
 
   private def inspect_char(char, error, io)
