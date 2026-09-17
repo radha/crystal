@@ -1215,6 +1215,16 @@ abstract class IO
     @encoding.try(&.name) || "UTF-8"
   end
 
+  # :nodoc:
+  #
+  # Returns `true` when characters are read and written as raw UTF-8 bytes,
+  # i.e. no decoder or encoder is in use: `#peek` then shows exactly the bytes
+  # that `#read_char` will decode. `false` after `#set_encoding` with any
+  # other encoding, or with UTF-8 and an *invalid* option.
+  def raw_utf8? : Bool
+    @encoding.nil?
+  end
+
   private def utf8_encoding?(encoding : String, invalid : Symbol? = nil) : Bool
     invalid.nil? && (
       encoding.compare("UTF-8", case_insensitive: true) == 0 ||
