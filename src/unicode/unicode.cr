@@ -77,11 +77,34 @@ module Unicode
     e = s + bytes.size
 
     while s + UNROLL <= e
+      # A block with no high bit set is pure ASCII: every byte is a complete
+      # codepoint, so when the DFA is in its initial state the whole block can
+      # be skipped without running it. Mid-sequence (any other state) an ASCII
+      # byte is an error, which the DFA below reports as usual.
+      # The first word is tested alone so that dense non-ASCII text pays for
+      # a single load before falling through to the DFA.
+      if state & 0x3F == 0 && s.as(UInt64*).value & 0x8080808080808080_u64 == 0
+        acc = 0_u64
+        {% for i in 1...(UNROLL // 8) %}
+          acc |= (s + {{ i * 8 }}).as(UInt64*).value
+        {% end %}
+        if acc & 0x8080808080808080_u64 == 0
+          s += UNROLL
+          next
+        end
+      end
+
       {% for i in 0...UNROLL %}
         state = table[s[{{ i }}]].unsafe_shr(state & 0x3F)
       {% end %}
       return false if state & 0x3F == 6
       s += UNROLL
+    end
+
+    # Same ASCII skip a word at a time for the tail below one unrolled block.
+    while s + 8 <= e && state & 0x3F == 0
+      break if s.as(UInt64*).value & 0x8080808080808080_u64 != 0
+      s += 8
     end
 
     while s < e
