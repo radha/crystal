@@ -137,6 +137,67 @@ class Deque(T)
     push(value)
   end
 
+  # :inherit:
+  def sort! : self
+    contiguous_slice.sort!
+    self
+  end
+
+  # :inherit:
+  def unstable_sort! : self
+    contiguous_slice.unstable_sort!
+    self
+  end
+
+  # :inherit:
+  def sort!(&block : T, T -> U) : self forall U
+    {% unless U <= Int32? %}
+      {% raise "Expected block to return Int32 or Nil, not #{U}.\nThe block is supposed to be a custom comparison operation, compatible with `Comparable#<=>`.\nDid you mean to use `#sort_by!`?" %}
+    {% end %}
+
+    contiguous_slice.sort!(&block)
+    self
+  end
+
+  # :inherit:
+  def unstable_sort!(&block : T, T -> U) : self forall U
+    {% unless U <= Int32? %}
+      {% raise "Expected block to return Int32 or Nil, not #{U}.\nThe block is supposed to be a custom comparison operation, compatible with `Comparable#<=>`.\nDid you mean to use `#unstable_sort_by!`?" %}
+    {% end %}
+
+    contiguous_slice.unstable_sort!(&block)
+    self
+  end
+
+  # :inherit:
+  def sort_by!(&block : T -> _) : self
+    contiguous_slice.sort_by!(&block)
+    self
+  end
+
+  # :inherit:
+  def unstable_sort_by!(&block : T -> _) : self
+    contiguous_slice.unstable_sort_by!(&block)
+    self
+  end
+
+  # Returns a slice over the elements in order, without allocating.
+  #
+  # If the elements wrap around the end of the ring buffer, the whole buffer is
+  # first rotated in place so that they become contiguous from index 0. The
+  # rotation is O(capacity) and only moves the elements together with the
+  # cleared slots of the gap, so the deque's contents are unchanged.
+  private def contiguous_slice : Slice(T)
+    if @start + @size > @capacity
+      buffer = Slice.new(@buffer, @capacity)
+      buffer[0, @start].reverse!
+      buffer[@start, @capacity - @start].reverse!
+      buffer.reverse!
+      @start = 0
+    end
+    Slice.new(@buffer + @start, @size)
+  end
+
   def unsafe_fetch(index : Int) : T
     index += @start
     index -= @capacity if index >= @capacity

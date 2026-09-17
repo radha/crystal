@@ -53,6 +53,15 @@ private def each_queue_repr(max_size, &)
   end
 end
 
+# Builds a deque whose elements wrap around the end of its ring buffer.
+private def wrapped_deque(values : Array(T)) forall T
+  deque = Deque(T).new(values.size + 2)
+  3.times { deque.push values.first }
+  3.times { deque.shift }
+  values.each { |value| deque.push value }
+  deque
+end
+
 describe "Deque" do
   describe "implementation" do
     it "works the same as array" do
@@ -647,6 +656,39 @@ describe "Deque" do
       expect_raises IndexError do
         a.swap(0, 3)
       end
+    end
+  end
+
+  describe "sort!" do
+    it "sorts contiguous and wrapped deques in place" do
+      values = [5, 3, 9, 1, 7, 2, 8, 6, 4]
+      Deque.new(values).sort!.should eq(Deque.new(values.sort))
+      Deque.new(values).unstable_sort!.should eq(Deque.new(values.sort))
+
+      deque = wrapped_deque(values)
+      deque.sort!.should eq(Deque.new(values.sort))
+      deque.push(0).unshift(10)
+      deque.should eq(Deque.new([10] + values.sort + [0]))
+
+      wrapped_deque(values).unstable_sort!.should eq(Deque.new(values.sort))
+      wrapped_deque(%w(b a c)).sort!.should eq(Deque{"a", "b", "c"})
+      Deque(Int32).new.sort!.should eq(Deque(Int32).new)
+    end
+
+    it "sorts with a block" do
+      values = [5, 3, 9, 1, 7]
+      Deque.new(values).sort! { |a, b| b <=> a }.should eq(Deque.new(values.sort.reverse))
+      wrapped_deque(values).sort! { |a, b| b <=> a }.should eq(Deque.new(values.sort.reverse))
+      wrapped_deque(values).unstable_sort! { |a, b| b <=> a }.should eq(Deque.new(values.sort.reverse))
+    end
+
+    it "sorts by a block, stably" do
+      values = [{2, "a"}, {1, "b"}, {2, "c"}, {1, "d"}]
+      sorted = Deque{ {1, "b"}, {1, "d"}, {2, "a"}, {2, "c"} }
+      Deque.new(values).sort_by! { |v| v[0] }.should eq(sorted)
+      wrapped_deque(values).sort_by! { |v| v[0] }.should eq(sorted)
+      wrapped_deque(values).sort! { |a, b| a[0] <=> b[0] }.should eq(sorted)
+      wrapped_deque(values).unstable_sort_by! { |v| v[0] }.map(&.[0]).should eq([1, 1, 2, 2])
     end
   end
 
