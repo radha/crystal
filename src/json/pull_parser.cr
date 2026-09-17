@@ -89,7 +89,22 @@ class JSON::PullParser
   end
 
   getter string_value : String
-  getter raw_value : String
+
+  # The raw value is copied from the token lazily: while the lexer is
+  # string-based it is a byte range of the (immutable) source string, and the
+  # substring is only built here if it is actually read.
+  @raw_value : String
+  @raw_source : String?
+  @raw_start : Int32
+  @raw_end : Int32
+
+  def raw_value : String
+    if source = @raw_source
+      @raw_value = source.byte_slice(@raw_start, @raw_end - @raw_start)
+      @raw_source = nil
+    end
+    @raw_value
+  end
 
   property max_nesting = 512
 
@@ -102,6 +117,9 @@ class JSON::PullParser
     @bool_value = false
     @string_value = ""
     @raw_value = ""
+    @raw_source = nil
+    @raw_start = 0
+    @raw_end = 0
     @object_stack = [] of ObjectStackKind
     @skip_count = 0
     @location = {0_i64, 0_i64}
@@ -118,10 +136,10 @@ class JSON::PullParser
       @bool_value = true
     in .int?
       @kind = :int
-      @raw_value = token.raw_value
+      capture_raw_value
     in .float?
       @kind = :float
-      @raw_value = token.raw_value
+      capture_raw_value
     in .string?
       @kind = :string
       @string_value = token.string_value
@@ -253,7 +271,7 @@ class JSON::PullParser
     when .bool?
       @bool_value.to_s.tap { read_next }
     when .int?, .float?
-      @raw_value.tap { read_next }
+      raw_value.tap { read_next }
     when .string?
       @string_value.to_json.tap { read_next }
     when .begin_array?
@@ -277,7 +295,7 @@ class JSON::PullParser
       json.bool(@bool_value)
       read_next
     when .int?, .float?
-      json.raw(@raw_value)
+      json.raw(raw_value)
       read_next
     when .string?
       json.string(@string_value)
@@ -489,12 +507,12 @@ class JSON::PullParser
         return
       when .int?
         @kind = :int
-        @raw_value = token.raw_value
+        capture_raw_value
         next_token_after_value
         return
       when .float?
         @kind = :float
-        @raw_value = token.raw_value
+        capture_raw_value
         next_token_after_value
         return
       when .string?
@@ -671,6 +689,15 @@ class JSON::PullParser
 
   private def token
     @lexer.token
+  end
+
+  private def capture_raw_value : Nil
+    if range = token.raw_range
+      @raw_source, @raw_start, @raw_end = range
+    else
+      @raw_source = nil
+      @raw_value = token.raw_value
+    end
   end
 
   private def next_token

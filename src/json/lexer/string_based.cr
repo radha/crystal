@@ -232,4 +232,10 @@ class JSON::Lexer::StringBased < JSON::Lexer
   private def number_string
     string_range(@number_start, current_pos)
   end
+
+  # The number's substring is only built if `Token#raw_value` is read;
+  # `Token#int_value` and `#float_value` usually never need it.
+  private def number_end
+    @token.set_raw_range(@reader.string, @number_start, current_pos)
+  end
 end

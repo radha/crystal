@@ -53,6 +53,18 @@ struct Float
       end
     end
 
+    # :nodoc:
+    #
+    # Parses the bytes in `start...finish` as a `Float64`. All of them must be
+    # consumed and no whitespace is skipped; equivalent to `String#to_f64?`
+    # with `whitespace: false, strict: true` on that byte range.
+    def self.to_f64?(start : UInt8*, finish : UInt8*) : Float64?
+      value = uninitialized Float64
+      options = ParseOptionsT(UInt8).new(format: :general)
+      ret = BinaryFormat_Float64.new.from_chars_advanced(start, finish, pointerof(value), options)
+      value if ret.ec == Errno::NONE && ret.ptr == finish
+    end
+
     def self.to_f32?(str : String, whitespace : Bool, strict : Bool) : Float32?
       value = uninitialized Float32
       start = str.to_unsafe
