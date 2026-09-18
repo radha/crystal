@@ -191,6 +191,12 @@ private struct LsbBits
   field b : UInt8, bits: 4
 end
 
+private struct SignedBits
+  include Binary::Format
+  field a : Int8, bits: 4
+  field b : Int16, bits: 12
+end
+
 private struct Elf64Ident
   include Binary::Format
   endian :little
@@ -216,6 +222,12 @@ private struct SizedFixed
   field len : UInt32, size_of: :rest
   field a : UInt16
   field b : UInt8
+end
+
+private struct SizedHead
+  include Binary::Format
+  field length : UInt16, size_of: :rest
+  field a : UInt8
 end
 
 private struct PgQuery
@@ -264,6 +276,16 @@ private struct RpcFrameHeader
   field flags : UInt8
   field stream_id : UInt32
   field length : UInt32
+end
+
+private struct VarBits
+  include Binary::Format
+  magic "VB"
+  field a : UInt8, bits: 3
+  field b : UInt8, bits: 5
+  pad 1
+  field len : UInt32, size_of: :rest
+  field body : Bytes, until: :eof
 end
 
 describe Binary::Format do
@@ -386,6 +408,24 @@ describe Binary::Format do
     it "raises IO::EOFError on an unterminated cstring" do
       expect_raises(IO::EOFError) { Texts.from_slice(Bytes[0, 0x54, 0x41, 0x47, 0x21, 0x68, 0x69]) }
     end
+
+    it "raises IO::EOFError for an offset past the end on variable layouts" do
+      expect_raises(IO::EOFError) { Texts.from_slice(Bytes[1, 2], 3) }
+      expect_raises(IO::EOFError) { Texts.from_slice(Bytes[1, 2], -1) }
+    end
+  end
+
+  describe "derived fields" do
+    it "recomputes derived fields from setter changes on write" do
+      t = Texts.new(name: "ab", tag: "abcd", note: "", n: 0, twice: Bytes.empty, rest: Bytes.empty)
+      t.name = "abcde"
+      t.to_slice[0].should eq 5
+      t.name_len.should eq 5
+      c = PgColumn.new(value: nil)
+      c.value = "42".to_slice
+      c.to_slice.should eq Bytes[0, 0, 0, 2, 0x34, 0x32]
+      c.length.should eq 2
+    end
   end
 
   describe "Array, StaticArray and nested formats" do
@@ -495,6 +535,21 @@ describe Binary::Format do
       v.byte_size.should eq 7
       Varints.from_slice(v.to_slice).should eq v
     end
+
+    it "skips unmodelled trailing bytes inside a size_of region" do
+      io = IO::Memory.new(Bytes[0, 3, 7, 0xEE, 0xEE, 0xAA])
+      SizedHead.read(io).a.should eq 7
+      io.read_byte.should eq 0xAA
+      # `length` is read as the literal wire value (3, covering the two
+      # skipped 0xEE bytes), not recomputed from the modelled fields (which
+      # would give 1 for `a` alone) — so compare fields, not struct equality
+      # against a freshly constructed `SizedHead.new(a: 7)` (whose derived
+      # `length` would be 1).
+      result, consumed = SizedHead.from_slice(Bytes[0, 3, 7, 0xEE, 0xEE, 0xAA], 0)
+      result.a.should eq 7
+      result.length.should eq 3
+      consumed.should eq 5
+    end
   end
 
   describe "bits" do
@@ -519,6 +574,15 @@ describe Binary::Format do
       expect_raises(Binary::Format::Error, /Ipv4#version/) do
         Ipv4.new(version: 16, ihl: 5, dscp: 0, ecn: 0, total_length: 0, id: 0, reserved: false, df: false, mf: false, fragment_offset: 0).to_slice
       end
+    end
+
+    it "packs signed bit fields in two's complement" do
+      s = SignedBits.new(a: -1, b: -2048)
+      s.to_slice.should eq Bytes[0xF8, 0x00]
+      SignedBits.from_slice(s.to_slice).should eq s
+      SignedBits.from_slice(Bytes[0x7F, 0xFF]).should eq SignedBits.new(a: 7, b: -1)
+      expect_raises(Binary::Format::Error, /SignedBits#a/) { SignedBits.new(a: 8, b: 0).to_slice }
+      expect_raises(Binary::Format::Error, /SignedBits#a/) { SignedBits.new(a: -9, b: 0).to_slice }
     end
   end
 
@@ -580,6 +644,19 @@ describe Binary::Format do
     end
   end
 
+  describe "variable layouts with pad, magic and bits" do
+    it "round-trips magic, bits, pad, size_of and rest through the IO path" do
+      VarBits.fixed_size?.should be_false
+      v = VarBits.new(a: 5, b: 3, body: Bytes[9, 8, 7])
+      v.to_slice.should eq Bytes[0x56, 0x42, 0xA3, 0, 0, 0, 0, 3, 9, 8, 7]
+      v.byte_size.should eq 11
+      VarBits.read(IO::Memory.new(v.to_slice)).should eq v
+      VarBits.read(UnbufferedIO.new(v.to_slice)).should eq v
+      VarBits.from_slice(Bytes[0xFF, 0xFF] + v.to_slice, 2).should eq({v, 11})
+      expect_raises(Binary::Format::MagicError) { VarBits.from_slice(Bytes[0x56, 0x43, 0xA3, 0, 0, 0, 0, 0]) }
+    end
+  end
+
   describe "size_of with fixed tail" do
     it "treats a size_of layout with a fixed tail as variable" do
       SizedFixed.fixed_size?.should be_false
@@ -594,7 +671,9 @@ describe Binary::Format do
     it "Postgres Query" do
       q = PgQuery.new(query: "select 1")
       q.to_slice.should eq Bytes[0x51, 0, 0, 0, 13] + "select 1\0".to_slice
-      PgQuery.from_slice(q.to_slice).query.should eq "select 1"
+      back = PgQuery.from_slice(q.to_slice)
+      back.query.should eq "select 1"
+      back.should eq q
     end
 
     it "Postgres RowDescription" do
@@ -610,6 +689,7 @@ describe Binary::Format do
       back.fields.size.should eq 1
       back.fields[0].type_modifier.should eq -1
       back.fields[0].format_code.should eq 1
+      back.should eq rd
     end
 
     it "Postgres DataRow with a NULL column" do
