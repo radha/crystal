@@ -904,6 +904,8 @@ module Binary
         {% end %}
       {% end %}
 
+      {% fixed = false if entries.any? { |x| x[:size_of] } %}
+
       {% for e in entries %}
         {% if e[:length_ref] %}
           {% target = nil %}
