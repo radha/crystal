@@ -196,6 +196,72 @@ module Binary
       def self.present(value : T?, label : String) : T forall T
         value || raise Error.new("#{label}: the field is nil but its `if:` condition is true")
       end
+
+      def self.read_bits(io : IO, nbytes : Int32, msb : Bool) : UInt64
+        acc = 0_u64
+        nbytes.times do |i|
+          byte = io.read_byte || raise IO::EOFError.new
+          if msb
+            acc = (acc << 8) | byte
+          else
+            acc |= byte.to_u64 << (8 * i)
+          end
+        end
+        acc
+      end
+
+      def self.write_bits(io : IO, acc : UInt64, nbytes : Int32, msb : Bool) : Nil
+        nbytes.times do |i|
+          shift = msb ? 8 * (nbytes - 1 - i) : 8 * i
+          io.write_byte(((acc >> shift) & 0xFF).to_u8!)
+        end
+      end
+
+      def self.load_bits(ptr : Pointer(UInt8), nbytes : Int32, msb : Bool) : UInt64
+        acc = 0_u64
+        nbytes.times do |i|
+          if msb
+            acc = (acc << 8) | ptr[i]
+          else
+            acc |= ptr[i].to_u64 << (8 * i)
+          end
+        end
+        acc
+      end
+
+      def self.store_bits(ptr : Pointer(UInt8), acc : UInt64, nbytes : Int32, msb : Bool) : Nil
+        nbytes.times do |i|
+          shift = msb ? 8 * (nbytes - 1 - i) : 8 * i
+          ptr[i] = ((acc >> shift) & 0xFF).to_u8!
+        end
+      end
+
+      def self.from_bits(type : T.class, acc : UInt64, shift : Int32, bits : Int32) : T forall T
+        raw = (acc >> shift) & (bits == 64 ? UInt64::MAX : (1_u64 << bits) &- 1)
+        {% if T == ::Bool %}
+          raw != 0
+        {% elsif T < ::Enum %}
+          T.new(typeof(T.new(0).value).new!(raw))
+        {% else %}
+          T.new!(raw)
+        {% end %}
+      end
+
+      def self.to_bits(value : Bool, bits : Int32, label : String) : UInt64
+        value ? 1_u64 : 0_u64
+      end
+
+      def self.to_bits(value : Enum, bits : Int32, label : String) : UInt64
+        to_bits(value.value, bits, label)
+      end
+
+      def self.to_bits(value : Int, bits : Int32, label : String) : UInt64
+        raw = value.to_u64!
+        if value < 0 || (bits < 64 && raw >= (1_u64 << bits))
+          raise Error.new("#{label}: value #{value} does not fit in #{bits} bits")
+        end
+        raw
+      end
     end
 
     # Sets the default byte order for every multi-byte field of this format.
@@ -204,6 +270,13 @@ module Binary
       {% raise "Binary::Format: endian must be :big, :little or :native, not #{value}" unless [:big, :little, :native].includes?(value) %}
       @[::Binary::Format::Entry(kind: :endian, value: {{value}})]
       private def __binary_directive_endian; end
+    end
+
+    # Sets the packing order of `bits:` runs: `:msb` (default) or `:lsb`.
+    macro bit_order(value)
+      {% raise "Binary::Format: bit_order must be :msb or :lsb, not #{value}" unless [:msb, :lsb].includes?(value) %}
+      @[::Binary::Format::Entry(kind: :bit_order, value: {{value}})]
+      private def __binary_directive_bit_order; end
     end
 
     # Skips *size* bytes on read and writes *size* zero bytes.
@@ -417,12 +490,15 @@ module Binary
     # :nodoc:
     macro __binary_generate(widths)
       {% type_endian = :big %}
+      {% bit_order = :msb %}
       {% raw = [] of Nil %}
       {% for m in @type.methods %}
         {% a = m.annotation(::Binary::Format::Entry) %}
         {% if a %}
           {% if a[:kind] == :endian %}
             {% type_endian = a[:value] %}
+          {% elsif a[:kind] == :bit_order %}
+            {% bit_order = a[:value] %}
           {% else %}
             {% raw << a %}
           {% end %}
@@ -441,7 +517,10 @@ module Binary
         fixed = true
       %}
 
-      {% for a in raw %}
+      {% run = [] of Nil %}
+      {% run_offset = nil %}
+
+      {% for a in raw + [{kind: :__end}] %}
         {% e = {} of Nil => Nil %}
         {% e[:kind] = a[:kind] %}
         {% e[:width] = nil %}
@@ -527,11 +606,11 @@ module Binary
           {% e[:signed] = sg[0] %}
           {% e[:swidth] = ws[0] %}
           {% if e[:cat] == :int || e[:cat] == :enum %}
-            {% allowed = ["endian", "varint", "value", "if", "size_of", "including_self", "max"] %}
+            {% allowed = ["endian", "varint", "value", "if", "size_of", "including_self", "max", "bits"] %}
           {% elsif e[:cat] == :float %}
             {% allowed = ["endian", "value", "if"] %}
           {% elsif e[:cat] == :bool %}
-            {% allowed = ["value", "if"] %}
+            {% allowed = ["value", "if", "bits"] %}
           {% elsif e[:cat] == :string %}
             {% allowed = ["length", "cstring", "until", "max", "if"] %}
           {% elsif e[:cat] == :bytes %}
@@ -682,6 +761,14 @@ module Binary
           {% elsif a[:including_self] %}
             {% raise "#{e[:label].id}: `including_self:` only applies with `size_of: :rest`" %}
           {% end %}
+          {% e[:bits] = nil %}
+          {% if a[:bits] %}
+            {% raise "#{e[:label].id}: `bits:` expects an integer literal in 1..64" unless a[:bits].is_a?(NumberLiteral) && a[:bits] >= 1 && a[:bits] <= 64 %}
+            {% raise "#{e[:label].id}: `bits: #{a[:bits]}` is wider than #{t}" if e[:width] && a[:bits] > e[:width] * 8 %}
+            {% raise "#{e[:label].id}: `bits:` cannot be combined with `varint:`, `if:` or `size_of:`" if e[:varint] || e[:if] || e[:size_of] %}
+            {% e[:bits] = a[:bits] %}
+            {% e[:width] = 0 %}
+          {% end %}
           {% for key, _v in a.named_args %}
             {% ks = key.id.stringify %}
             {% unless internal_keys.includes?(ks) || allowed.includes?(ks) %}
@@ -708,18 +795,51 @@ module Binary
             {% e[:width] = v.args.size %}
             {% e[:const_expr] = v %}
           {% end %}
+        {% elsif a[:kind] == :__end %}
+          # Sentinel entry: closes a trailing `bits:` run, see below. It is
+          # never appended to `entries`.
         {% else %}
           {% raise "Binary::Format: unknown entry kind #{a[:kind]}" %}
         {% end %}
-        {% if e[:width].nil? %}
-          {% fixed = false %}
-          {% offset = nil %}
-        {% elsif offset %}
-          {% e[:offset] = offset %}
-          {% offset = offset + e[:width] %}
+        {% if e[:kind] == :field && e[:bits] %}
+          {% run_offset = offset if run.empty? %}
+          {% e[:offset] = run_offset %}
+          {% run << e %}
+        {% else %}
+          {% if !run.empty? %}
+            {% total = 0 %}
+            {% for m in run %}
+              {% total = total + m[:bits] %}
+            {% end %}
+            {% raise "#{run[0][:label].id}: a run of `bits:` fields must end on a byte boundary, this one has #{total} bits" unless total % 8 == 0 %}
+            {% raise "#{run[0][:label].id}: a run of `bits:` fields may not exceed 64 bits, this one has #{total} bits" if total > 64 %}
+            {% shift = 0 %}
+            {% for m, i in run %}
+              {% m[:run_head] = i == 0 %}
+              {% m[:run_bytes] = total // 8 %}
+              {% m[:bit_shift] = bit_order == :msb ? total - shift - m[:bits] : shift %}
+              {% shift = shift + m[:bits] %}
+            {% end %}
+            {% run[0][:run_members] = run %}
+            {% run[0][:width] = total // 8 %}
+            {% offset = run_offset + total // 8 if run_offset %}
+            {% run = [] of Nil %}
+          {% end %}
+          {% if e[:kind] == :__end %}
+            # nothing further: the sentinel does not affect `fixed`/`offset`
+            # and is never appended to `entries`.
+          {% elsif e[:width].nil? %}
+            {% fixed = false %}
+            {% offset = nil %}
+          {% elsif offset %}
+            {% e[:offset] = offset %}
+            {% offset = offset + e[:width] %}
+          {% end %}
         {% end %}
-        {% e[:pos] = entries.size %}
-        {% entries << e %}
+        {% unless e[:kind] == :__end %}
+          {% e[:pos] = entries.size %}
+          {% entries << e %}
+        {% end %}
       {% end %}
 
       {% for e in entries %}
@@ -825,6 +945,12 @@ module Binary
             {% if e[:width] > 0 %} __io.skip({{e[:width]}}) {% end %}
           {% elsif e[:kind] == :magic %}
             ::Binary::Format::Codec.read_magic(__io, BINARY_MAGIC_{{e[:index]}}, {{type_name.stringify}})
+          {% elsif e[:kind] == :field && e[:bits] && !e[:run_head] %}
+          {% elsif e[:kind] == :field && e[:bits] %}
+            %acc{e[:name]} = ::Binary::Format::Codec.read_bits(__io, {{e[:run_bytes]}}, {{bit_order == :msb}})
+            {% for m in e[:run_members] %}
+              {{m[:name]}} = ::Binary::Format::Codec.from_bits({{m[:type]}}, %acc{e[:name]}, {{m[:bit_shift]}}, {{m[:bits]}})
+            {% end %}
           {% elsif e[:kind] == :field %}
             {{e[:name]}} = {% if e[:if] %} ({{e[:if].body}}) ? ( {% end %} __binary_read_scalar(__io, {{e[:cat]}}, {{e[:type]}}, {{e[:format]}}, {{e[:opts]}}) {% if e[:if] %} ) : nil {% end %}
             {% if e[:size_of] %}
@@ -844,6 +970,13 @@ module Binary
             {% if e[:width] > 0 %} ::Binary::Format::Codec.write_zeros(__io, {{e[:width]}}) {% end %}
           {% elsif e[:kind] == :magic %}
             __io.write(BINARY_MAGIC_{{e[:index]}})
+          {% elsif e[:kind] == :field && e[:bits] && !e[:run_head] %}
+          {% elsif e[:kind] == :field && e[:bits] %}
+            %acc{e[:name]} = 0_u64
+            {% for m in e[:run_members] %}
+              %acc{e[:name]} |= ::Binary::Format::Codec.to_bits({{m[:write_value] || "@#{m[:name]}".id}}, {{m[:bits]}}, {{m[:label]}}) << {{m[:bit_shift]}}
+            {% end %}
+            ::Binary::Format::Codec.write_bits(__io, %acc{e[:name]}, {{e[:run_bytes]}}, {{bit_order == :msb}})
           {% elsif e[:kind] == :field %}
             {% if e[:if] %}
               if ({{e[:if].body}})
@@ -874,7 +1007,9 @@ module Binary
           {% for e in entries %}
             {% if e[:pos] >= point[1] %}
               {% if e[:kind] == :field %}
-                {% if e[:if] %}
+                {% if e[:bits] %}
+                  __binary_size += {{e[:run_head] ? e[:run_bytes] : 0}}
+                {% elsif e[:if] %}
                   __binary_size += (({{e[:if].body}}) ? __binary_size_scalar({{e[:cat]}}, {{e[:type]}}, ::Binary::Format::Codec.present(@{{e[:name]}}, {{e[:label]}}), {{e[:opts]}}) : 0)
                 {% else %}
                   __binary_size += (__binary_size_scalar({{e[:cat]}}, {{e[:type]}}, {{e[:write_value] || "@#{e[:name]}".id}}, {{e[:opts]}}))
