@@ -24,6 +24,17 @@ private struct Mixed
   field d : UInt64
 end
 
+private enum Signed16 : Int16
+  Neg = -2
+  Pos =  3
+end
+
+private struct SignedEnum
+  include Binary::Format
+  field s : Signed16
+  field t : Signed16, endian: :little
+end
+
 describe Binary::Format do
   describe "scalars" do
     it "writes big-endian by default and reads back" do
@@ -63,6 +74,12 @@ describe Binary::Format do
       io = IO::Memory.new
       Mixed.new(a: 1, b: 0_f32, c: false, d: 0).write(io)
       io.to_slice.size.should eq 15
+    end
+
+    it "round-trips enums with a signed base type" do
+      v = SignedEnum.new(s: :neg, t: :pos)
+      v.to_slice.should eq Bytes[0xFF, 0xFE, 3, 0]
+      SignedEnum.from_slice(v.to_slice).should eq v
     end
   end
 end
