@@ -108,6 +108,35 @@ describe Binary::BitReader do
     r.read_bits(7).should eq 0
     r.eof?.should be_true
   end
+
+  it "compacts the staging buffer across a short read followed by more data" do
+    # IO::Memory.new(bytes) wraps the slice non-resizeably, so a later
+    # `write` would raise; build a resizeable IO::Memory and rewind it to
+    # read from the start instead.
+    io = IO::Memory.new
+    io.write(Bytes[1, 2, 3, 4, 5, 6, 7])
+    io.rewind
+    r = Binary::BitReader.new(io)
+    r.read_bits?(60).should be_nil
+    r.read_bits(8).should eq 1
+    r.read_bits(8).should eq 2
+    io.write(Bytes[8, 9, 10, 11, 12, 13, 14, 15])
+    io.pos = 7
+    r.read_bits(64).should eq IO::ByteFormat::BigEndian.decode(UInt64, Bytes[3, 4, 5, 6, 7, 8, 9, 10])
+    r.read_bits(40).should eq IO::ByteFormat::BigEndian.decode(UInt64, Bytes[0, 0, 0, 11, 12, 13, 14, 15])
+    r.eof?.should be_true
+  end
+
+  it "reads LSB-first from an IO across several refills" do
+    bytes = Bytes.new(24) { |i| (i * 53).to_u8! }
+    r = Binary::BitReader.new(IO::Memory.new(bytes), :lsb)
+    expected = IO::ByteFormat::LittleEndian.decode(UInt64, bytes[0, 8])
+    r.read_bits(3).should eq(expected & 0x7)
+    r.read_bits(61).should eq(expected >> 3)
+    r.read_bits(64).should eq IO::ByteFormat::LittleEndian.decode(UInt64, bytes[8, 8])
+    r.read_bits(64).should eq IO::ByteFormat::LittleEndian.decode(UInt64, bytes[16, 8])
+    r.eof?.should be_true
+  end
 end
 
 describe Binary::BitWriter do
