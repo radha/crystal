@@ -24,6 +24,32 @@ private struct Mixed
   field d : UInt64
 end
 
+private struct PngSig
+  include Binary::Format
+  magic Bytes[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+  field width : UInt32
+  field height : UInt32
+  field depth : UInt8
+  pad 3
+end
+
+private struct Riff
+  include Binary::Format
+  endian :little
+  magic "RIFF"
+  field size : UInt32
+  magic 0xCAFEBABE_u32
+end
+
+private struct Aligned
+  include Binary::Format
+  field a : UInt8
+  align 4
+  field b : UInt32
+  field c : UInt8
+  align 8
+end
+
 private enum Signed16 : Int16
   Neg = -2
   Pos =  3
@@ -80,6 +106,40 @@ describe Binary::Format do
       v = SignedEnum.new(s: :neg, t: :pos)
       v.to_slice.should eq Bytes[0xFF, 0xFE, 3, 0]
       SignedEnum.from_slice(v.to_slice).should eq v
+    end
+  end
+
+  describe "pad, align and magic" do
+    it "writes magic bytes and zero padding" do
+      png = PngSig.new(width: 1, height: 2, depth: 8)
+      png.to_slice.should eq Bytes[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 1, 0, 0, 0, 2, 8, 0, 0, 0]
+      png.byte_size.should eq 20
+      PngSig.from_slice(png.to_slice).should eq png
+    end
+
+    it "accepts String and suffixed integer magics in the type endian" do
+      r = Riff.new(size: 4)
+      r.to_slice.should eq Bytes[0x52, 0x49, 0x46, 0x46, 4, 0, 0, 0, 0xBE, 0xBA, 0xFE, 0xCA]
+      Riff.from_slice(r.to_slice).size.should eq 4
+    end
+
+    it "raises MagicError naming both byte strings" do
+      bad = Bytes[0x89, 0x50, 0x4E, 0x48, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 1, 0, 0, 0, 2, 8, 0, 0, 0]
+      ex = expect_raises(Binary::Format::MagicError) { PngSig.from_slice(bad) }
+      ex.message.not_nil!.should contain "89504e470d0a1a0a"
+      ex.message.not_nil!.should contain "89504e480d0a1a0a"
+    end
+
+    it "aligns relative to the start of the record" do
+      a = Aligned.new(a: 1, b: 2, c: 3)
+      a.to_slice.should eq Bytes[1, 0, 0, 0, 0, 0, 0, 2, 3, 0, 0, 0, 0, 0, 0, 0]
+      a.byte_size.should eq 16
+      Aligned.from_slice(a.to_slice).should eq a
+    end
+
+    it "skips padding bytes on read regardless of their content" do
+      bytes = Bytes[1, 9, 9, 9, 0, 0, 0, 2, 3, 9, 9, 9, 9, 9, 9, 9]
+      Aligned.from_slice(bytes).should eq Aligned.new(a: 1, b: 2, c: 3)
     end
   end
 end
