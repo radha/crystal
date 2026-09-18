@@ -19,6 +19,9 @@ module Binary
     @io : IO?
     @pos : Int32 = 0
     @consumed : Int64 = 0
+    @staged : StaticArray(UInt8, 8) = StaticArray(UInt8, 8).new(0_u8)
+    @staged_count : Int32 = 0
+    @staged_pos : Int32 = 0
 
     # Creates a reader over *bytes* in the given bit *order*.
     def initialize(bytes : Bytes, @order : BitOrder = :msb)
@@ -42,8 +45,6 @@ module Binary
 
     # Like `read_bits` but returns `nil` if fewer than *n* bits remain.
     # No bits are consumed in that case.
-    # Note: for IO-backed readers, unavailability is detected only when attempting to refill,
-    # so a short read may raise `IO::EOFError` if the IO runs out mid-read.
     def read_bits?(n : Int) : UInt64?
       raise ArgumentError.new("bit width must be in 0..64, not #{n}") unless 0 <= n <= 64
       return 0_u64 if n == 0
@@ -66,11 +67,23 @@ module Binary
     end
 
     # Returns true if at least *n* more bits are available to read without consuming.
-    # For IO-backed readers, returns true (availability is checked at refill time).
+    # For IO-backed readers, stages bytes into a buffer without consuming them logically.
     private def available?(n : Int32) : Bool
       if bytes = @bytes
         (bytes.size - @pos) * 8 >= n
       else
+        io = @io.not_nil!
+        needed = (n + 7) // 8
+        staged_remaining = @staged_count - @staged_pos
+        while staged_remaining < needed
+          byte = io.read_byte
+          if byte.nil?
+            return false
+          end
+          @staged[@staged_count] = byte
+          @staged_count += 1
+          staged_remaining += 1
+        end
         true
       end
     end
@@ -97,17 +110,7 @@ module Binary
       if bytes = @bytes
         @pos >= bytes.size
       else
-        peek = @io.not_nil!.peek
-        if peek.nil?
-          begin
-            fill(1)
-            false
-          rescue IO::EOFError
-            true
-          end
-        else
-          peek.empty?
-        end
+        !available?(1)
       end
     end
 
@@ -139,6 +142,14 @@ module Binary
         return nil if @pos >= bytes.size
         b = bytes.to_unsafe[@pos]
         @pos += 1
+        b
+      elsif @staged_pos < @staged_count
+        b = @staged[@staged_pos]
+        @staged_pos += 1
+        if @staged_pos == @staged_count
+          @staged_pos = 0
+          @staged_count = 0
+        end
         b
       else
         @io.not_nil!.read_byte
