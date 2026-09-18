@@ -147,6 +147,28 @@ private struct Varints
   field xs : Array(Int32), count: 2, varint: true
 end
 
+private struct Ipv4
+  include Binary::Format
+  field version : UInt8, bits: 4
+  field ihl : UInt8, bits: 4
+  field dscp : UInt8, bits: 6
+  field ecn : UInt8, bits: 2
+  field total_length : UInt16
+  field id : UInt16
+  field reserved : Bool, bits: 1
+  field df : Bool, bits: 1
+  field mf : Bool, bits: 1
+  field fragment_offset : UInt16, bits: 13
+end
+
+private struct LsbBits
+  include Binary::Format
+  bit_order :lsb
+  field kind : Kind, bits: 3
+  field a : UInt16, bits: 9
+  field b : UInt8, bits: 4
+end
+
 describe Binary::Format do
   describe "scalars" do
     it "writes big-endian by default and reads back" do
@@ -375,6 +397,31 @@ describe Binary::Format do
       v.to_slice.should eq Bytes[0xAC, 0x02, 0x01, 0x02, 0x03, 0xAC, 0x02]
       v.byte_size.should eq 7
       Varints.from_slice(v.to_slice).should eq v
+    end
+  end
+
+  describe "bits" do
+    it "packs MSB-first runs like an IPv4 header" do
+      h = Ipv4.new(version: 4, ihl: 5, dscp: 0, ecn: 0, total_length: 60, id: 0x1C46, reserved: false, df: true, mf: false, fragment_offset: 0)
+      h.to_slice.should eq Bytes[0x45, 0x00, 0x00, 0x3C, 0x1C, 0x46, 0x40, 0x00]
+      h.byte_size.should eq 8
+      back = Ipv4.from_slice(h.to_slice)
+      back.should eq h
+      back.df.should be_true
+    end
+
+    it "packs LSB-first runs" do
+      v = LsbBits.new(kind: :response, a: 0x1AB, b: 0xC)
+      # bits 0..2 = 2, bits 3..11 = 0x1AB, bits 12..15 = 0xC
+      # value = 2 | (0x1AB << 3) | (0xC << 12) = 0xCD5A -> little-endian bytes 5A CD
+      v.to_slice.should eq Bytes[0x5A, 0xCD]
+      LsbBits.from_slice(v.to_slice).should eq v
+    end
+
+    it "raises on write when a value is wider than its bit field" do
+      expect_raises(Binary::Format::Error, /Ipv4#version/) do
+        Ipv4.new(version: 16, ihl: 5, dscp: 0, ecn: 0, total_length: 0, id: 0, reserved: false, df: false, mf: false, fragment_offset: 0).to_slice
+      end
     end
   end
 end
