@@ -80,7 +80,8 @@ module Binary
   #
   # Derived fields (`length:`/`count:` targets, `value:`, `size_of:`) are
   # computed in the constructor; a setter on a field they depend on takes
-  # effect at the next `write`, `to_slice` or `byte_size` call.
+  # effect at the next `write` or `to_slice` call (`byte_size` refreshes
+  # every derived field except `size_of:` ones).
   #
   # ### Fixed layouts
   #
