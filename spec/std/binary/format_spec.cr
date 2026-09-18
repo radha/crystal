@@ -211,6 +211,61 @@ private struct Elf64Ident
   field kinds : Array(Kind), count: 2
 end
 
+private struct SizedFixed
+  include Binary::Format
+  field len : UInt32, size_of: :rest
+  field a : UInt16
+  field b : UInt8
+end
+
+private struct PgQuery
+  include Binary::Format
+  field type : UInt8 = 'Q'.ord.to_u8
+  field length : Int32, size_of: :rest, including_self: true
+  field query : String, cstring: true
+end
+
+private struct PgFieldDesc
+  include Binary::Format
+  field name : String, cstring: true
+  field table_oid : Int32
+  field column : Int16
+  field type_oid : Int32
+  field type_size : Int16
+  field type_modifier : Int32
+  field format_code : Int16
+end
+
+private struct PgRowDescription
+  include Binary::Format
+  field type : UInt8 = 'T'.ord.to_u8
+  field length : Int32, size_of: :rest, including_self: true
+  field count : Int16
+  field fields : Array(PgFieldDesc), count: :count
+end
+
+private struct PgColumn
+  include Binary::Format
+  field length : Int32
+  field value : Bytes?, length: :length, if: -> { length >= 0 }
+end
+
+private struct PgDataRow
+  include Binary::Format
+  field type : UInt8 = 'D'.ord.to_u8
+  field length : Int32, size_of: :rest, including_self: true
+  field count : Int16
+  field columns : Array(PgColumn), count: :count
+end
+
+private struct RpcFrameHeader
+  include Binary::Format
+  field type : UInt8
+  field flags : UInt8
+  field stream_id : UInt32
+  field length : UInt32
+end
+
 describe Binary::Format do
   describe "scalars" do
     it "writes big-endian by default and reads back" do
@@ -522,6 +577,103 @@ describe Binary::Format do
       e = Elf64Ident.new(class_: 0, data: 0, version: 0, osabi: 0, abiversion: 0, type: 0, machine: 0, e_version: 0, entry: 0,
         name: "abc", tags: StaticArray[0_u16, 0_u16], point: Point.new(x: 0, y: 0), kinds: [Kind::Request, Kind::Request])
       expect_raises(Binary::Format::Error, /Elf64Ident#name/) { e.to_slice }
+    end
+  end
+
+  describe "size_of with fixed tail" do
+    it "treats a size_of layout with a fixed tail as variable" do
+      SizedFixed.fixed_size?.should be_false
+      s = SizedFixed.new(a: 0x0102, b: 3)
+      s.to_slice.should eq Bytes[0, 0, 0, 3, 1, 2, 3]
+      s.len.should eq 3
+      SizedFixed.from_slice(s.to_slice).should eq s
+    end
+  end
+
+  describe "known-answer dumps" do
+    it "Postgres Query" do
+      q = PgQuery.new(query: "select 1")
+      q.to_slice.should eq Bytes[0x51, 0, 0, 0, 13] + "select 1\0".to_slice
+      PgQuery.from_slice(q.to_slice).query.should eq "select 1"
+    end
+
+    it "Postgres RowDescription" do
+      rd = PgRowDescription.new(fields: [
+        PgFieldDesc.new(name: "id", table_oid: 16384, column: 1, type_oid: 23, type_size: 4, type_modifier: -1, format_code: 1),
+      ])
+      bytes = rd.to_slice
+      bytes[0].should eq 'T'.ord
+      IO::ByteFormat::BigEndian.decode(Int32, bytes[1, 4]).should eq bytes.size - 1
+      bytes[5, 2].should eq Bytes[0, 1]
+      bytes[7, 3].should eq "id\0".to_slice
+      back = PgRowDescription.from_slice(bytes)
+      back.fields.size.should eq 1
+      back.fields[0].type_modifier.should eq -1
+      back.fields[0].format_code.should eq 1
+    end
+
+    it "Postgres DataRow with a NULL column" do
+      # `PgColumn#length` is derived from `value` (`value.try(&.size) || 0`),
+      # so a `nil` value always derives a length of 0, not the wire's `-1`
+      # NULL sentinel. `PgColumn#value`'s `if: -> { length >= 0 }` then sees
+      # that derived 0 and considers the field present, so writing a `nil`
+      # value raises the same `if:`-was-true-but-the-field-is-nil error as
+      # `Optional#extra` does (see the "varint, if, value and size_of"
+      # describe block above) instead of silently emitting a 0-length,
+      # no-data column. This matches the module docs: a real client writes
+      # NULL columns (the `-1` wire form) through its own encoder, not
+      # through this derived length/`if:` combination.
+      expect_raises(Binary::Format::Error, /PgColumn#value/) do
+        PgDataRow.new(columns: [PgColumn.new(value: "42".to_slice), PgColumn.new(value: nil)]).to_slice
+      end
+
+      one_column = PgDataRow.new(columns: [PgColumn.new(value: "42".to_slice)])
+      bytes = one_column.to_slice
+      bytes.should eq Bytes[0x44, 0, 0, 0, 12, 0, 1, 0, 0, 0, 2, 0x34, 0x32]
+      IO::ByteFormat::BigEndian.decode(Int32, bytes[1, 4]).should eq bytes.size - 1
+
+      null = Bytes[0x44, 0, 0, 0, 16, 0, 2, 0, 0, 0, 2, 0x34, 0x32, 0xFF, 0xFF, 0xFF, 0xFF]
+      back = PgDataRow.from_slice(null)
+      back.columns[0].value.should eq "42".to_slice
+      back.columns[1].value.should be_nil
+      back.columns[1].length.should eq -1
+    end
+
+    it "RPC frame header is a 10-byte fixed layout" do
+      RpcFrameHeader::SIZE.should eq 10
+      h = RpcFrameHeader.new(type: 1, flags: 0x80, stream_id: 7, length: 512)
+      h.to_slice.should eq Bytes[1, 0x80, 0, 0, 0, 7, 0, 0, 2, 0]
+      RpcFrameHeader.from_slice(h.to_slice).should eq h
+    end
+  end
+
+  describe "random round-trips" do
+    it "fixed layouts survive 1000 random instances" do
+      rng = Random.new(7)
+      1000.times do
+        h = Ipv4.new(version: rng.rand(16).to_u8, ihl: rng.rand(16).to_u8, dscp: rng.rand(64).to_u8, ecn: rng.rand(4).to_u8,
+          total_length: rng.rand(UInt16), id: rng.rand(UInt16), reserved: rng.next_bool, df: rng.next_bool, mf: rng.next_bool,
+          fragment_offset: rng.rand(8192).to_u16)
+        Ipv4.from_slice(h.to_slice).should eq h
+        m = Mixed.new(a: rng.rand(Int16), b: rng.next_float.to_f32, c: rng.next_bool, d: rng.rand(UInt64))
+        Mixed.from_slice(m.to_slice).should eq m
+      end
+    end
+
+    it "variable layouts survive 300 random instances through IO and slices" do
+      rng = Random.new(11)
+      300.times do
+        params = Array.new(rng.rand(0..5)) { rng.hex(rng.rand(0..8)) }
+        s = Startup.new(params: params)
+        Startup.from_slice(s.to_slice).should eq s
+        Startup.read(IO::Memory.new(s.to_slice)).should eq s
+        v = Varints.new(a: rng.rand(UInt32), b: rng.rand(Int64), k: rng.next_bool ? Kind::Request : Kind::Response, xs: [rng.rand(Int32), rng.rand(Int32)])
+        Varints.from_slice(v.to_slice).should eq v
+        t = Texts.new(name: rng.hex(rng.rand(0..10)), tag: rng.hex(2), note: rng.hex(rng.rand(0..4)), n: rng.rand(4).to_u8,
+          twice: Bytes.new(0), rest: Bytes.new(rng.rand(0..6)) { rng.rand(UInt8) })
+        t = Texts.new(name: t.name, tag: t.tag, note: t.note, n: t.n, twice: Bytes.new((t.n * 2).to_i32) { rng.rand(UInt8) }, rest: t.rest)
+        Texts.from_slice(t.to_slice).should eq t
+      end
     end
   end
 end
