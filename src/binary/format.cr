@@ -88,6 +88,55 @@ module Binary
           T.zero
         {% end %}
       end
+
+      def self.check_size(size : Int, max : Int32, label : String) : Int32
+        if size < 0 || size > max
+          raise SizeError.new("#{label}: size #{size} is outside 0..#{max}")
+        end
+        size.to_i32
+      end
+
+      def self.read_string(io : IO, size : Int, max : Int32, label : String) : String
+        io.read_string(check_size(size, max, label))
+      end
+
+      def self.read_cstring(io : IO, label : String) : String
+        str = io.gets('\0', chomp: false) || raise IO::EOFError.new
+        raise IO::EOFError.new unless str.ends_with?('\0')
+        str.byte_slice(0, str.bytesize - 1)
+      end
+
+      def self.read_bytes(io : IO, size : Int, max : Int32, label : String) : Bytes
+        buf = Bytes.new(check_size(size, max, label))
+        io.read_fully(buf)
+        buf
+      end
+
+      def self.read_rest_bytes(io : IO, max : Int32, label : String) : Bytes
+        if io.is_a?(IO::Sized)
+          read_bytes(io, io.read_remaining, max, label)
+        else
+          mem = IO::Memory.new
+          IO.copy(io, mem, max.to_i64 + 1)
+          check_size(mem.size, max, label)
+          mem.to_slice
+        end
+      end
+
+      def self.read_rest_string(io : IO, max : Int32, label : String) : String
+        String.new(read_rest_bytes(io, max, label))
+      end
+
+      def self.write_cstring(io : IO, value : String, label : String) : Nil
+        raise Error.new("#{label}: string contains a NUL byte") if value.byte_index(0_u8)
+        io.write(value.to_slice)
+        io.write_byte(0_u8)
+      end
+
+      def self.write_exact(io : IO, value : Bytes, size : Int, label : String) : Nil
+        raise Error.new("#{label}: expected #{size} bytes but the value has #{value.size}") unless value.size == size
+        io.write(value)
+      end
     end
 
     # Sets the default byte order for every multi-byte field of this format.
@@ -184,6 +233,20 @@ module Binary
         ::Binary::Format::Codec.read_bool({{io}})
       {% elsif cat == :enum %}
         ::Binary::Format::Codec.read_enum({{io}}, {{type}}, {{format}})
+      {% elsif cat == :string %}
+        {% if opts[:mode] == :cstring %}
+          ::Binary::Format::Codec.read_cstring({{io}}, {{opts[:label]}})
+        {% elsif opts[:mode] == :rest %}
+          ::Binary::Format::Codec.read_rest_string({{io}}, {{opts[:max]}}, {{opts[:label]}})
+        {% else %}
+          ::Binary::Format::Codec.read_string({{io}}, {{opts[:length]}}, {{opts[:max]}}, {{opts[:label]}})
+        {% end %}
+      {% elsif cat == :bytes %}
+        {% if opts[:mode] == :rest %}
+          ::Binary::Format::Codec.read_rest_bytes({{io}}, {{opts[:max]}}, {{opts[:label]}})
+        {% else %}
+          ::Binary::Format::Codec.read_bytes({{io}}, {{opts[:length]}}, {{opts[:max]}}, {{opts[:label]}})
+        {% end %}
       {% else %}
         {% raise "Binary::Format: cannot read #{cat}" %}
       {% end %}
@@ -197,6 +260,14 @@ module Binary
         ::Binary::Format::Codec.write_bool({{io}}, {{value}})
       {% elsif cat == :enum %}
         ::Binary::Format::Codec.write_enum({{io}}, {{value}}, {{format}})
+      {% elsif cat == :string || cat == :bytes %}
+        {% if opts[:mode] == :cstring %}
+          ::Binary::Format::Codec.write_cstring({{io}}, {{value}}, {{opts[:label]}})
+        {% elsif opts[:mode] == :fixed || opts[:mode] == :length %}
+          ::Binary::Format::Codec.write_exact({{io}}, {{value}}.to_slice, {{opts[:length]}}, {{opts[:label]}})
+        {% else %}
+          {{io}}.write({{value}}.to_slice)
+        {% end %}
       {% else %}
         {% raise "Binary::Format: cannot write #{cat}" %}
       {% end %}
@@ -206,6 +277,14 @@ module Binary
     macro __binary_size_scalar(cat, type, value, opts)
       {% if cat == :int || cat == :float || cat == :bool || cat == :enum %}
         {{opts[:width]}}
+      {% elsif cat == :string %}
+        {% if opts[:mode] == :cstring %}
+          ({{value}}.bytesize &+ 1)
+        {% else %}
+          {{value}}.bytesize
+        {% end %}
+      {% elsif cat == :bytes %}
+        {{value}}.size
       {% else %}
         {% raise "Binary::Format: cannot size #{cat}" %}
       {% end %}
@@ -279,8 +358,44 @@ module Binary
           {% elsif t < ::Enum %}
             {% e[:cat] = :enum %}
             {% e[:width] = widths[e[:name]] %}
+          {% elsif t == ::String %}
+            {% e[:cat] = :string %}
+            {% allowed = ["length", "cstring", "until", "max"] %}
+          {% elsif tname == "Slice(UInt8)" %}
+            {% e[:cat] = :bytes %}
+            {% allowed = ["length", "until", "max"] %}
           {% else %}
             {% raise "#{e[:label].id}: unsupported field type #{t}" %}
+          {% end %}
+          {% e[:mode] = nil %}
+          {% e[:length] = nil %}
+          {% e[:max] = nil %}
+          {% if e[:cat] == :string || e[:cat] == :bytes %}
+            {% modes = 0 %}
+            {% modes = modes + 1 if a[:length] %}
+            {% modes = modes + 1 if a[:cstring] %}
+            {% modes = modes + 1 if a[:until] %}
+            {% raise "#{e[:label].id}: needs exactly one of `length:`, `cstring: true` or `until: :eof`" unless modes == 1 %}
+            {% raise "#{e[:label].id}: `until:` must be :eof" if a[:until] && a[:until] != :eof %}
+            {% e[:max] = a[:max] || "::Binary::Format::DEFAULT_MAX_BYTES".id %}
+            {% if a[:cstring] %}
+              {% e[:mode] = :cstring %}
+            {% elsif a[:until] %}
+              {% e[:mode] = :rest %}
+            {% elsif a[:length].is_a?(SymbolLiteral) %}
+              {% e[:mode] = :ref %}
+              {% e[:length_ref] = a[:length].id %}
+              {% e[:length] = a[:length].id %}
+            {% elsif a[:length].is_a?(NumberLiteral) %}
+              {% e[:mode] = :fixed %}
+              {% e[:length] = a[:length] %}
+              {% e[:width] = a[:length] %}
+            {% elsif a[:length].is_a?(ProcLiteral) %}
+              {% e[:mode] = :length %}
+              {% e[:length] = "(#{a[:length].body})".id %}
+            {% else %}
+              {% raise "#{e[:label].id}: `length:` must be a field name symbol, an integer literal or a `->{ }` block" %}
+            {% end %}
           {% end %}
           {% for key, _v in a.named_args %}
             {% ks = key.id.stringify %}
@@ -288,7 +403,7 @@ module Binary
               {% raise "#{e[:label].id}: option `#{ks.id}:` is not valid for a #{t} field (allowed: #{allowed.join(", ").id})" %}
             {% end %}
           {% end %}
-          {% e[:opts] = {label: e[:label], width: e[:width], signed: e[:signed]} %}
+          {% e[:opts] = {label: e[:label], width: e[:width], signed: e[:signed], mode: e[:mode], length: e[:length], max: e[:max]} %}
         {% elsif a[:kind] == :pad %}
           {% e[:width] = a[:size] %}
         {% elsif a[:kind] == :align %}
@@ -318,7 +433,27 @@ module Binary
           {% e[:offset] = offset %}
           {% offset = offset + e[:width] %}
         {% end %}
+        {% e[:pos] = entries.size %}
         {% entries << e %}
+      {% end %}
+
+      {% for e in entries %}
+        {% if e[:length_ref] %}
+          {% target = nil %}
+          {% for x in entries %}
+            {% target = x if x[:kind] == :field && x[:name] == e[:length_ref] %}
+          {% end %}
+          {% raise "#{e[:label].id}: `length: :#{e[:length_ref]}` names an unknown field" unless target %}
+          {% raise "#{e[:label].id}: `length: :#{e[:length_ref]}` must name an integer field declared before it" unless target[:cat] == :int && target[:pos] < e[:pos] %}
+          {% raise "#{target[:label].id}: a derived field cannot have a default value" if target[:has_default] %}
+          {% target[:derived] = true %}
+          {% measure = e[:cat] == :string ? "bytesize" : "size" %}
+          {% if e[:nilable] %}
+            {% target[:write_value] = "#{target[:type]}.new(#{e[:name]}.try(&.#{measure.id}) || 0)".id %}
+          {% else %}
+            {% target[:write_value] = "#{target[:type]}.new(#{e[:name]}.#{measure.id})".id %}
+          {% end %}
+        {% end %}
       {% end %}
 
       {% fields = entries.select { |x| x[:kind] == :field } %}
@@ -351,11 +486,17 @@ module Binary
           {% for e in fields.select { |x| x[:derived] } %}
             @{{e[:name]}} = ::Binary::Format::Codec.zero({{e[:type]}})
           {% end %}
+          {% for e in fields.select { |x| x[:derived] } %}
+            @{{e[:name]}} = {{e[:write_value]}}
+          {% end %}
         end
       {% else %}
         def initialize(*, {{params.join(", ").id}})
           {% for e in fields.select { |x| x[:derived] } %}
             @{{e[:name]}} = ::Binary::Format::Codec.zero({{e[:type]}})
+          {% end %}
+          {% for e in fields.select { |x| x[:derived] } %}
+            @{{e[:name]}} = {{e[:write_value]}}
           {% end %}
         end
       {% end %}
