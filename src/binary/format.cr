@@ -114,13 +114,14 @@ module Binary
     end
 
     # Declares constant bytes: a `String` (ASCII only), `Bytes[...]`, or an
-    # integer literal with a type suffix (written in the type's endian).
-    # Read asserts the bytes and raises `MagicError` on mismatch.
+    # integer literal with a type suffix other than `_i32` (write `_u32` for
+    # a 4-byte magic), written in the type's endian. Read asserts the bytes
+    # and raises `MagicError` on mismatch.
     macro magic(value)
       {% if value.is_a?(StringLiteral) %}
         {% raise "Binary::Format: a String magic must be ASCII, use Bytes[...] otherwise" unless value =~ /\A[\x00-\x7f]*\z/ %}
       {% elsif value.is_a?(NumberLiteral) %}
-        {% raise "Binary::Format: an integer magic needs a type suffix, e.g. 0x89504E47_u32" unless value.kind.id.stringify =~ /\A[ui](8|16|32|64|128)\z/ %}
+        {% raise "Binary::Format: an integer magic needs an explicit type suffix other than _i32 (an unsuffixed literal is Int32 too), e.g. 0x89504E47_u32" unless value.kind.id.stringify =~ /\A[ui](8|16|64|128)\z|\Au32\z/ %}
       {% elsif !(value.is_a?(Call) && value.name == "[]") %}
         {% raise "Binary::Format: magic must be a String, Bytes[...] or a suffixed integer literal, got `#{value}`" %}
       {% end %}
