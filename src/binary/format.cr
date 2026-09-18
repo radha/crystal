@@ -137,6 +137,25 @@ module Binary
         raise Error.new("#{label}: expected #{size} bytes but the value has #{value.size}") unless value.size == size
         io.write(value)
       end
+
+      def self.check_count(count : Int, max : Int32, label : String) : Int32
+        if count < 0 || count > max
+          raise SizeError.new("#{label}: count #{count} is outside 0..#{max}")
+        end
+        count.to_i32
+      end
+
+      def self.check_exact_count(actual : Int, expected : Int, label : String) : Nil
+        raise Error.new("#{label}: expected #{expected} elements but the value has #{actual}") unless actual == expected
+      end
+
+      def self.rest?(io : IO, label : String) : Bool
+        peek = io.peek
+        if peek.nil?
+          raise Error.new("#{label}: `until: :eof` needs an IO that supports peek, #{io.class} does not")
+        end
+        !peek.empty?
+      end
     end
 
     # Sets the default byte order for every multi-byte field of this format.
@@ -247,6 +266,33 @@ module Binary
         {% else %}
           ::Binary::Format::Codec.read_bytes({{io}}, {{opts[:length]}}, {{opts[:max]}}, {{opts[:label]}})
         {% end %}
+      {% elsif cat == :nested %}
+        {{type}}.read({{io}})
+      {% elsif cat == :static_array %}
+        {{type}}.new { __binary_read_scalar({{io}}, {{opts[:ecat]}}, {{opts[:elem]}}, {{format}}, {{opts[:eopts]}}) }
+      {% elsif cat == :array %}
+        begin
+          {% if opts[:amode] == :rest %}
+            %arr = ::Array({{opts[:elem]}}).new
+            while ::Binary::Format::Codec.rest?({{io}}, {{opts[:label]}})
+              %arr << __binary_read_scalar({{io}}, {{opts[:ecat]}}, {{opts[:elem]}}, {{format}}, {{opts[:eopts]}})
+            end
+          {% elsif opts[:amode] == :sentinel %}
+            %arr = ::Array({{opts[:elem]}}).new
+            loop do
+              %item = __binary_read_scalar({{io}}, {{opts[:ecat]}}, {{opts[:elem]}}, {{format}}, {{opts[:eopts]}})
+              break if %item == {{opts[:sentinel]}}
+              %arr << %item
+            end
+          {% else %}
+            %count = ::Binary::Format::Codec.check_count({{opts[:count]}}, {{opts[:max]}}, {{opts[:label]}})
+            %arr = ::Array({{opts[:elem]}}).new(::Math.min(%count, ::Binary::Format::PRESIZE_LIMIT))
+            %count.times do
+              %arr << __binary_read_scalar({{io}}, {{opts[:ecat]}}, {{opts[:elem]}}, {{format}}, {{opts[:eopts]}})
+            end
+          {% end %}
+          %arr
+        end
       {% else %}
         {% raise "Binary::Format: cannot read #{cat}" %}
       {% end %}
@@ -268,6 +314,18 @@ module Binary
         {% else %}
           {{io}}.write({{value}}.to_slice)
         {% end %}
+      {% elsif cat == :nested %}
+        {{value}}.write({{io}})
+      {% elsif cat == :static_array %}
+        {{value}}.each { |%item| __binary_write_scalar({{io}}, {{opts[:ecat]}}, {{opts[:elem]}}, {{format}}, %item, {{opts[:eopts]}}) }
+      {% elsif cat == :array %}
+        {% if opts[:amode] == :fixed || opts[:amode] == :proc %}
+          ::Binary::Format::Codec.check_exact_count({{value}}.size, {{opts[:count]}}, {{opts[:label]}})
+        {% end %}
+        {{value}}.each { |%item| __binary_write_scalar({{io}}, {{opts[:ecat]}}, {{opts[:elem]}}, {{format}}, %item, {{opts[:eopts]}}) }
+        {% if opts[:amode] == :sentinel %}
+          __binary_write_scalar({{io}}, {{opts[:ecat]}}, {{opts[:elem]}}, {{format}}, {{opts[:sentinel]}}, {{opts[:eopts]}})
+        {% end %}
       {% else %}
         {% raise "Binary::Format: cannot write #{cat}" %}
       {% end %}
@@ -285,6 +343,10 @@ module Binary
         {% end %}
       {% elsif cat == :bytes %}
         {{value}}.size
+      {% elsif cat == :nested %}
+        {{value}}.byte_size
+      {% elsif cat == :static_array || cat == :array %}
+        ({% if opts[:ewidth] %}{{value}}.size &* {{opts[:ewidth]}}{% else %}{{value}}.sum(0) { |%item| __binary_size_scalar({{opts[:ecat]}}, {{opts[:elem]}}, %item, {{opts[:eopts]}}) }{% end %}{% if opts[:amode] == :sentinel %} &+ __binary_size_scalar({{opts[:ecat]}}, {{opts[:elem]}}, {{opts[:sentinel]}}, {{opts[:eopts]}}){% end %})
       {% else %}
         {% raise "Binary::Format: cannot size #{cat}" %}
       {% end %}
@@ -345,27 +407,71 @@ module Binary
           {% e[:signed] = false %}
           {% allowed = ["endian"] %}
           {% tname = t.name.stringify %}
-          {% if t < ::Int && int_widths[tname] %}
-            {% e[:cat] = :int %}
-            {% e[:width] = int_widths[tname] %}
-            {% e[:signed] = tname.starts_with?("Int") %}
-          {% elsif float_widths[tname] %}
-            {% e[:cat] = :float %}
-            {% e[:width] = float_widths[tname] %}
-          {% elsif t == ::Bool %}
-            {% e[:cat] = :bool %}
-            {% e[:width] = 1 %}
-          {% elsif t < ::Enum %}
-            {% e[:cat] = :enum %}
-            {% e[:width] = widths[e[:name]] %}
-          {% elsif t == ::String %}
-            {% e[:cat] = :string %}
+          {% elem = nil %}
+          {% if tname.starts_with?("StaticArray(") || tname.starts_with?("Array(") %}
+            {% elem = t.type_vars[0] %}
+          {% end %}
+          {% cats = [] of Nil %}
+          {% ws = [] of Nil %}
+          {% sg = [] of Nil %}
+          {% for tt in (elem ? [t, elem] : [t]) %}
+            {% tn = tt.name.stringify %}
+            {% if tt < ::Int && int_widths[tn] %}
+              {% cats << :int %}
+              {% ws << int_widths[tn] %}
+              {% sg << tn.starts_with?("Int") %}
+            {% elsif float_widths[tn] %}
+              {% cats << :float %}
+              {% ws << float_widths[tn] %}
+              {% sg << false %}
+            {% elsif tt == ::Bool %}
+              {% cats << :bool %}
+              {% ws << 1 %}
+              {% sg << false %}
+            {% elsif tt < ::Enum %}
+              {% cats << :enum %}
+              {% ws << (cats.size == 1 ? widths[e[:name]] : widths["#{e[:name]}__elem".id]) %}
+              {% sg << false %}
+            {% elsif tt == ::String %}
+              {% cats << :string %}
+              {% ws << nil %}
+              {% sg << false %}
+            {% elsif tn == "Slice(UInt8)" %}
+              {% cats << :bytes %}
+              {% ws << nil %}
+              {% sg << false %}
+            {% elsif tn.starts_with?("StaticArray(") %}
+              {% raise "#{e[:label].id}: arrays of arrays are not supported" unless cats.empty? %}
+              {% cats << :static_array %}
+              {% ws << nil %}
+              {% sg << false %}
+            {% elsif tn.starts_with?("Array(") %}
+              {% raise "#{e[:label].id}: arrays of arrays are not supported" unless cats.empty? %}
+              {% cats << :array %}
+              {% ws << nil %}
+              {% sg << false %}
+            {% elsif tt <= ::Binary::Format %}
+              {% raise "#{e[:label].id}: #{tt} must be defined before #{@type} because it is embedded in it" unless tt.has_constant?(:BINARY_FORMAT_FIXED) %}
+              {% cats << :nested %}
+              {% ws << (tt.constant(:BINARY_FORMAT_FIXED) ? tt.constant(:SIZE) : nil) %}
+              {% sg << false %}
+            {% else %}
+              {% raise "#{e[:label].id}: unsupported field type #{tt}" %}
+            {% end %}
+          {% end %}
+          {% e[:cat] = cats[0] %}
+          {% e[:width] = ws[0] %}
+          {% e[:signed] = sg[0] %}
+          {% if e[:cat] == :string %}
             {% allowed = ["length", "cstring", "until", "max"] %}
-          {% elsif tname == "Slice(UInt8)" %}
-            {% e[:cat] = :bytes %}
+          {% elsif e[:cat] == :bytes %}
             {% allowed = ["length", "until", "max"] %}
-          {% else %}
-            {% raise "#{e[:label].id}: unsupported field type #{t}" %}
+          {% elsif e[:cat] == :nested %}
+            {% allowed = [] of Nil %}
+          {% elsif e[:cat] == :static_array %}
+            {% allowed = ["endian", "cstring", "length"] %}
+          {% elsif e[:cat] == :array %}
+            {% allowed = ["endian", "cstring", "length", "count", "until", "sentinel", "max"] %}
           {% end %}
           {% e[:mode] = nil %}
           {% e[:length] = nil %}
@@ -397,13 +503,74 @@ module Binary
               {% raise "#{e[:label].id}: `length:` must be a field name symbol, an integer literal or a `->{ }` block" %}
             {% end %}
           {% end %}
+          {% e[:eopts] = nil %}
+          {% e[:amode] = nil %}
+          {% e[:count] = nil %}
+          {% e[:sentinel] = nil %}
+          {% if elem %}
+            {% e[:elem] = elem %}
+            {% e[:ecat] = cats[1] %}
+            {% e[:ewidth] = ws[1] %}
+            {% emode = nil %}
+            {% elength = nil %}
+            {% if e[:ecat] == :string %}
+              {% if a[:cstring] %}
+                {% emode = :cstring %}
+              {% elsif a[:length].is_a?(NumberLiteral) %}
+                {% emode = :fixed %}
+                {% elength = a[:length] %}
+                {% e[:ewidth] = a[:length] %}
+              {% else %}
+                {% raise "#{e[:label].id}: String elements need `cstring: true` or `length: <integer>`" %}
+              {% end %}
+            {% elsif e[:ecat] == :bytes %}
+              {% raise "#{e[:label].id}: Bytes elements need `length: <integer>`" unless a[:length].is_a?(NumberLiteral) %}
+              {% emode = :fixed %}
+              {% elength = a[:length] %}
+              {% e[:ewidth] = a[:length] %}
+            {% elsif a[:cstring] || a[:length] %}
+              {% raise "#{e[:label].id}: `cstring:`/`length:` only apply to String or Bytes elements" %}
+            {% end %}
+            {% e[:eopts] = {label: e[:label], width: e[:ewidth], signed: sg[1], mode: emode, length: elength, max: nil} %}
+            {% if e[:cat] == :static_array %}
+              {% e[:count] = t.type_vars[1] %}
+              {% e[:width] = e[:ewidth] ? e[:ewidth] * t.type_vars[1] : nil %}
+            {% else %}
+              {% modes = 0 %}
+              {% modes = modes + 1 if a[:count] %}
+              {% modes = modes + 1 if a[:until] %}
+              {% modes = modes + 1 if a[:sentinel] %}
+              {% raise "#{e[:label].id}: needs exactly one of `count:`, `until: :eof` or `sentinel:`" unless modes == 1 %}
+              {% raise "#{e[:label].id}: `until:` must be :eof" if a[:until] && a[:until] != :eof %}
+              {% e[:max] = a[:max] || "::Binary::Format::DEFAULT_MAX_COUNT".id %}
+              {% if a[:until] %}
+                {% e[:amode] = :rest %}
+              {% elsif a[:sentinel] %}
+                {% e[:amode] = :sentinel %}
+                {% e[:sentinel] = a[:sentinel] %}
+              {% elsif a[:count].is_a?(SymbolLiteral) %}
+                {% e[:amode] = :ref %}
+                {% e[:count_ref] = a[:count].id %}
+                {% e[:count] = a[:count].id %}
+              {% elsif a[:count].is_a?(NumberLiteral) %}
+                {% e[:amode] = :fixed %}
+                {% e[:count] = a[:count] %}
+                {% e[:width] = e[:ewidth] ? e[:ewidth] * a[:count] : nil %}
+              {% elsif a[:count].is_a?(ProcLiteral) %}
+                {% e[:amode] = :proc %}
+                {% e[:count] = "(#{a[:count].body})".id %}
+              {% else %}
+                {% raise "#{e[:label].id}: `count:` must be a field name symbol, an integer literal or a `->{ }` block" %}
+              {% end %}
+            {% end %}
+          {% end %}
           {% for key, _v in a.named_args %}
             {% ks = key.id.stringify %}
             {% unless internal_keys.includes?(ks) || allowed.includes?(ks) %}
               {% raise "#{e[:label].id}: option `#{ks.id}:` is not valid for a #{t} field (allowed: #{allowed.join(", ").id})" %}
             {% end %}
           {% end %}
-          {% e[:opts] = {label: e[:label], width: e[:width], signed: e[:signed], mode: e[:mode], length: e[:length], max: e[:max]} %}
+          {% e[:opts] = {label: e[:label], width: e[:width], signed: e[:signed], mode: e[:mode], length: e[:length], max: e[:max], amode: e[:amode], count: e[:count], sentinel: e[:sentinel], elem: e[:elem], ecat: e[:ecat], ewidth: e[:ewidth], eopts: e[:eopts]} %}
         {% elsif a[:kind] == :pad %}
           {% e[:width] = a[:size] %}
         {% elsif a[:kind] == :align %}
@@ -452,6 +619,21 @@ module Binary
             {% target[:write_value] = "#{target[:type]}.new(#{e[:name]}.try(&.#{measure.id}) || 0)".id %}
           {% else %}
             {% target[:write_value] = "#{target[:type]}.new(#{e[:name]}.#{measure.id})".id %}
+          {% end %}
+        {% end %}
+        {% if e[:count_ref] %}
+          {% target = nil %}
+          {% for x in entries %}
+            {% target = x if x[:kind] == :field && x[:name] == e[:count_ref] %}
+          {% end %}
+          {% raise "#{e[:label].id}: `count: :#{e[:count_ref]}` names an unknown field" unless target %}
+          {% raise "#{e[:label].id}: `count: :#{e[:count_ref]}` must name an integer field declared before it" unless target[:cat] == :int && target[:pos] < e[:pos] %}
+          {% raise "#{target[:label].id}: a derived field cannot have a default value" if target[:has_default] %}
+          {% target[:derived] = true %}
+          {% if e[:nilable] %}
+            {% target[:write_value] = "#{target[:type]}.new(#{e[:name]}.try(&.size) || 0)".id %}
+          {% else %}
+            {% target[:write_value] = "#{target[:type]}.new(#{e[:name]}.size)".id %}
           {% end %}
         {% end %}
       {% end %}

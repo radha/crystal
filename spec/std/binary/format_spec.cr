@@ -96,6 +96,28 @@ private struct Capped
   field body : Bytes, length: :len, max: 8
 end
 
+private struct Point
+  include Binary::Format
+  field x : Int16
+  field y : Int16
+end
+
+private struct Shapes
+  include Binary::Format
+  field count : UInt16
+  field points : Array(Point), count: :count, max: 100
+  field ident : StaticArray(UInt8, 4)
+  field names : Array(String), cstring: true, sentinel: ""
+  field tail : Array(UInt32), until: :eof, endian: :little
+end
+
+private struct FixedCounts
+  include Binary::Format
+  field pair : Array(UInt8), count: 2
+  field n : UInt8
+  field more : Array(UInt16), count: -> { n + 1 }
+end
+
 describe Binary::Format do
   describe "scalars" do
     it "writes big-endian by default and reads back" do
@@ -215,6 +237,52 @@ describe Binary::Format do
 
     it "raises IO::EOFError on an unterminated cstring" do
       expect_raises(IO::EOFError) { Texts.from_slice(Bytes[0, 0x54, 0x41, 0x47, 0x21, 0x68, 0x69]) }
+    end
+  end
+
+  describe "Array, StaticArray and nested formats" do
+    it "round-trips count-prefixed, sentinel-terminated and rest arrays" do
+      s = Shapes.new(
+        points: [Point.new(x: 1, y: -1), Point.new(x: 2, y: -2)],
+        ident: StaticArray[9_u8, 8_u8, 7_u8, 6_u8],
+        names: ["ab", "c"],
+        tail: [1_u32, 2_u32],
+      )
+      s.count.should eq 2
+      s.to_slice.should eq Bytes[
+        0, 2, 0, 1, 0xFF, 0xFF, 0, 2, 0xFF, 0xFE,
+        9, 8, 7, 6,
+        0x61, 0x62, 0, 0x63, 0, 0,
+        1, 0, 0, 0, 2, 0, 0, 0,
+      ]
+      s.byte_size.should eq 28
+      back = Shapes.from_slice(s.to_slice)
+      back.should eq s
+      back.count.should eq 2
+    end
+
+    it "checks literal and computed counts on write" do
+      f = FixedCounts.new(pair: [1_u8, 2_u8], n: 1, more: [3_u16, 4_u16])
+      f.to_slice.should eq Bytes[1, 2, 1, 0, 3, 0, 4]
+      FixedCounts.from_slice(f.to_slice).should eq f
+      expect_raises(Binary::Format::Error, /FixedCounts#pair/) do
+        FixedCounts.new(pair: [1_u8], n: 0, more: [] of UInt16).to_slice
+      end
+      expect_raises(Binary::Format::Error, /FixedCounts#more/) do
+        FixedCounts.new(pair: [1_u8, 2_u8], n: 0, more: [] of UInt16).to_slice
+      end
+    end
+
+    it "raises SizeError for a count beyond max:" do
+      expect_raises(Binary::Format::SizeError, /Shapes#points/) do
+        Shapes.from_slice(Bytes[0xFF, 0xFF] + Bytes.new(4))
+      end
+    end
+
+    it "requires a peekable IO for until: :eof arrays" do
+      bytes = Shapes.new(points: [] of Point, ident: StaticArray[0_u8, 0_u8, 0_u8, 0_u8], names: [] of String, tail: [7_u32]).to_slice
+      Shapes.read(IO::Memory.new(bytes)).tail.should eq [7_u32]
+      expect_raises(Binary::Format::Error, /peek/) { Shapes.read(UnbufferedIO.new(bytes)) }
     end
   end
 end
