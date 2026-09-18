@@ -246,8 +246,8 @@ end
 
 private struct PgColumn
   include Binary::Format
-  field length : Int32
-  field value : Bytes?, length: :length, if: -> { length >= 0 }
+  field length : Int32, value: -> { value.try(&.size) || -1 }
+  field value : Bytes?, length: -> { length }, if: -> { length >= 0 }
 end
 
 private struct PgDataRow
@@ -613,30 +613,15 @@ describe Binary::Format do
     end
 
     it "Postgres DataRow with a NULL column" do
-      # `PgColumn#length` is derived from `value` (`value.try(&.size) || 0`),
-      # so a `nil` value always derives a length of 0, not the wire's `-1`
-      # NULL sentinel. `PgColumn#value`'s `if: -> { length >= 0 }` then sees
-      # that derived 0 and considers the field present, so writing a `nil`
-      # value raises the same `if:`-was-true-but-the-field-is-nil error as
-      # `Optional#extra` does (see the "varint, if, value and size_of"
-      # describe block above) instead of silently emitting a 0-length,
-      # no-data column. This matches the module docs: a real client writes
-      # NULL columns (the `-1` wire form) through its own encoder, not
-      # through this derived length/`if:` combination.
-      expect_raises(Binary::Format::Error, /PgColumn#value/) do
-        PgDataRow.new(columns: [PgColumn.new(value: "42".to_slice), PgColumn.new(value: nil)]).to_slice
-      end
-
-      one_column = PgDataRow.new(columns: [PgColumn.new(value: "42".to_slice)])
-      bytes = one_column.to_slice
-      bytes.should eq Bytes[0x44, 0, 0, 0, 12, 0, 1, 0, 0, 0, 2, 0x34, 0x32]
-      IO::ByteFormat::BigEndian.decode(Int32, bytes[1, 4]).should eq bytes.size - 1
-
-      null = Bytes[0x44, 0, 0, 0, 16, 0, 2, 0, 0, 0, 2, 0x34, 0x32, 0xFF, 0xFF, 0xFF, 0xFF]
-      back = PgDataRow.from_slice(null)
+      row = PgDataRow.new(columns: [PgColumn.new(value: "42".to_slice), PgColumn.new(value: nil)])
+      bytes = row.to_slice
+      bytes.should eq Bytes[0x44, 0, 0, 0, 16, 0, 2, 0, 0, 0, 2, 0x34, 0x32, 0xFF, 0xFF, 0xFF, 0xFF]
+      row.columns[1].length.should eq -1
+      back = PgDataRow.from_slice(bytes)
       back.columns[0].value.should eq "42".to_slice
       back.columns[1].value.should be_nil
       back.columns[1].length.should eq -1
+      PgDataRow.from_slice(bytes).should eq row
     end
 
     it "RPC frame header is a 10-byte fixed layout" do
