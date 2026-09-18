@@ -88,6 +88,26 @@ describe Binary::BitReader do
     r.read_bits(13).should eq 0b00011_11111111
     r.eof?.should be_true
   end
+
+  it "returns nil from read_bits? on a short IO without consuming buffered bits" do
+    io = IO::Memory.new(Bytes[0xAB, 0xCD])
+    r = Binary::BitReader.new(io)
+    r.read_bits(4).should eq 0xA
+    r.read_bits?(16).should be_nil
+    r.bit_position.should eq 4
+    r.read_bits(12).should eq 0xBCD
+    r.eof?.should be_true
+    r.read_bits?(1).should be_nil
+  end
+
+  it "reports eof? correctly on an IO with staged bytes" do
+    r = Binary::BitReader.new(IO::Memory.new(Bytes[0x80]))
+    r.eof?.should be_false
+    r.read_bit.should be_true
+    r.eof?.should be_false
+    r.read_bits(7).should eq 0
+    r.eof?.should be_true
+  end
 end
 
 describe Binary::BitWriter do
