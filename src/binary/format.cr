@@ -262,6 +262,23 @@ module Binary
         end
         raw
       end
+
+      def self.decode_enum(type : T.class, bytes : Bytes, format : IO::ByteFormat) : T forall T
+        T.new(format.decode(typeof(T.new(0).value), bytes))
+      end
+
+      def self.encode_enum(value : Enum, bytes : Bytes, format : IO::ByteFormat) : Nil
+        format.encode(value.value, bytes)
+      end
+
+      def self.zero_fill(ptr : Pointer(UInt8), count : Int32) : Nil
+        ptr.clear(count)
+      end
+
+      def self.copy_exact(value : Bytes, ptr : Pointer(UInt8), size : Int32, label : String) : Nil
+        raise Error.new("#{label}: expected #{size} bytes but the value has #{value.size}") unless value.size == size
+        value.copy_to(ptr, size)
+      end
     end
 
     # Sets the default byte order for every multi-byte field of this format.
@@ -484,6 +501,51 @@ module Binary
         ({% if opts[:ewidth] %}{{value}}.size &* {{opts[:ewidth]}}{% else %}{{value}}.sum(0) { |%item| __binary_size_scalar({{opts[:ecat]}}, {{opts[:elem]}}, %item, {{opts[:eopts]}}) }{% end %}{% if opts[:amode] == :sentinel %} &+ __binary_size_scalar({{opts[:ecat]}}, {{opts[:elem]}}, {{opts[:sentinel]}}, {{opts[:eopts]}}){% end %})
       {% else %}
         {% raise "Binary::Format: cannot size #{cat}" %}
+      {% end %}
+    end
+
+    # :nodoc:
+    macro __binary_decode_scalar(ptr, cat, type, format, opts)
+      {% if cat == :int || cat == :float %}
+        {{format}}.decode({{type}}, ::Slice.new({{ptr}}, {{opts[:width]}}))
+      {% elsif cat == :bool %}
+        (({{ptr}}).value != 0)
+      {% elsif cat == :enum %}
+        ::Binary::Format::Codec.decode_enum({{type}}, ::Slice.new({{ptr}}, {{opts[:width]}}), {{format}})
+      {% elsif cat == :string %}
+        ::String.new(::Slice.new({{ptr}}, {{opts[:length]}}))
+      {% elsif cat == :bytes %}
+        ::Slice.new({{ptr}}, {{opts[:length]}}).dup
+      {% elsif cat == :nested %}
+        {{type}}.from_slice(::Slice.new({{ptr}}, {{opts[:width]}}))
+      {% elsif cat == :static_array %}
+        {{type}}.new { |%idx| __binary_decode_scalar({{ptr}} + %idx &* {{opts[:ewidth]}}, {{opts[:ecat]}}, {{opts[:elem]}}, {{format}}, {{opts[:eopts]}}) }
+      {% elsif cat == :array %}
+        ::Array({{opts[:elem]}}).new({{opts[:count]}}) { |%idx| __binary_decode_scalar({{ptr}} + %idx &* {{opts[:ewidth]}}, {{opts[:ecat]}}, {{opts[:elem]}}, {{format}}, {{opts[:eopts]}}) }
+      {% else %}
+        {% raise "Binary::Format: cannot decode #{cat} from a pointer" %}
+      {% end %}
+    end
+
+    # :nodoc:
+    macro __binary_encode_scalar(ptr, cat, type, format, value, opts)
+      {% if cat == :int || cat == :float %}
+        {{format}}.encode({{value}}, ::Slice.new({{ptr}}, {{opts[:width]}}))
+      {% elsif cat == :bool %}
+        ({{ptr}}).value = ({{value}} ? 1_u8 : 0_u8)
+      {% elsif cat == :enum %}
+        ::Binary::Format::Codec.encode_enum({{value}}, ::Slice.new({{ptr}}, {{opts[:width]}}), {{format}})
+      {% elsif cat == :string || cat == :bytes %}
+        ::Binary::Format::Codec.copy_exact({{value}}.to_slice, {{ptr}}, {{opts[:length]}}, {{opts[:label]}})
+      {% elsif cat == :nested %}
+        {{value}}.write_to(::Slice.new({{ptr}}, {{opts[:width]}}))
+      {% elsif cat == :static_array %}
+        {{value}}.each_with_index { |%item, %idx| __binary_encode_scalar({{ptr}} + %idx &* {{opts[:ewidth]}}, {{opts[:ecat]}}, {{opts[:elem]}}, {{format}}, %item, {{opts[:eopts]}}) }
+      {% elsif cat == :array %}
+        ::Binary::Format::Codec.check_exact_count({{value}}.size, {{opts[:count]}}, {{opts[:label]}})
+        {{value}}.each_with_index { |%item, %idx| __binary_encode_scalar({{ptr}} + %idx &* {{opts[:ewidth]}}, {{opts[:ecat]}}, {{opts[:elem]}}, {{format}}, %item, {{opts[:eopts]}}) }
+      {% else %}
+        {% raise "Binary::Format: cannot encode #{cat} to a pointer" %}
       {% end %}
     end
 
@@ -921,6 +983,7 @@ module Binary
         end
       {% end %}
 
+      {% unless fixed %}
       # Reads one record from *io*. Raises `IO::EOFError` on truncated input.
       def self.read(io : IO) : self
         new(__binary_io: io)
@@ -1029,6 +1092,94 @@ module Binary
         write(::IO::Memory.new(bytes))
         bytes
       end
+      {% end %}
+
+      {% if fixed %}
+        # Encoded size in bytes of every record of this format.
+        SIZE = {{offset}}
+
+        # Reads one record from *io* with a single `read_fully`.
+        def self.read(io : IO) : self
+          buf = uninitialized UInt8[SIZE]
+          io.read_fully(buf.to_slice)
+          new(__binary_ptr: buf.to_unsafe)
+        end
+
+        # Decodes one record from the start of *bytes* without copying.
+        def self.from_slice(bytes : Bytes) : self
+          raise IO::EOFError.new if bytes.size < SIZE
+          new(__binary_ptr: bytes.to_unsafe)
+        end
+
+        # Decodes one record at *offset* and returns it with `SIZE`.
+        def self.from_slice(bytes : Bytes, offset : Int) : {self, Int32}
+          raise IO::EOFError.new if offset < 0 || bytes.size - offset < SIZE
+          {new(__binary_ptr: bytes.to_unsafe + offset), SIZE}
+        end
+
+        # :nodoc:
+        def initialize(*, __binary_ptr __ptr : Pointer(UInt8))
+          {% for e in entries %}
+            {% if e[:kind] == :magic %}
+              ::Binary::Format::Codec.check_magic(::Slice.new(__ptr + {{e[:offset]}}, {{e[:width]}}), BINARY_MAGIC_{{e[:index]}}, {{type_name.stringify}})
+            {% elsif e[:kind] == :field && e[:bits] && !e[:run_head] %}
+            {% elsif e[:kind] == :field && e[:bits] %}
+              %acc{e[:name]} = ::Binary::Format::Codec.load_bits(__ptr + {{e[:offset]}}, {{e[:run_bytes]}}, {{bit_order == :msb}})
+              {% for m in e[:run_members] %}
+                {{m[:name]}} = ::Binary::Format::Codec.from_bits({{m[:type]}}, %acc{e[:name]}, {{m[:bit_shift]}}, {{m[:bits]}})
+              {% end %}
+            {% elsif e[:kind] == :field %}
+              {{e[:name]}} = __binary_decode_scalar(__ptr + {{e[:offset]}}, {{e[:cat]}}, {{e[:type]}}, {{e[:format]}}, {{e[:opts]}})
+            {% end %}
+          {% end %}
+          {% for e in fields %}
+            @{{e[:name]}} = {{e[:name]}}
+          {% end %}
+        end
+
+        # Encodes this record into the first `SIZE` bytes of *bytes* and
+        # returns `SIZE`. Raises `ArgumentError` if *bytes* is too small.
+        def write_to(bytes : Bytes) : Int32
+          raise ArgumentError.new("need #{SIZE} bytes, got #{bytes.size}") if bytes.size < SIZE
+          __ptr = bytes.to_unsafe
+          {% for e in entries %}
+            {% if e[:kind] == :pad %}
+              {% if e[:width] > 0 %} ::Binary::Format::Codec.zero_fill(__ptr + {{e[:offset]}}, {{e[:width]}}) {% end %}
+            {% elsif e[:kind] == :magic %}
+              BINARY_MAGIC_{{e[:index]}}.copy_to(__ptr + {{e[:offset]}}, {{e[:width]}})
+            {% elsif e[:kind] == :field && e[:bits] && !e[:run_head] %}
+            {% elsif e[:kind] == :field && e[:bits] %}
+              %acc{e[:name]} = 0_u64
+              {% for m in e[:run_members] %}
+                %acc{e[:name]} |= ::Binary::Format::Codec.to_bits({{m[:write_value] || "@#{m[:name]}".id}}, {{m[:bits]}}, {{m[:label]}}) << {{m[:bit_shift]}}
+              {% end %}
+              ::Binary::Format::Codec.store_bits(__ptr + {{e[:offset]}}, %acc{e[:name]}, {{e[:run_bytes]}}, {{bit_order == :msb}})
+            {% elsif e[:kind] == :field %}
+              __binary_encode_scalar(__ptr + {{e[:offset]}}, {{e[:cat]}}, {{e[:type]}}, {{e[:format]}}, {{e[:write_value] || "@#{e[:name]}".id}}, {{e[:opts]}})
+            {% end %}
+          {% end %}
+          SIZE
+        end
+
+        # Writes this record to *io* with a single `write`.
+        def write(io : IO) : Nil
+          buf = uninitialized UInt8[SIZE]
+          write_to(buf.to_slice)
+          io.write(buf.to_slice)
+        end
+
+        # Returns `SIZE`.
+        def byte_size : Int32
+          SIZE
+        end
+
+        # Returns this record encoded into a new `Bytes` of `SIZE` bytes.
+        def to_slice : Bytes
+          bytes = Bytes.new(SIZE)
+          write_to(bytes)
+          bytes
+        end
+      {% end %}
     end
   end
 end

@@ -20,6 +20,28 @@ private class UnbufferedIO < IO
   end
 end
 
+# Records every `write` and `read` call so a spec can count syscall-shaped IO.
+private class CountingIO < IO
+  getter writes = [] of Bytes
+  getter reads = 0
+
+  def initialize(@input : Bytes = Bytes.empty)
+    @pos = 0
+  end
+
+  def read(slice : Bytes) : Int32
+    @reads += 1
+    n = Math.min(slice.size, @input.size - @pos)
+    slice.copy_from(@input.to_unsafe + @pos, n)
+    @pos += n
+    n
+  end
+
+  def write(slice : Bytes) : Nil
+    @writes << slice.dup
+  end
+end
+
 private enum Kind : UInt8
   Request  = 1
   Response = 2
@@ -167,6 +189,26 @@ private struct LsbBits
   field kind : Kind, bits: 3
   field a : UInt16, bits: 9
   field b : UInt8, bits: 4
+end
+
+private struct Elf64Ident
+  include Binary::Format
+  endian :little
+  magic Bytes[0x7F, 0x45, 0x4C, 0x46]
+  field class_ : UInt8
+  field data : UInt8
+  field version : UInt8
+  field osabi : UInt8
+  field abiversion : UInt8
+  pad 7
+  field type : UInt16
+  field machine : UInt16
+  field e_version : UInt32
+  field entry : UInt64
+  field name : String, length: 4
+  field tags : StaticArray(UInt16, 2)
+  field point : Point
+  field kinds : Array(Kind), count: 2
 end
 
 describe Binary::Format do
@@ -422,6 +464,64 @@ describe Binary::Format do
       expect_raises(Binary::Format::Error, /Ipv4#version/) do
         Ipv4.new(version: 16, ihl: 5, dscp: 0, ecn: 0, total_length: 0, id: 0, reserved: false, df: false, mf: false, fragment_offset: 0).to_slice
       end
+    end
+  end
+
+  describe "fixed layouts" do
+    it "exposes SIZE and fixed_size? only for fixed layouts" do
+      Header.fixed_size?.should be_true
+      Header::SIZE.should eq 10
+      Ipv4::SIZE.should eq 8
+      PngSig::SIZE.should eq 20
+      Aligned::SIZE.should eq 16
+      Elf64Ident::SIZE.should eq 16 + 2 + 2 + 4 + 8 + 4 + 4 + 4 + 2
+      Texts.fixed_size?.should be_false
+      Shapes.fixed_size?.should be_false
+      Startup.fixed_size?.should be_false
+      Varints.fixed_size?.should be_false
+    end
+
+    it "decodes by pointer and encodes with write_to" do
+      e = Elf64Ident.new(class_: 2, data: 1, version: 1, osabi: 0, abiversion: 0, type: 2, machine: 0x3E, e_version: 1, entry: 0x401000,
+        name: "abcd", tags: StaticArray[1_u16, 2_u16], point: Point.new(x: -1, y: 1), kinds: [Kind::Request, Kind::Response])
+      bytes = e.to_slice
+      bytes.size.should eq Elf64Ident::SIZE
+      bytes[0, 4].should eq Bytes[0x7F, 0x45, 0x4C, 0x46]
+      bytes[16, 2].should eq Bytes[2, 0]
+      bytes[24, 8].should eq Bytes[0x00, 0x10, 0x40, 0, 0, 0, 0, 0]
+      bytes[32, 4].should eq "abcd".to_slice
+      bytes[36, 4].should eq Bytes[1, 0, 2, 0]
+      bytes[40, 4].should eq Bytes[0xFF, 0xFF, 0, 1]
+      bytes[44, 2].should eq Bytes[1, 2]
+      Elf64Ident.from_slice(bytes).should eq e
+      buf = Bytes.new(Elf64Ident::SIZE + 3)
+      e.write_to(buf).should eq Elf64Ident::SIZE
+      buf[0, Elf64Ident::SIZE].should eq bytes
+      Elf64Ident.from_slice(Bytes[0, 0] + bytes, 2).should eq({e, Elf64Ident::SIZE})
+    end
+
+    it "reads and writes a fixed record with a single IO call" do
+      h = Header.new(kind: :request, flags: 1, stream_id: 2, length: 3)
+      io = CountingIO.new
+      h.write(io)
+      io.writes.size.should eq 1
+      io.writes[0].should eq h.to_slice
+      input = CountingIO.new(h.to_slice)
+      Header.read(input).should eq h
+      input.reads.should eq 1
+    end
+
+    it "raises IO::EOFError from from_slice and write_to on short buffers" do
+      expect_raises(IO::EOFError) { Header.from_slice(Bytes.new(9)) }
+      expect_raises(IO::EOFError) { Header.from_slice(Bytes.new(12), 3) }
+      expect_raises(ArgumentError) { Header.new(kind: :request, flags: 0, stream_id: 0).write_to(Bytes.new(9)) }
+      expect_raises(Binary::Format::MagicError) { Elf64Ident.from_slice(Bytes.new(Elf64Ident::SIZE)) }
+    end
+
+    it "checks fixed-length strings and counts on write_to" do
+      e = Elf64Ident.new(class_: 0, data: 0, version: 0, osabi: 0, abiversion: 0, type: 0, machine: 0, e_version: 0, entry: 0,
+        name: "abc", tags: StaticArray[0_u16, 0_u16], point: Point.new(x: 0, y: 0), kinds: [Kind::Request, Kind::Request])
+      expect_raises(Binary::Format::Error, /Elf64Ident#name/) { e.to_slice }
     end
   end
 end
