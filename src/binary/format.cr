@@ -531,7 +531,7 @@ module Binary
             {% elsif a[:cstring] || a[:length] %}
               {% raise "#{e[:label].id}: `cstring:`/`length:` only apply to String or Bytes elements" %}
             {% end %}
-            {% e[:eopts] = {label: e[:label], width: e[:ewidth], signed: sg[1], mode: emode, length: elength, max: nil} %}
+            {% e[:eopts] = {label: e[:label], width: e[:ewidth], signed: sg[1], mode: emode, length: elength, max: "::Binary::Format::DEFAULT_MAX_BYTES".id} %}
             {% if e[:cat] == :static_array %}
               {% e[:count] = t.type_vars[1] %}
               {% e[:width] = e[:ewidth] ? e[:ewidth] * t.type_vars[1] : nil %}
