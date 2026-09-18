@@ -39,6 +39,18 @@ describe Binary::BitReader do
     r.read_bits(64).should eq IO::ByteFormat::BigEndian.decode(UInt64, bytes[9, 8])
   end
 
+  it "reads 64 bits when 60 bits are already buffered" do
+    bytes = Bytes.new(16) { |i| (0x11 * (i + 1)).to_u8! }
+    r = Binary::BitReader.new(bytes)
+    r.read_bits(4).should eq 1
+    expected = (IO::ByteFormat::BigEndian.decode(UInt64, bytes[0, 8]) << 4) | (bytes[8].to_u64 >> 4)
+    r.read_bits(64).should eq expected
+    r2 = Binary::BitReader.new(bytes, :lsb)
+    r2.read_bits(4).should eq 1
+    expected2 = (IO::ByteFormat::LittleEndian.decode(UInt64, bytes[0, 8]) >> 4) | (bytes[8].to_u64 << 60)
+    r2.read_bits(64).should eq expected2
+  end
+
   it "reads 0 bits as 0 without consuming" do
     r = Binary::BitReader.new(Bytes[0xFF])
     r.read_bits(0).should eq 0
