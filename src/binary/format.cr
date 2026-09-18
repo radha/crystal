@@ -3,7 +3,95 @@ require "./frame"
 require "./bit_order"
 
 module Binary
-  # Declarative layout for binary structs. See the module docs added in Task 10.
+  # Declarative layout for binary structs and protocol messages.
+  #
+  # Including `Binary::Format` in a `struct` or `class` and declaring the
+  # layout with `field` (plus `pad`, `align`, `magic`) generates a keyword
+  # constructor, `read(io)`, `from_slice`, `write(io)`, `to_slice` and
+  # `byte_size`:
+  #
+  # ```
+  # require "binary"
+  #
+  # struct PngHeader
+  #   include Binary::Format
+  #   magic Bytes[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+  #   field width : UInt32
+  #   field height : UInt32
+  #   field depth : UInt8
+  #   pad 3
+  # end
+  #
+  # header = PngHeader.new(width: 640, height: 480, depth: 8)
+  # header.to_slice.size                        # => 20
+  # PngHeader.from_slice(header.to_slice).width # => 640
+  # ```
+  #
+  # ### Directives
+  #
+  # * `endian :big | :little | :native`: default byte order (default `:big`).
+  # * `bit_order :msb | :lsb`: packing order of `bits:` runs (default `:msb`).
+  #
+  # ### Entries
+  #
+  # * `field name : Type[, options]`, optionally `= default`.
+  # * `pad n`: skips *n* bytes on read, writes zeros.
+  # * `align n`: pads to a multiple of *n* bytes from the record start; every
+  #   entry before it must have a fixed width.
+  # * `magic value`: constant bytes (`String` ASCII, `Bytes[...]`, or an
+  #   integer literal with a type suffix other than `_i32` (write `_u32`
+  #   for a 4-byte magic)); a mismatch on read raises `MagicError`.
+  #
+  # ### Field types
+  #
+  # Integers, `Float32`/`Float64`, `Bool` (one byte), enums, `String`,
+  # `Bytes`, `StaticArray(T, N)`, `Array(T)`, nested formats (which must be
+  # defined earlier in the file), and `T?` together with `if:`.
+  #
+  # ### Field options
+  #
+  # * `endian:`: per-field byte order.
+  # * `varint: true`: LEB128 for unsigned types, zigzag for signed types.
+  # * `bits: n`: packed bit field; consecutive `bits:` fields form a run that
+  #   must end on a byte boundary and fit in 64 bits.
+  # * `length: :other | n | ->{ expr }`: byte length of a `String`/`Bytes`.
+  #   A field name makes that integer field *derived*: it is computed on
+  #   write and excluded from the constructor.
+  # * `cstring: true`: NUL-terminated `String` (also per element of an array).
+  # * `count: :other | n | ->{ expr }`: element count of an `Array`.
+  # * `until: :eof`: consume the rest of the bounding stream (needs an IO with
+  #   `peek` for arrays).
+  # * `sentinel: value`: read array elements until one equals *value*.
+  # * `size_of: :rest`: the field holds the byte size of everything after it
+  #   and bounds the read of the rest; `including_self: true` adds its own
+  #   width. Derived.
+  # * `value: ->{ expr }`: derived field computed on write.
+  # * `if: ->{ expr }`: the field is present only when *expr* is true; the
+  #   type must be nilable, and `if:` cannot be combined with `value:` or
+  #   `size_of:`.
+  # * `max: n`: allocation guard for length and count prefixes.
+  #
+  # Expressions in `->{ }` refer to earlier fields by name.
+  #
+  # Derived fields (`length:`/`count:` targets, `value:`, `size_of:`) are
+  # computed in the constructor and recomputed on every `write`; setters do
+  # not update them.
+  #
+  # ### Fixed layouts
+  #
+  # When every entry has a compile-time width — no `String`/`Bytes` without
+  # a fixed `length:`, no `Array` without a fixed `count:`, and no
+  # `size_of:` — the format is *fixed*: it gets a `SIZE` constant,
+  # `fixed_size?` returns `true`, `from_slice` decodes by pointer offset,
+  # `write_to(bytes)` encodes in place, and `read`/`write` use a single IO
+  # call.
+  #
+  # ### Errors
+  #
+  # `Error` for invalid values (a NUL inside a cstring, a value too wide for
+  # its bits, a required `if:` field that is `nil`), `MagicError`,
+  # `SizeError` for prefixes beyond `max:`, and `IO::EOFError` for truncated
+  # input.
   module Format
     # :nodoc:
     annotation Entry

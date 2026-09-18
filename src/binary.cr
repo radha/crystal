@@ -1,6 +1,8 @@
 # Format-agnostic building blocks for binary protocols and file formats:
-# variable-length integers (`Binary::Varint`, `Binary::Zigzag`) and
-# length-prefixed framing (`Binary::Frame`).
+# variable-length integers (`Binary::Varint`, `Binary::Zigzag`),
+# length-prefixed framing (`Binary::Frame`), bit-level IO
+# (`Binary::BitReader`, `Binary::BitWriter`) and declarative struct layouts
+# (`Binary::Format`).
 #
 # NOTE: To use `Binary`, you must explicitly import it with `require "binary"`
 module Binary
