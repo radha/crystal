@@ -42,13 +42,37 @@ module Binary
 
     # Like `read_bits` but returns `nil` if fewer than *n* bits remain.
     # No bits are consumed in that case.
+    # Note: for IO-backed readers, unavailability is detected only when attempting to refill,
+    # so a short read may raise `IO::EOFError` if the IO runs out mid-read.
     def read_bits?(n : Int) : UInt64?
       raise ArgumentError.new("bit width must be in 0..64, not #{n}") unless 0 <= n <= 64
       return 0_u64 if n == 0
-      unless fill(n)
-        return nil
+      n = n.to_i32
+      if n <= @bits
+        return take(n)
       end
-      take(n)
+      have = @bits
+      rest = n - have
+      # Peek availability before consuming anything, so a short read leaves the reader untouched.
+      return nil unless available?(rest)
+      first = have > 0 ? take(have) : 0_u64
+      fill(rest)
+      second = take(rest)
+      if @order.msb?
+        (first << rest) | second
+      else
+        first | (second << have)
+      end
+    end
+
+    # Returns true if at least *n* more bits are available to read without consuming.
+    # For IO-backed readers, returns true (availability is checked at refill time).
+    private def available?(n : Int32) : Bool
+      if bytes = @bytes
+        (bytes.size - @pos) * 8 >= n
+      else
+        true
+      end
     end
 
     # Reads one bit.
@@ -74,14 +98,23 @@ module Binary
         @pos >= bytes.size
       else
         peek = @io.not_nil!.peek
-        peek.nil? ? !fill(1) : peek.empty?
+        if peek.nil?
+          begin
+            fill(1)
+            false
+          rescue IO::EOFError
+            true
+          end
+        else
+          peek.empty?
+        end
       end
     end
 
-    # Ensures at least *n* bits are buffered. Returns `false` at end of data.
+    # Ensures at least *n* bits are buffered. Raises `IO::EOFError` at end of data.
     # The accumulator never holds more than 64 bits: refills happen only while
     # `@bits < n <= 64`, adding 8 bits (or 64 when empty) each time.
-    private def fill(n : Int32) : Bool
+    private def fill(n : Int32) : Nil
       while @bits < n
         if @bits == 0 && (bytes = @bytes) && bytes.size - @pos >= 8
           word = Slice.new(bytes.to_unsafe + @pos, 8)
@@ -91,7 +124,7 @@ module Binary
           next
         end
         byte = next_byte
-        return false unless byte
+        raise IO::EOFError.new unless byte
         if @order.msb?
           @acc = (@acc << 8) | byte
         else
@@ -99,7 +132,6 @@ module Binary
         end
         @bits += 8
       end
-      true
     end
 
     private def next_byte : UInt8?
