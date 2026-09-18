@@ -649,6 +649,7 @@ module Binary
           {% if a[:if] %}
             {% raise "#{e[:label].id}: `if:` expects a `->{ }` block" unless a[:if].is_a?(ProcLiteral) %}
             {% raise "#{e[:label].id}: a field with `if:` must be declared nilable (`#{t}?`)" unless e[:nilable] %}
+            {% raise "#{e[:label].id}: `if:` cannot be combined with `value:` or `size_of:`" if a[:value] || a[:size_of] %}
             {% e[:if] = a[:if] %}
             {% e[:width] = nil %}
           {% elsif e[:nilable] %}
@@ -862,8 +863,13 @@ module Binary
         {% end %}
       {% end %}
       {% for point in size_points %}
-        # Returns the encoded size in bytes without writing anything.
-        def {{point[0]}} : Int32
+        {% if point[1] == 0 %}
+          # Returns the encoded size in bytes without writing anything.
+          def {{point[0]}} : Int32
+        {% else %}
+          # :nodoc:
+          private def {{point[0]}} : Int32
+        {% end %}
           __binary_size = 0
           {% for e in entries %}
             {% if e[:pos] >= point[1] %}
