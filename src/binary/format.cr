@@ -51,9 +51,11 @@ module Binary
   # ### Field options
   #
   # * `endian:`: per-field byte order.
-  # * `varint: true`: LEB128 for unsigned types, zigzag for signed types.
+  # * `varint: true`: LEB128 for unsigned types, zigzag for signed types;
+  #   supports up to 64-bit integers.
   # * `bits: n`: packed bit field; consecutive `bits:` fields form a run that
-  #   must end on a byte boundary and fit in 64 bits.
+  #   must end on a byte boundary and fit in 64 bits. Signed types are
+  #   packed and unpacked as two's complement.
   # * `length: :other | n | ->{ expr }`: byte length of a `String`/`Bytes`.
   #   A field name makes that integer field *derived*: it is computed on
   #   write and excluded from the constructor.
@@ -64,18 +66,21 @@ module Binary
   # * `sentinel: value`: read array elements until one equals *value*.
   # * `size_of: :rest`: the field holds the byte size of everything after it
   #   and bounds the read of the rest; `including_self: true` adds its own
-  #   width. Derived.
-  # * `value: ->{ expr }`: derived field computed on write.
+  #   width. Derived. After the last modelled field, any unread bytes still
+  #   remaining in the region are skipped.
+  # * `value: ->{ expr }`: derived field computed on write; applies to
+  #   integer, float, `Bool` and enum fields.
   # * `if: ->{ expr }`: the field is present only when *expr* is true; the
   #   type must be nilable, and `if:` cannot be combined with `value:` or
   #   `size_of:`.
-  # * `max: n`: allocation guard for length and count prefixes.
+  # * `max: n`: allocation guard for length and count prefixes only
+  #   (`sentinel:`/`until:` arrays bound the elements read, not the count).
   #
   # Expressions in `->{ }` refer to earlier fields by name.
   #
   # Derived fields (`length:`/`count:` targets, `value:`, `size_of:`) are
-  # computed in the constructor and recomputed on every `write`; setters do
-  # not update them.
+  # computed in the constructor; a setter on a field they depend on takes
+  # effect at the next `write`, `to_slice` or `byte_size` call.
   #
   # ### Fixed layouts
   #
@@ -84,7 +89,8 @@ module Binary
   # `size_of:` — the format is *fixed*: it gets a `SIZE` constant,
   # `fixed_size?` returns `true`, `from_slice` decodes by pointer offset,
   # `write_to(bytes)` encodes in place, and `read`/`write` use a single IO
-  # call.
+  # call. `read` and `write` allocate `SIZE` bytes on the stack, so a very
+  # large fixed layout should use `from_slice`/`write_to` instead.
   #
   # ### Errors
   #

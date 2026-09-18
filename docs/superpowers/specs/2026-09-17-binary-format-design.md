@@ -84,7 +84,7 @@ combination with `if:`.
 | `until: :eof` | String, Bytes, Array | consume the rest of the bounding stream |
 | `sentinel: value` | Array | read elements until one equals `value`, drop it; write it after the elements |
 | `size_of: :rest` | ints | field holds the byte length of everything after it; bounds the rest of the read with `IO::Sized`; derived on write. `including_self: true` adds the field's own width (Postgres) |
-| `value: ->{ expr }` | any | derived: computed on write, excluded from the constructor, populated on read |
+| `value: ->{ expr }` | ints, floats, Bool, enums | derived: computed on write, excluded from the constructor, populated on read |
 | `if: ->{ expr }` | any `T?` | present only when the expression is true, evaluated against earlier fields |
 | `max: n` | String, Bytes, Array | allocation guard for length/count prefixes; raises `Binary::Format::SizeError` |
 
@@ -95,8 +95,9 @@ or `sentinel:`. Element options (`endian:`, `varint:`, `cstring:`,
 
 `->{ expr }` bodies reference earlier fields by bare name. This works on both
 read and write (section 2). Only earlier fields may be referenced; a
-reference to a later field fails to compile on the read path because the
-local does not exist yet.
+reference to a later field fails to compile on the read path with "'self'
+was used before initializing instance variable" because the local does not
+exist yet.
 
 The trailing NUL of a Postgres parameter list reads back as an empty final
 string, which the Postgres client drops. The DSL deliberately has no
@@ -136,7 +137,8 @@ for the remaining fields (`n` minus the field width when
 `including_self: true`). `until: :eof` reads until `io.peek` is empty or
 `nil`. `IO::Memory`, `IO::Sized` and every `IO::Buffered` support `peek`; a
 source whose `peek` returns `nil` raises `Binary::Format::Error` naming the
-field.
+field. After the last field, any bytes of a `size_of` region still unread
+(not consumed by the modelled fields) are skipped.
 
 `if:` false leaves the field `nil`. `sentinel:` compares with `==`.
 
@@ -177,9 +179,10 @@ into a `UInt64` accumulator and extracts each field with shift and mask in
   byte (deflate style).
 
 Write packs the same way and emits the bytes. `Bool` with `bits: 1` reads as
-`!= 0`; an enum takes its base-type value. A value wider than `n` bits
-raises `Binary::Format::Error` on write. No runtime `BitReader` is involved,
-so a packed header costs the same as an integer read.
+`!= 0`; an enum takes its base-type value. Signed integer `bits:` fields are
+packed and unpacked as two's complement. A value wider than `n` bits raises
+`Binary::Format::Error` on write. No runtime `BitReader` is involved, so a
+packed header costs the same as an integer read.
 
 ### `Binary::BitReader` and `Binary::BitWriter`
 
@@ -206,8 +209,11 @@ so a packed header costs the same as an integer read.
 
 A format is fixed when every entry has a compile-time width: integers,
 floats, `Bool`, enums, `StaticArray` of fixed types, nested fixed formats,
-`pad`, `align`, `magic`, `bits:` runs. Not fixed: `varint`, `String`,
-`Bytes`, `Array`, `if:`, `size_of`, any nested non-fixed format.
+`pad`, `align`, `magic`, `bits:` runs, a `String`/`Bytes` field with a fixed
+`length: <Int>` and an `Array` with a fixed `count: <Int>` of fixed-width
+elements. Not fixed: `varint`, a `String`/`Bytes` without a fixed `length:`,
+an `Array` without a fixed `count:`, `if:`, `size_of`, any nested non-fixed
+format.
 
 For fixed formats the macro additionally generates:
 
