@@ -124,6 +124,29 @@ private struct FixedElems
   field tags : Array(String), length: 3, count: 2
 end
 
+private struct Startup
+  include Binary::Format
+  field length : Int32, size_of: :rest, including_self: true
+  field version : Int32 = 196608
+  field params : Array(String), cstring: true, until: :eof
+end
+
+private struct Optional
+  include Binary::Format
+  field flags : UInt8
+  field extra : UInt16?, if: -> { flags & 1 != 0 }
+  field name : String?, cstring: true, if: -> { flags & 2 != 0 }
+  field n : UInt8, value: -> { flags &+ 1 }
+end
+
+private struct Varints
+  include Binary::Format
+  field a : UInt32, varint: true
+  field b : Int64, varint: true
+  field k : Kind, varint: true
+  field xs : Array(Int32), count: 2, varint: true
+end
+
 describe Binary::Format do
   describe "scalars" do
     it "writes big-endian by default and reads back" do
@@ -299,6 +322,59 @@ describe Binary::Format do
       expect_raises(Binary::Format::Error, /FixedElems#tags/) do
         FixedElems.new(chunks: StaticArray[Bytes[1, 2], Bytes[3, 4]], tags: ["ab", "def"]).to_slice
       end
+    end
+  end
+
+  describe "varint, if, value and size_of" do
+    it "encodes the Postgres StartupMessage with a derived total length" do
+      s = Startup.new(params: ["user", "bob", "database", "db", ""])
+      s.to_slice.should eq Bytes[0, 0, 0, 30, 0, 3, 0, 0] + "user\0bob\0database\0db\0\0".to_slice
+      s.length.should eq 30
+      s.byte_size.should eq 30
+      back = Startup.from_slice(s.to_slice)
+      back.params.should eq ["user", "bob", "database", "db", ""]
+      back.length.should eq 30
+      back.version.should eq 196608
+    end
+
+    it "bounds the rest of the record with size_of so trailing bytes are untouched" do
+      bytes = Startup.new(params: ["a"]).to_slice + Bytes[0xAA, 0xBB]
+      io = IO::Memory.new(bytes)
+      Startup.read(io).params.should eq ["a"]
+      io.read_byte.should eq 0xAA
+    end
+
+    it "raises SizeError on a negative or oversized size_of" do
+      expect_raises(Binary::Format::SizeError) { Startup.from_slice(Bytes[0xFF, 0xFF, 0xFF, 0xFF]) }
+    end
+
+    it "reads and writes optional fields by condition" do
+      Optional.new(flags: 0).to_slice.should eq Bytes[0, 1]
+      Optional.new(flags: 3, extra: 7, name: "x").to_slice.should eq Bytes[3, 0, 7, 0x78, 0, 4]
+      o = Optional.from_slice(Bytes[1, 0, 9, 2])
+      o.extra.should eq 9
+      o.name.should be_nil
+      o.n.should eq 2
+      Optional.from_slice(Bytes[2, 0x79, 0, 3]).name.should eq "y"
+    end
+
+    it "raises when a required conditional field is nil and skips it when the condition is false" do
+      expect_raises(Binary::Format::Error, /Optional#extra/) { Optional.new(flags: 1).to_slice }
+      Optional.new(flags: 0, extra: 5).to_slice.should eq Bytes[0, 1]
+    end
+
+    it "computes value: fields on construction and on write" do
+      Optional.new(flags: 4).n.should eq 5
+      o = Optional.new(flags: 4)
+      o.flags = 8
+      o.to_slice.should eq Bytes[8, 9]
+    end
+
+    it "encodes varints, zigzag for signed types and enums" do
+      v = Varints.new(a: 300, b: -1, k: :response, xs: [-2, 150])
+      v.to_slice.should eq Bytes[0xAC, 0x02, 0x01, 0x02, 0x03, 0xAC, 0x02]
+      v.byte_size.should eq 7
+      Varints.from_slice(v.to_slice).should eq v
     end
   end
 end

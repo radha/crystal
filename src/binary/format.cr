@@ -156,6 +156,46 @@ module Binary
         end
         !peek.empty?
       end
+
+      def self.read_varint(io : IO, type : T.class) : T forall T
+        {% if T.name.stringify.starts_with?("Int") %}
+          Binary::Varint.decode_zigzag(T, io)
+        {% else %}
+          Binary::Varint.decode(T, io)
+        {% end %}
+      end
+
+      def self.write_varint(io : IO, value : Int::Signed) : Nil
+        Binary::Varint.encode_zigzag(value, io)
+      end
+
+      def self.write_varint(io : IO, value : Int::Unsigned) : Nil
+        Binary::Varint.encode(value, io)
+      end
+
+      def self.varint_size(value : Int::Signed) : Int32
+        Binary::Varint.size(Binary::Zigzag.encode(value))
+      end
+
+      def self.varint_size(value : Int::Unsigned) : Int32
+        Binary::Varint.size(value)
+      end
+
+      def self.read_enum_varint(io : IO, type : T.class) : T forall T
+        T.new(read_varint(io, typeof(T.new(0).value)))
+      end
+
+      def self.write_enum_varint(io : IO, value : Enum) : Nil
+        write_varint(io, value.value)
+      end
+
+      def self.enum_varint_size(value : Enum) : Int32
+        varint_size(value.value)
+      end
+
+      def self.present(value : T?, label : String) : T forall T
+        value || raise Error.new("#{label}: the field is nil but its `if:` condition is true")
+      end
     end
 
     # Sets the default byte order for every multi-byte field of this format.
@@ -247,11 +287,19 @@ module Binary
     # :nodoc:
     macro __binary_read_scalar(io, cat, type, format, opts)
       {% if cat == :int || cat == :float %}
-        {{io}}.read_bytes({{type}}, {{format}})
+        {% if opts[:varint] %}
+          ::Binary::Format::Codec.read_varint({{io}}, {{type}})
+        {% else %}
+          {{io}}.read_bytes({{type}}, {{format}})
+        {% end %}
       {% elsif cat == :bool %}
         ::Binary::Format::Codec.read_bool({{io}})
       {% elsif cat == :enum %}
-        ::Binary::Format::Codec.read_enum({{io}}, {{type}}, {{format}})
+        {% if opts[:varint] %}
+          ::Binary::Format::Codec.read_enum_varint({{io}}, {{type}})
+        {% else %}
+          ::Binary::Format::Codec.read_enum({{io}}, {{type}}, {{format}})
+        {% end %}
       {% elsif cat == :string %}
         {% if opts[:mode] == :cstring %}
           ::Binary::Format::Codec.read_cstring({{io}}, {{opts[:label]}})
@@ -301,11 +349,19 @@ module Binary
     # :nodoc:
     macro __binary_write_scalar(io, cat, type, format, value, opts)
       {% if cat == :int || cat == :float %}
-        {{io}}.write_bytes({{value}}, {{format}})
+        {% if opts[:varint] %}
+          ::Binary::Format::Codec.write_varint({{io}}, {{value}})
+        {% else %}
+          {{io}}.write_bytes({{value}}, {{format}})
+        {% end %}
       {% elsif cat == :bool %}
         ::Binary::Format::Codec.write_bool({{io}}, {{value}})
       {% elsif cat == :enum %}
-        ::Binary::Format::Codec.write_enum({{io}}, {{value}}, {{format}})
+        {% if opts[:varint] %}
+          ::Binary::Format::Codec.write_enum_varint({{io}}, {{value}})
+        {% else %}
+          ::Binary::Format::Codec.write_enum({{io}}, {{value}}, {{format}})
+        {% end %}
       {% elsif cat == :string || cat == :bytes %}
         {% if opts[:mode] == :cstring %}
           ::Binary::Format::Codec.write_cstring({{io}}, {{value}}, {{opts[:label]}})
@@ -334,7 +390,13 @@ module Binary
     # :nodoc:
     macro __binary_size_scalar(cat, type, value, opts)
       {% if cat == :int || cat == :float || cat == :bool || cat == :enum %}
-        {{opts[:width]}}
+        {% if opts[:varint] && cat == :enum %}
+          ::Binary::Format::Codec.enum_varint_size({{value}})
+        {% elsif opts[:varint] %}
+          ::Binary::Format::Codec.varint_size({{value}})
+        {% else %}
+          {{opts[:width]}}
+        {% end %}
       {% elsif cat == :string %}
         {% if opts[:mode] == :cstring %}
           ({{value}}.bytesize &+ 1)
@@ -385,6 +447,7 @@ module Binary
         {% e[:width] = nil %}
         {% e[:derived] = false %}
         {% e[:write_value] = nil %}
+        {% e[:size_of] = nil %}
         {% if a[:kind] == :field %}
           {% e[:name] = a[:name].id %}
           {% e[:label] = "#{type_name}##{a[:name].id}" %}
@@ -462,16 +525,23 @@ module Binary
           {% e[:cat] = cats[0] %}
           {% e[:width] = ws[0] %}
           {% e[:signed] = sg[0] %}
-          {% if e[:cat] == :string %}
-            {% allowed = ["length", "cstring", "until", "max"] %}
+          {% e[:swidth] = ws[0] %}
+          {% if e[:cat] == :int || e[:cat] == :enum %}
+            {% allowed = ["endian", "varint", "value", "if", "size_of", "including_self", "max"] %}
+          {% elsif e[:cat] == :float %}
+            {% allowed = ["endian", "value", "if"] %}
+          {% elsif e[:cat] == :bool %}
+            {% allowed = ["value", "if"] %}
+          {% elsif e[:cat] == :string %}
+            {% allowed = ["length", "cstring", "until", "max", "if"] %}
           {% elsif e[:cat] == :bytes %}
-            {% allowed = ["length", "until", "max"] %}
+            {% allowed = ["length", "until", "max", "if"] %}
           {% elsif e[:cat] == :nested %}
-            {% allowed = [] of Nil %}
+            {% allowed = ["if"] %}
           {% elsif e[:cat] == :static_array %}
-            {% allowed = ["endian", "cstring", "length"] %}
+            {% allowed = ["endian", "varint", "cstring", "length", "if"] %}
           {% elsif e[:cat] == :array %}
-            {% allowed = ["endian", "cstring", "length", "count", "until", "sentinel", "max"] %}
+            {% allowed = ["endian", "varint", "cstring", "length", "count", "until", "sentinel", "max", "if"] %}
           {% end %}
           {% e[:mode] = nil %}
           {% e[:length] = nil %}
@@ -564,13 +634,60 @@ module Binary
               {% end %}
             {% end %}
           {% end %}
+          {% e[:varint] = a[:varint] ? true : nil %}
+          {% if e[:varint] %}
+            {% vcat = elem ? e[:ecat] : e[:cat] %}
+            {% raise "#{e[:label].id}: `varint:` needs an integer or enum type" unless vcat == :int || vcat == :enum %}
+            {% raise "#{e[:label].id}: `varint:` cannot be combined with `size_of:`" if a[:size_of] %}
+            {% if elem %}
+              {% e[:ewidth] = nil %}
+              {% e[:eopts] = {label: e[:label], width: nil, signed: sg[1], mode: nil, length: nil, max: "::Binary::Format::DEFAULT_MAX_BYTES".id, varint: true} %}
+            {% end %}
+            {% e[:width] = nil %}
+          {% end %}
+          {% e[:if] = nil %}
+          {% if a[:if] %}
+            {% raise "#{e[:label].id}: `if:` expects a `->{ }` block" unless a[:if].is_a?(ProcLiteral) %}
+            {% raise "#{e[:label].id}: a field with `if:` must be declared nilable (`#{t}?`)" unless e[:nilable] %}
+            {% e[:if] = a[:if] %}
+            {% e[:width] = nil %}
+          {% elsif e[:nilable] %}
+            {% raise "#{e[:label].id}: a nilable field needs an `if:` condition" %}
+          {% end %}
+          {% e[:value] = nil %}
+          {% if a[:value] %}
+            {% raise "#{e[:label].id}: `value:` expects a `->{ }` block" unless a[:value].is_a?(ProcLiteral) %}
+            {% raise "#{e[:label].id}: a derived field cannot have a default value" if e[:has_default] %}
+            {% e[:value] = a[:value] %}
+            {% e[:derived] = true %}
+            {% if e[:cat] == :int || e[:cat] == :float %}
+              {% e[:write_value] = "#{t}.new((#{a[:value].body}))".id %}
+            {% else %}
+              {% e[:write_value] = "((#{a[:value].body}))".id %}
+            {% end %}
+          {% end %}
+          {% e[:size_of] = nil %}
+          {% if a[:size_of] %}
+            {% raise "#{e[:label].id}: `size_of:` must be :rest" unless a[:size_of] == :rest %}
+            {% raise "#{e[:label].id}: `size_of:` needs an integer type" unless e[:cat] == :int %}
+            {% raise "#{e[:label].id}: a derived field cannot have a default value" if e[:has_default] %}
+            {% raise "#{type_name.id}: only one field may have `size_of: :rest`" if entries.any? { |x| x[:size_of] } %}
+            {% e[:size_of] = true %}
+            {% e[:including_self] = a[:including_self] ? true : false %}
+            {% e[:max] = a[:max] || "::Binary::Format::DEFAULT_MAX_BYTES".id %}
+            {% e[:derived] = true %}
+            {% suffix = e[:including_self] ? " &+ #{e[:width]}".id : "".id %}
+            {% e[:write_value] = "#{t}.new(__binary_size_after_#{e[:name]}#{suffix})".id %}
+          {% elsif a[:including_self] %}
+            {% raise "#{e[:label].id}: `including_self:` only applies with `size_of: :rest`" %}
+          {% end %}
           {% for key, _v in a.named_args %}
             {% ks = key.id.stringify %}
             {% unless internal_keys.includes?(ks) || allowed.includes?(ks) %}
               {% raise "#{e[:label].id}: option `#{ks.id}:` is not valid for a #{t} field (allowed: #{allowed.join(", ").id})" %}
             {% end %}
           {% end %}
-          {% e[:opts] = {label: e[:label], width: e[:width], signed: e[:signed], mode: e[:mode], length: e[:length], max: e[:max], amode: e[:amode], count: e[:count], sentinel: e[:sentinel], elem: e[:elem], ecat: e[:ecat], ewidth: e[:ewidth], eopts: e[:eopts]} %}
+          {% e[:opts] = {label: e[:label], width: e[:swidth], signed: e[:signed], mode: e[:mode], length: e[:length], max: e[:max], amode: e[:amode], count: e[:count], sentinel: e[:sentinel], elem: e[:elem], ecat: e[:ecat], ewidth: e[:ewidth], eopts: e[:eopts], varint: e[:varint]} %}
         {% elsif a[:kind] == :pad %}
           {% e[:width] = a[:size] %}
         {% elsif a[:kind] == :align %}
@@ -708,7 +825,10 @@ module Binary
           {% elsif e[:kind] == :magic %}
             ::Binary::Format::Codec.read_magic(__io, BINARY_MAGIC_{{e[:index]}}, {{type_name.stringify}})
           {% elsif e[:kind] == :field %}
-            {{e[:name]}} = __binary_read_scalar(__io, {{e[:cat]}}, {{e[:type]}}, {{e[:format]}}, {{e[:opts]}})
+            {{e[:name]}} = {% if e[:if] %} ({{e[:if].body}}) ? ( {% end %} __binary_read_scalar(__io, {{e[:cat]}}, {{e[:type]}}, {{e[:format]}}, {{e[:opts]}}) {% if e[:if] %} ) : nil {% end %}
+            {% if e[:size_of] %}
+              __io = ::IO::Sized.new(__io, ::Binary::Format::Codec.check_size({{e[:name]}}{% if e[:including_self] %} &- {{e[:width]}}{% end %}, {{e[:max]}}, {{e[:label]}}))
+            {% end %}
           {% end %}
         {% end %}
         {% for e in fields %}
@@ -724,23 +844,43 @@ module Binary
           {% elsif e[:kind] == :magic %}
             __io.write(BINARY_MAGIC_{{e[:index]}})
           {% elsif e[:kind] == :field %}
-            __binary_write_scalar(__io, {{e[:cat]}}, {{e[:type]}}, {{e[:format]}}, {{e[:write_value] || "@#{e[:name]}".id}}, {{e[:opts]}})
+            {% if e[:if] %}
+              if ({{e[:if].body}})
+                __binary_write_scalar(__io, {{e[:cat]}}, {{e[:type]}}, {{e[:format]}}, ::Binary::Format::Codec.present(@{{e[:name]}}, {{e[:label]}}), {{e[:opts]}})
+              end
+            {% else %}
+              __binary_write_scalar(__io, {{e[:cat]}}, {{e[:type]}}, {{e[:format]}}, {{e[:write_value] || "@#{e[:name]}".id}}, {{e[:opts]}})
+            {% end %}
           {% end %}
         {% end %}
       end
 
-      # Returns the encoded size in bytes without writing anything.
-      def byte_size : Int32
-        __binary_size = 0
-        {% for e in entries %}
-          {% if e[:kind] == :field %}
-            __binary_size += __binary_size_scalar({{e[:cat]}}, {{e[:type]}}, {{e[:write_value] || "@#{e[:name]}".id}}, {{e[:opts]}})
-          {% else %}
-            __binary_size += {{e[:width]}}
-          {% end %}
+      {% size_points = [{"byte_size".id, 0}] %}
+      {% for e in entries %}
+        {% if e[:size_of] %}
+          {% size_points << {"__binary_size_after_#{e[:name]}".id, e[:pos] + 1} %}
         {% end %}
-        __binary_size
-      end
+      {% end %}
+      {% for point in size_points %}
+        # Returns the encoded size in bytes without writing anything.
+        def {{point[0]}} : Int32
+          __binary_size = 0
+          {% for e in entries %}
+            {% if e[:pos] >= point[1] %}
+              {% if e[:kind] == :field %}
+                {% if e[:if] %}
+                  __binary_size += (({{e[:if].body}}) ? __binary_size_scalar({{e[:cat]}}, {{e[:type]}}, ::Binary::Format::Codec.present(@{{e[:name]}}, {{e[:label]}}), {{e[:opts]}}) : 0)
+                {% else %}
+                  __binary_size += (__binary_size_scalar({{e[:cat]}}, {{e[:type]}}, {{e[:write_value] || "@#{e[:name]}".id}}, {{e[:opts]}}))
+                {% end %}
+              {% else %}
+                __binary_size += {{e[:width]}}
+              {% end %}
+            {% end %}
+          {% end %}
+          __binary_size
+        end
+      {% end %}
 
       # Returns this record encoded into a new `Bytes` of exactly `byte_size`.
       def to_slice : Bytes
