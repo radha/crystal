@@ -652,7 +652,7 @@ module Binary
       end
 
       def self.read_enum(io : IO, type : T.class, format : IO::ByteFormat) : T forall T
-        T.new(io.read_bytes(typeof(T.values.first.value), format))
+        T.new(io.read_bytes(typeof(T.new(0).value), format))
       end
 
       def self.write_enum(io : IO, value : Enum, format : IO::ByteFormat) : Nil
@@ -662,7 +662,7 @@ module Binary
       # Placeholder value for derived fields in the keyword constructor.
       def self.zero(type : T.class) : T forall T
         {% if T < ::Enum %}
-          T.new(typeof(T.values.first.value).zero)
+          T.new(typeof(T.new(0).value).zero)
         {% elsif T == ::Bool %}
           false
         {% else %}
@@ -2006,7 +2006,7 @@ Expected: `Startup#length: option `size_of:` is not valid`.
       end
 
       def self.read_enum_varint(io : IO, type : T.class) : T forall T
-        T.new(read_varint(io, typeof(T.values.first.value)))
+        T.new(read_varint(io, typeof(T.new(0).value)))
       end
 
       def self.write_enum_varint(io : IO, value : Enum) : Nil
@@ -2356,7 +2356,7 @@ Codec:
         {% if T == ::Bool %}
           raw != 0
         {% elsif T < ::Enum %}
-          T.new(typeof(T.values.first.value).new!(raw))
+          T.new(typeof(T.new(0).value).new!(raw))
         {% else %}
           T.new!(raw)
         {% end %}
@@ -2624,7 +2624,7 @@ Codec:
 
 ```crystal
       def self.decode_enum(type : T.class, bytes : Bytes, format : IO::ByteFormat) : T forall T
-        T.new(format.decode(typeof(T.values.first.value), bytes))
+        T.new(format.decode(typeof(T.new(0).value), bytes))
       end
 
       def self.encode_enum(value : Enum, bytes : Bytes, format : IO::ByteFormat) : Nil
