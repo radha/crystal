@@ -2,6 +2,24 @@
 require "spec"
 require "binary"
 
+# Reads one byte at a time and has no peek buffer.
+private class UnbufferedIO < IO
+  def initialize(@bytes : Bytes)
+    @pos = 0
+  end
+
+  def read(slice : Bytes) : Int32
+    return 0 if @pos >= @bytes.size || slice.empty?
+    slice[0] = @bytes[@pos]
+    @pos += 1
+    1
+  end
+
+  def write(slice : Bytes) : Nil
+    raise IO::Error.new("read-only")
+  end
+end
+
 private enum Kind : UInt8
   Request  = 1
   Response = 2
@@ -59,6 +77,23 @@ private struct SignedEnum
   include Binary::Format
   field s : Signed16
   field t : Signed16, endian: :little
+end
+
+private struct Texts
+  include Binary::Format
+  field name_len : UInt8
+  field name : String, length: :name_len
+  field tag : String, length: 4
+  field note : String, cstring: true
+  field n : UInt8
+  field twice : Bytes, length: -> { n * 2 }
+  field rest : Bytes, until: :eof
+end
+
+private struct Capped
+  include Binary::Format
+  field len : UInt32
+  field body : Bytes, length: :len, max: 8
 end
 
 describe Binary::Format do
@@ -140,6 +175,46 @@ describe Binary::Format do
     it "skips padding bytes on read regardless of their content" do
       bytes = Bytes[1, 9, 9, 9, 0, 0, 0, 2, 3, 9, 9, 9, 9, 9, 9, 9]
       Aligned.from_slice(bytes).should eq Aligned.new(a: 1, b: 2, c: 3)
+    end
+  end
+
+  describe "String and Bytes" do
+    it "derives length fields and round-trips every mode" do
+      t = Texts.new(name: "abc", tag: "TAG!", note: "hi", n: 2, twice: Bytes[7, 8, 9, 10], rest: Bytes[1, 2])
+      t.name_len.should eq 3
+      t.to_slice.should eq Bytes[3, 0x61, 0x62, 0x63, 0x54, 0x41, 0x47, 0x21, 0x68, 0x69, 0, 2, 7, 8, 9, 10, 1, 2]
+      t.byte_size.should eq 18
+      back = Texts.from_slice(t.to_slice)
+      back.should eq t
+      back.name_len.should eq 3
+    end
+
+    it "reads the rest through an IO::Memory and an unbuffered IO" do
+      bytes = Texts.new(name: "", tag: "abcd", note: "", n: 0, twice: Bytes.empty, rest: Bytes[5, 6, 7]).to_slice
+      Texts.read(IO::Memory.new(bytes)).rest.should eq Bytes[5, 6, 7]
+      Texts.read(UnbufferedIO.new(bytes)).rest.should eq Bytes[5, 6, 7]
+    end
+
+    it "raises SizeError beyond max: and on negative lengths" do
+      bytes = Bytes[0, 0, 0, 9, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+      expect_raises(Binary::Format::SizeError, /Capped#body/) { Capped.from_slice(bytes) }
+      Capped.from_slice(Bytes[0, 0, 0, 2, 1, 2]).body.should eq Bytes[1, 2]
+    end
+
+    it "raises on a NUL inside a cstring and on a wrong fixed length" do
+      expect_raises(Binary::Format::Error, /Texts#note/) do
+        Texts.new(name: "", tag: "abcd", note: "a\0b", n: 0, twice: Bytes.empty, rest: Bytes.empty).to_slice
+      end
+      expect_raises(Binary::Format::Error, /Texts#tag/) do
+        Texts.new(name: "", tag: "abc", note: "", n: 0, twice: Bytes.empty, rest: Bytes.empty).to_slice
+      end
+      expect_raises(Binary::Format::Error, /Texts#twice/) do
+        Texts.new(name: "", tag: "abcd", note: "", n: 1, twice: Bytes[1, 2, 3], rest: Bytes.empty).to_slice
+      end
+    end
+
+    it "raises IO::EOFError on an unterminated cstring" do
+      expect_raises(IO::EOFError) { Texts.from_slice(Bytes[0, 0x54, 0x41, 0x47, 0x21, 0x68, 0x69]) }
     end
   end
 end
