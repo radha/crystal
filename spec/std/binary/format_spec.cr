@@ -118,6 +118,12 @@ private struct FixedCounts
   field more : Array(UInt16), count: -> { n + 1 }
 end
 
+private struct FixedElems
+  include Binary::Format
+  field chunks : StaticArray(Bytes, 2), length: 2
+  field tags : Array(String), length: 3, count: 2
+end
+
 describe Binary::Format do
   describe "scalars" do
     it "writes big-endian by default and reads back" do
@@ -283,6 +289,16 @@ describe Binary::Format do
       bytes = Shapes.new(points: [] of Point, ident: StaticArray[0_u8, 0_u8, 0_u8, 0_u8], names: [] of String, tail: [7_u32]).to_slice
       Shapes.read(IO::Memory.new(bytes)).tail.should eq [7_u32]
       expect_raises(Binary::Format::Error, /peek/) { Shapes.read(UnbufferedIO.new(bytes)) }
+    end
+
+    it "reads and writes fixed-length String and Bytes elements" do
+      f = FixedElems.new(chunks: StaticArray[Bytes[1, 2], Bytes[3, 4]], tags: ["abc", "def"])
+      f.to_slice.should eq Bytes[1, 2, 3, 4, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66]
+      f.byte_size.should eq 10
+      FixedElems.from_slice(f.to_slice).should eq f
+      expect_raises(Binary::Format::Error, /FixedElems#tags/) do
+        FixedElems.new(chunks: StaticArray[Bytes[1, 2], Bytes[3, 4]], tags: ["ab", "def"]).to_slice
+      end
     end
   end
 end
