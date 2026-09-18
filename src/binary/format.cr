@@ -58,6 +58,26 @@ module Binary
         io.write_bytes(value.value, format)
       end
 
+      ZEROS = Bytes.new(64)
+
+      def self.write_zeros(io : IO, count : Int32) : Nil
+        while count > 0
+          n = Math.min(count, ZEROS.size)
+          io.write(ZEROS[0, n])
+          count -= n
+        end
+      end
+
+      def self.check_magic(actual : Bytes, expected : Bytes, type : String) : Nil
+        raise MagicError.new(type, expected, actual) unless actual == expected
+      end
+
+      def self.read_magic(io : IO, expected : Bytes, type : String) : Nil
+        actual = Bytes.new(expected.size)
+        io.read_fully(actual)
+        check_magic(actual, expected, type)
+      end
+
       # Placeholder value for derived fields in the keyword constructor.
       def self.zero(type : T.class) : T forall T
         {% if T < ::Enum %}
@@ -76,6 +96,36 @@ module Binary
       {% raise "Binary::Format: endian must be :big, :little or :native, not #{value}" unless [:big, :little, :native].includes?(value) %}
       @[::Binary::Format::Entry(kind: :endian, value: {{value}})]
       private def __binary_directive_endian; end
+    end
+
+    # Skips *size* bytes on read and writes *size* zero bytes.
+    macro pad(size)
+      {% raise "Binary::Format: `pad` expects a positive integer literal, got `#{size}`" unless size.is_a?(NumberLiteral) && size > 0 %}
+      @[::Binary::Format::Entry(kind: :pad, size: {{size}})]
+      private def __binary_entry_pad_{{@type.methods.size}}; end
+    end
+
+    # Pads to the next multiple of *size* bytes counted from the start of the
+    # record. Every entry before it must have a fixed width.
+    macro align(size)
+      {% raise "Binary::Format: `align` expects a positive integer literal, got `#{size}`" unless size.is_a?(NumberLiteral) && size > 0 %}
+      @[::Binary::Format::Entry(kind: :align, size: {{size}})]
+      private def __binary_entry_align_{{@type.methods.size}}; end
+    end
+
+    # Declares constant bytes: a `String` (ASCII only), `Bytes[...]`, or an
+    # integer literal with a type suffix (written in the type's endian).
+    # Read asserts the bytes and raises `MagicError` on mismatch.
+    macro magic(value)
+      {% if value.is_a?(StringLiteral) %}
+        {% raise "Binary::Format: a String magic must be ASCII, use Bytes[...] otherwise" unless value =~ /\A[\x00-\x7f]*\z/ %}
+      {% elsif value.is_a?(NumberLiteral) %}
+        {% raise "Binary::Format: an integer magic needs a type suffix, e.g. 0x89504E47_u32" unless value.kind.id.stringify =~ /\A[ui](8|16|32|64|128)\z/ %}
+      {% elsif !(value.is_a?(Call) && value.name == "[]") %}
+        {% raise "Binary::Format: magic must be a String, Bytes[...] or a suffixed integer literal, got `#{value}`" %}
+      {% end %}
+      @[::Binary::Format::Entry(kind: :magic, value: {{value}})]
+      private def __binary_entry_magic_{{@type.methods.size}}; end
     end
 
     # Declares the next field of the layout. See the module docs for options.
@@ -179,6 +229,7 @@ module Binary
         type_name = @type.name
         int_widths = {"Int8" => 1, "UInt8" => 1, "Int16" => 2, "UInt16" => 2, "Int32" => 4, "UInt32" => 4, "Int64" => 8, "UInt64" => 8, "Int128" => 16, "UInt128" => 16}
         float_widths = {"Float32" => 4, "Float64" => 8}
+        magic_widths = {"i8" => 1, "u8" => 1, "i16" => 2, "u16" => 2, "i32" => 4, "u32" => 4, "i64" => 8, "u64" => 8, "i128" => 16, "u128" => 16}
         formats = {big: "::IO::ByteFormat::BigEndian".id, little: "::IO::ByteFormat::LittleEndian".id, native: "::IO::ByteFormat::SystemEndian".id}
         internal_keys = ["kind", "name", "type", "has_default", "default"]
         entries = [] of Nil
@@ -237,6 +288,25 @@ module Binary
             {% end %}
           {% end %}
           {% e[:opts] = {label: e[:label], width: e[:width], signed: e[:signed]} %}
+        {% elsif a[:kind] == :pad %}
+          {% e[:width] = a[:size] %}
+        {% elsif a[:kind] == :align %}
+          {% raise "#{type_name.id}: `align #{a[:size]}` needs every preceding entry to have a fixed width" unless offset %}
+          {% e[:kind] = :pad %}
+          {% e[:width] = (a[:size] - offset % a[:size]) % a[:size] %}
+        {% elsif a[:kind] == :magic %}
+          {% v = a[:value] %}
+          {% e[:index] = entries.size %}
+          {% if v.is_a?(StringLiteral) %}
+            {% e[:width] = v.size %}
+            {% e[:const_expr] = "#{v}.to_slice".id %}
+          {% elsif v.is_a?(NumberLiteral) %}
+            {% e[:width] = magic_widths[v.kind.id.stringify] %}
+            {% e[:const_expr] = "(::IO::Memory.new(#{e[:width]}).tap { |m| m.write_bytes(#{v}, #{formats[type_endian]}) }.to_slice)".id %}
+          {% else %}
+            {% e[:width] = v.args.size %}
+            {% e[:const_expr] = v %}
+          {% end %}
         {% else %}
           {% raise "Binary::Format: unknown entry kind #{a[:kind]}" %}
         {% end %}
@@ -255,6 +325,13 @@ module Binary
 
       # :nodoc:
       BINARY_FORMAT_FIXED = {{fixed}}
+
+      {% for e in entries %}
+        {% if e[:kind] == :magic %}
+          # :nodoc:
+          BINARY_MAGIC_{{e[:index]}} = {{e[:const_expr]}}
+        {% end %}
+      {% end %}
 
       # Returns `true` if every field has a compile-time width.
       def self.fixed_size? : Bool
@@ -302,7 +379,11 @@ module Binary
       # :nodoc:
       def initialize(*, __binary_io __io : IO)
         {% for e in entries %}
-          {% if e[:kind] == :field %}
+          {% if e[:kind] == :pad %}
+            {% if e[:width] > 0 %} __io.skip({{e[:width]}}) {% end %}
+          {% elsif e[:kind] == :magic %}
+            ::Binary::Format::Codec.read_magic(__io, BINARY_MAGIC_{{e[:index]}}, {{type_name.stringify}})
+          {% elsif e[:kind] == :field %}
             {{e[:name]}} = __binary_read_scalar(__io, {{e[:cat]}}, {{e[:type]}}, {{e[:format]}}, {{e[:opts]}})
           {% end %}
         {% end %}
@@ -314,7 +395,11 @@ module Binary
       # Writes this record to *io*.
       def write(__io : IO) : Nil
         {% for e in entries %}
-          {% if e[:kind] == :field %}
+          {% if e[:kind] == :pad %}
+            {% if e[:width] > 0 %} ::Binary::Format::Codec.write_zeros(__io, {{e[:width]}}) {% end %}
+          {% elsif e[:kind] == :magic %}
+            __io.write(BINARY_MAGIC_{{e[:index]}})
+          {% elsif e[:kind] == :field %}
             __binary_write_scalar(__io, {{e[:cat]}}, {{e[:type]}}, {{e[:format]}}, {{e[:write_value] || "@#{e[:name]}".id}}, {{e[:opts]}})
           {% end %}
         {% end %}
@@ -326,6 +411,8 @@ module Binary
         {% for e in entries %}
           {% if e[:kind] == :field %}
             __binary_size += __binary_size_scalar({{e[:cat]}}, {{e[:type]}}, {{e[:write_value] || "@#{e[:name]}".id}}, {{e[:opts]}})
+          {% else %}
+            __binary_size += {{e[:width]}}
           {% end %}
         {% end %}
         __binary_size
