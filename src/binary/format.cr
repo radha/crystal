@@ -46,12 +46,12 @@ module Binary
         io.write_byte(value ? 1_u8 : 0_u8)
       end
 
-      # *base* is the unsigned integer type matching the field's declared byte
-      # width, chosen by the macro so this never has to call `T.values` (doing
-      # so on a `T` resolved from a `private enum` in a different file raises
-      # "undefined constant" — see Task 2 report).
-      def self.read_enum(io : IO, type : T.class, base : U.class, format : IO::ByteFormat) : T forall T, U
-        T.new(io.read_bytes(U, format))
+      # `typeof(T.new(0).value)` derives the enum's underlying integer type
+      # without calling `T.values` (calling `.values` on a `T` resolved from a
+      # `private enum` in a different file raises "undefined constant" — see
+      # Task 2 report).
+      def self.read_enum(io : IO, type : T.class, format : IO::ByteFormat) : T forall T
+        T.new(io.read_bytes(typeof(T.new(0).value), format))
       end
 
       def self.write_enum(io : IO, value : Enum, format : IO::ByteFormat) : Nil
@@ -61,7 +61,7 @@ module Binary
       # Placeholder value for derived fields in the keyword constructor.
       def self.zero(type : T.class) : T forall T
         {% if T < ::Enum %}
-          T.new(0)
+          T.new(typeof(T.new(0).value).zero)
         {% elsif T == ::Bool %}
           false
         {% else %}
@@ -132,7 +132,7 @@ module Binary
       {% elsif cat == :bool %}
         ::Binary::Format::Codec.read_bool({{io}})
       {% elsif cat == :enum %}
-        ::Binary::Format::Codec.read_enum({{io}}, {{type}}, {{opts[:base]}}, {{format}})
+        ::Binary::Format::Codec.read_enum({{io}}, {{type}}, {{format}})
       {% else %}
         {% raise "Binary::Format: cannot read #{cat}" %}
       {% end %}
@@ -179,7 +179,6 @@ module Binary
         type_name = @type.name
         int_widths = {"Int8" => 1, "UInt8" => 1, "Int16" => 2, "UInt16" => 2, "Int32" => 4, "UInt32" => 4, "Int64" => 8, "UInt64" => 8, "Int128" => 16, "UInt128" => 16}
         float_widths = {"Float32" => 4, "Float64" => 8}
-        unsigned_by_width = {1 => "::UInt8".id, 2 => "::UInt16".id, 4 => "::UInt32".id, 8 => "::UInt64".id, 16 => "::UInt128".id}
         formats = {big: "::IO::ByteFormat::BigEndian".id, little: "::IO::ByteFormat::LittleEndian".id, native: "::IO::ByteFormat::SystemEndian".id}
         internal_keys = ["kind", "name", "type", "has_default", "default"]
         entries = [] of Nil
@@ -228,7 +227,6 @@ module Binary
           {% elsif t < ::Enum %}
             {% e[:cat] = :enum %}
             {% e[:width] = widths[e[:name]] %}
-            {% e[:base] = unsigned_by_width[e[:width]] %}
           {% else %}
             {% raise "#{e[:label].id}: unsupported field type #{t}" %}
           {% end %}
@@ -238,7 +236,7 @@ module Binary
               {% raise "#{e[:label].id}: option `#{ks.id}:` is not valid for a #{t} field (allowed: #{allowed.join(", ").id})" %}
             {% end %}
           {% end %}
-          {% e[:opts] = {label: e[:label], width: e[:width], signed: e[:signed], base: e[:base]} %}
+          {% e[:opts] = {label: e[:label], width: e[:width], signed: e[:signed]} %}
         {% else %}
           {% raise "Binary::Format: unknown entry kind #{a[:kind]}" %}
         {% end %}
