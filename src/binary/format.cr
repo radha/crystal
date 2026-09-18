@@ -331,6 +331,11 @@ module Binary
         {% elsif T < ::Enum %}
           T.new(typeof(T.new(0).value).new!(raw))
         {% else %}
+          {% if T.name.stringify.starts_with?("Int") %}
+            if bits < 64 && (raw & (1_u64 << (bits - 1))) != 0
+              raw |= UInt64::MAX << bits
+            end
+          {% end %}
           T.new!(raw)
         {% end %}
       end
@@ -343,9 +348,16 @@ module Binary
         to_bits(value.value, bits, label)
       end
 
-      def self.to_bits(value : Int, bits : Int32, label : String) : UInt64
+      def self.to_bits(value : Int::Signed, bits : Int32, label : String) : UInt64
+        ok = bits == 64 || (-(1_i64 << (bits - 1)) <= value && value < (1_i64 << (bits - 1)))
+        raise Error.new("#{label}: value #{value} does not fit in #{bits} bits") unless ok
+        mask = bits == 64 ? UInt64::MAX : (1_u64 << bits) - 1
+        value.to_u64! & mask
+      end
+
+      def self.to_bits(value : Int::Unsigned, bits : Int32, label : String) : UInt64
         raw = value.to_u64!
-        if value < 0 || (bits < 64 && raw >= (1_u64 << bits))
+        if bits < 64 && raw >= (1_u64 << bits)
           raise Error.new("#{label}: value #{value} does not fit in #{bits} bits")
         end
         raw
@@ -408,7 +420,12 @@ module Binary
         {% raise "Binary::Format: a String magic must be ASCII, use Bytes[...] otherwise" unless value =~ /\A[\x00-\x7f]*\z/ %}
       {% elsif value.is_a?(NumberLiteral) %}
         {% raise "Binary::Format: an integer magic needs an explicit type suffix other than _i32 (an unsuffixed literal is Int32 too), e.g. 0x89504E47_u32" unless value.kind.id.stringify =~ /\A[ui](8|16|64|128)\z|\Au32\z/ %}
-      {% elsif !(value.is_a?(Call) && value.name == "[]") %}
+      {% elsif value.is_a?(Call) && value.name == "[]" %}
+        {% raise "Binary::Format: a Bytes magic must be written as `Bytes[b1, b2, ...]` with literal bytes" unless value.receiver.stringify == "Bytes" %}
+        {% for arg in value.args %}
+          {% raise "Binary::Format: a Bytes magic must be written as `Bytes[b1, b2, ...]` with literal bytes" if arg.is_a?(Splat) %}
+        {% end %}
+      {% else %}
         {% raise "Binary::Format: magic must be a String, Bytes[...] or a suffixed integer literal, got `#{value}`" %}
       {% end %}
       @[::Binary::Format::Entry(kind: :magic, value: {{value}})]
@@ -455,6 +472,7 @@ module Binary
           {% end %}
         {% end %}
       {% end %}
+      # :nodoc:
       macro __binary_stage2
         \{% widths = { __binary_none: 0, {% for pair in enum_entries %} {{pair[0]}}: sizeof({{pair[1]}}), {% end %} } %}
         __binary_generate(\{{ widths }})
@@ -867,6 +885,7 @@ module Binary
           {% if e[:varint] %}
             {% vcat = elem ? e[:ecat] : e[:cat] %}
             {% raise "#{e[:label].id}: `varint:` needs an integer or enum type" unless vcat == :int || vcat == :enum %}
+            {% raise "#{e[:label].id}: `varint:` supports up to 64-bit integers" if vcat == :int && ["Int128", "UInt128"].includes?((elem ? elem : t).name.stringify) %}
             {% raise "#{e[:label].id}: `varint:` cannot be combined with `size_of:`" if a[:size_of] %}
             {% if elem %}
               {% e[:ewidth] = nil %}
@@ -1073,6 +1092,18 @@ module Binary
         end
       {% end %}
 
+      # :nodoc:
+      #
+      # Recomputes every derived field (`value:`, `length:`/`count:` targets)
+      # except `size_of:` fields, so getters reflect setter changes made
+      # since construction. Called first thing from `write`, `write_to`,
+      # `byte_size` and each `__binary_size_after_*`.
+      private def __binary_refresh_derived : Nil
+        {% for e in fields.select { |x| x[:derived] && !x[:size_of] } %}
+          @{{e[:name]}} = {{e[:write_value]}}
+        {% end %}
+      end
+
       {% unless fixed %}
       # Reads one record from *io*. Raises `IO::EOFError` on truncated input.
       def self.read(io : IO) : self
@@ -1087,6 +1118,7 @@ module Binary
       # Parses one record starting at *offset* and returns it with the number
       # of bytes consumed.
       def self.from_slice(bytes : Bytes, offset : Int) : {self, Int32}
+        raise IO::EOFError.new if offset < 0 || offset > bytes.size
         io = ::IO::Memory.new(bytes + offset, writable: false)
         {read(io), io.pos.to_i32}
       end
@@ -1111,6 +1143,11 @@ module Binary
             {% end %}
           {% end %}
         {% end %}
+        {% if entries.any? { |x| x[:size_of] } %}
+          if (%sized = __io).is_a?(::IO::Sized)
+            %sized.skip(%sized.read_remaining)
+          end
+        {% end %}
         {% for e in fields %}
           @{{e[:name]}} = {{e[:name]}}
         {% end %}
@@ -1118,6 +1155,12 @@ module Binary
 
       # Writes this record to *io*.
       def write(__io : IO) : Nil
+        __binary_refresh_derived
+        {% for e in entries %}
+          {% if e[:kind] == :field && e[:size_of] %}
+            @{{e[:name]}} = {{e[:write_value]}}
+          {% end %}
+        {% end %}
         {% for e in entries %}
           {% if e[:kind] == :pad %}
             {% if e[:width] > 0 %} ::Binary::Format::Codec.write_zeros(__io, {{e[:width]}}) {% end %}
@@ -1156,6 +1199,7 @@ module Binary
           # :nodoc:
           private def {{point[0]}} : Int32
         {% end %}
+          __binary_refresh_derived
           __binary_size = 0
           {% for e in entries %}
             {% if e[:pos] >= point[1] %}
@@ -1231,6 +1275,7 @@ module Binary
         # returns `SIZE`. Raises `ArgumentError` if *bytes* is too small.
         def write_to(bytes : Bytes) : Int32
           raise ArgumentError.new("need #{SIZE} bytes, got #{bytes.size}") if bytes.size < SIZE
+          __binary_refresh_derived
           __ptr = bytes.to_unsafe
           {% for e in entries %}
             {% if e[:kind] == :pad %}
@@ -1260,6 +1305,7 @@ module Binary
 
         # Returns `SIZE`.
         def byte_size : Int32
+          __binary_refresh_derived
           SIZE
         end
 

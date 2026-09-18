@@ -74,6 +74,12 @@ module Binary
       else
         io = @io.not_nil!
         needed = (n + 7) // 8
+        if @staged_pos > 0
+          remaining = @staged_count - @staged_pos
+          (@staged.to_slice + @staged_pos).copy_to(@staged.to_unsafe, remaining) if remaining > 0
+          @staged_count = remaining
+          @staged_pos = 0
+        end
         staged_remaining = @staged_count - @staged_pos
         while staged_remaining < needed
           byte = io.read_byte
