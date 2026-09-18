@@ -12,3 +12,5 @@ end
 
 require "./binary/varint"
 require "./binary/frame"
+require "./binary/bit_order"
+require "./binary/bit_io"
