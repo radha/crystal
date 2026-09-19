@@ -185,5 +185,14 @@ describe Redis::RESP do
     it "raises ProtocolError on EOF inside an aggregate" do
       expect_raises(Redis::ProtocolError) { parse("*2\r\n+a\r\n") }
     end
+    it "rejects a null map" do
+      expect_raises(Redis::ProtocolError, /null map/) { parse("%-1\r\n") }
+    end
+    it "rejects a null set" do
+      expect_raises(Redis::ProtocolError, /null set/) { parse("~-1\r\n") }
+    end
+    it "parses a large but legal count beyond the presize hint cap" do
+      parse("*5000\r\n" + ":1\r\n" * 5000).as(Array).size.should eq(5000)
+    end
   end
 end
