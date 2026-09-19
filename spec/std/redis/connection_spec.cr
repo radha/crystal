@@ -75,10 +75,13 @@ describe Redis::Connection do
       end
     end
     Redis::Connection.new(server.url, password: "p", client_name: "app").close
-    seen.should eq([["HELLO", "3", "AUTH", "default", "p", "SETNAME", "app"], ["AUTH", "default", "p"], ["CLIENT", "SETNAME", "app"]])
+    seen.should eq([["HELLO", "3", "AUTH", "default", "p", "SETNAME", "app"], ["AUTH", "p"], ["CLIENT", "SETNAME", "app"]])
+    seen.clear
+    Redis::Connection.new(server.url, username: "u", password: "p", client_name: "app").close
+    seen.should eq([["HELLO", "3", "AUTH", "u", "p", "SETNAME", "app"], ["AUTH", "u", "p"], ["CLIENT", "SETNAME", "app"]])
     seen.clear
     Redis::Connection.new(server.url, protocol: 2, password: "p").close
-    seen.should eq([["AUTH", "default", "p"]])
+    seen.should eq([["AUTH", "p"]])
     server.close
   end
 
