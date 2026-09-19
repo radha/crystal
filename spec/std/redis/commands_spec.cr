@@ -267,6 +267,12 @@ describe "list commands" do
     expect_call(2_i64, ["LINSERT", "l", "BEFORE", "b", "a"], &.linsert("l", :before, "b", "a")).should eq(2_i64)
     expect_call("a", ["LMOVE", "l", "m", "LEFT", "RIGHT"], &.lmove("l", "m", :left, :right)).should eq("a")
   end
+
+  it "rejects unknown position symbols" do
+    expect_raises(ArgumentError, /:before or :after/) { stub(nil).linsert("l", :middle, "b", "a") }
+    expect_raises(ArgumentError, /:left or :right/) { stub(nil).lmove("l", "m", :up, :left) }
+    expect_raises(ArgumentError, /:left or :right/) { stub(nil).lmove("l", "m", :left, :down) }
+  end
 end
 
 describe "set commands" do
