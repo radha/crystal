@@ -87,6 +87,9 @@ module Redis
 
     # :nodoc:
     struct Parser
+      # Presize hint cap: the count itself is still bounded by max_bulk_size.
+      PRESIZE_LIMIT = 4096
+
       def initialize(@io : IO, @max_bulk_size : Int32, @max_depth : Int32, @push : (Array(Value) ->)?)
       end
 
@@ -225,14 +228,18 @@ module Redis
         count = read_length
         return nil if count < 0
         depth = enter(depth)
-        Array(Value).new(count) { read_value(depth) }
+        hint = Math.min(count, PRESIZE_LIMIT)
+        array = Array(Value).new(hint)
+        count.times { array << read_value(depth) }
+        array
       end
 
       private def read_map_body(depth : Int32) : Hash(Value, Value)
         count = read_length
         raise ProtocolError.new("null map") if count < 0
         depth = enter(depth)
-        hash = Hash(Value, Value).new(initial_capacity: count)
+        hint = Math.min(count, PRESIZE_LIMIT)
+        hash = Hash(Value, Value).new(initial_capacity: hint)
         count.times do
           key = read_value(depth)
           hash[key] = read_value(depth)
@@ -244,7 +251,8 @@ module Redis
         count = read_length
         raise ProtocolError.new("null set") if count < 0
         depth = enter(depth)
-        set = Set(Value).new(count)
+        hint = Math.min(count, PRESIZE_LIMIT)
+        set = Set(Value).new(hint)
         count.times { set << read_value(depth) }
         set
       end
