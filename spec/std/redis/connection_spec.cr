@@ -117,6 +117,63 @@ describe Redis::Connection do
     expect_raises(Redis::ConnectionError) { Redis::Connection.new("redis://127.0.0.1:#{port}", connect_timeout: 1.second) }
   end
 
+  it "wraps a failed TLS handshake in ConnectionError" do
+    server = RedisSpec::FakeServer.new do |io|
+      io << "nope\r\n"
+      io.flush
+    end
+    context = OpenSSL::SSL::Context::Client.new
+    context.verify_mode = OpenSSL::SSL::VerifyMode::NONE
+    expect_raises(Redis::ConnectionError) do
+      Redis::Connection.new("rediss://127.0.0.1:#{server.port}", tls_context: context)
+    end
+    server.close
+  end
+
+  it "closes and raises ProtocolError on a truncated frame" do
+    server = RedisSpec::FakeServer.new do |io|
+      cmd = RedisSpec::FakeServer.read_command(io)
+      RedisSpec::FakeServer.serve_hello(io, cmd.not_nil!)
+      RedisSpec::FakeServer.read_command(io)
+      io << "+PON"
+      io.flush
+      io.close
+    end
+    conn = Redis::Connection.new(server.url)
+    expect_raises(Redis::ProtocolError) { conn.ping }
+    conn.closed?.should be_true
+    server.close
+  end
+
+  it "does not resend AUTH/SETNAME when HELLO succeeds and reports proto 2" do
+    seen = [] of Array(String)
+    server = RedisSpec::FakeServer.new do |io|
+      while cmd = RedisSpec::FakeServer.read_command(io)
+        seen << cmd
+        io << (cmd[0] == "HELLO" ? "%1\r\n$5\r\nproto\r\n:2\r\n" : "+OK\r\n")
+        io.flush
+      end
+    end
+    conn = Redis::Connection.new(server.url, password: "p", client_name: "app")
+    conn.protocol.should eq(2)
+    seen.should eq([["HELLO", "3", "AUTH", "default", "p", "SETNAME", "app"]])
+    conn.close
+    server.close
+  end
+
+  it "reads proto from a flat-array HELLO reply" do
+    server = RedisSpec::FakeServer.new do |io|
+      while cmd = RedisSpec::FakeServer.read_command(io)
+        io << (cmd[0] == "HELLO" ? "*2\r\n$5\r\nproto\r\n:2\r\n" : "+OK\r\n")
+        io.flush
+      end
+    end
+    conn = Redis::Connection.new(server.url)
+    conn.protocol.should eq(2)
+    conn.close
+    server.close
+  end
+
   it "raises CommandError on error replies and keeps the connection usable" do
     server = echo_server { |io, cmd| cmd[0] == "BAD" && (io << "-WRONGTYPE nope\r\n"; true) }
     conn = Redis::Connection.new(server.url)
