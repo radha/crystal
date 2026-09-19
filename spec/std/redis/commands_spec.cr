@@ -223,3 +223,79 @@ describe "string commands" do
     expect_call(5_i64, ["SETRANGE", "k", 1, "xy"], &.setrange("k", 1, "xy")).should eq(5_i64)
   end
 end
+
+describe "hash commands" do
+  it "hget / hset / hsetnx / hmget / hgetall / hdel / hexists / hkeys / hvals / hlen" do
+    expect_call("v", ["HGET", "h", "f"], &.hget("h", "f")).should eq("v")
+    expect_call(1_i64, ["HSET", "h", "f", "v"], &.hset("h", "f", "v")).should eq(1_i64)
+    expect_call(2_i64, ["HSET", "h", "a", "1", "b", "2"], &.hset("h", {"a" => "1", "b" => "2"})).should eq(2_i64)
+    expect_call(1_i64, ["HSETNX", "h", "f", "v"], &.hsetnx("h", "f", "v")).should be_true
+    expect_call(["1", nil] of Redis::Value, ["HMGET", "h", "a", "z"], &.hmget("h", "a", "z")).should eq(["1", nil])
+    expect_call({"a" => "1"} of Redis::Value => Redis::Value, ["HGETALL", "h"], &.hgetall("h")).should eq({"a" => "1"})
+    expect_call(["a", "1"] of Redis::Value, ["HGETALL", "h"], &.hgetall("h")).should eq({"a" => "1"})
+    expect_call(1_i64, ["HDEL", "h", "a", "b"], &.hdel("h", "a", "b")).should eq(1_i64)
+    expect_call(0_i64, ["HEXISTS", "h", "a"], &.hexists("h", "a")).should be_false
+    expect_call(["a"] of Redis::Value, ["HKEYS", "h"], &.hkeys("h")).should eq(["a"])
+    expect_call(["1"] of Redis::Value, ["HVALS", "h"], &.hvals("h")).should eq(["1"])
+    expect_call(1_i64, ["HLEN", "h"], &.hlen("h")).should eq(1_i64)
+    expect_call(3_i64, ["HINCRBY", "h", "n", 2], &.hincrby("h", "n", 2)).should eq(3_i64)
+    expect_call("1.5", ["HINCRBYFLOAT", "h", "n", 0.5], &.hincrbyfloat("h", "n", 0.5)).should eq(1.5)
+  end
+
+  it "hscan returns cursor and a hash" do
+    reply = ["0", ["a", "1"] of Redis::Value] of Redis::Value
+    expect_call(reply, ["HSCAN", "h", "0", "MATCH", "a*", "COUNT", 5], &.hscan("h", "0", match: "a*", count: 5)).should eq({"0", {"a" => "1"}})
+  end
+end
+
+describe "list commands" do
+  it "push / pop / len / range" do
+    expect_call(2_i64, ["LPUSH", "l", "a", "b"], &.lpush("l", "a", "b")).should eq(2_i64)
+    expect_call(2_i64, ["RPUSH", "l", "a"], &.rpush("l", "a")).should eq(2_i64)
+    expect_call(0_i64, ["LPUSHX", "l", "a"], &.lpushx("l", "a")).should eq(0_i64)
+    expect_call(0_i64, ["RPUSHX", "l", "a"], &.rpushx("l", "a")).should eq(0_i64)
+    expect_call("a", ["LPOP", "l"], &.lpop("l")).should eq("a")
+    expect_call(nil, ["RPOP", "l"], &.rpop("l")).should be_nil
+    expect_call(["a", "b"] of Redis::Value, ["LPOP", "l", 2], &.lpop("l", 2)).should eq(["a", "b"])
+    expect_call(nil, ["RPOP", "l", 2], &.rpop("l", 2)).should eq([] of String)
+    expect_call(3_i64, ["LLEN", "l"], &.llen("l")).should eq(3_i64)
+    expect_call(["a"] of Redis::Value, ["LRANGE", "l", 0, -1], &.lrange("l", 0, -1)).should eq(["a"])
+    expect_call("a", ["LINDEX", "l", 0], &.lindex("l", 0)).should eq("a")
+    expect_call("OK", ["LSET", "l", 0, "z"], &.lset("l", 0, "z")).should be_nil
+    expect_call(1_i64, ["LREM", "l", 0, "a"], &.lrem("l", 0, "a")).should eq(1_i64)
+    expect_call("OK", ["LTRIM", "l", 0, 1], &.ltrim("l", 0, 1)).should be_nil
+    expect_call(2_i64, ["LINSERT", "l", "BEFORE", "b", "a"], &.linsert("l", :before, "b", "a")).should eq(2_i64)
+    expect_call("a", ["LMOVE", "l", "m", "LEFT", "RIGHT"], &.lmove("l", "m", :left, :right)).should eq("a")
+  end
+end
+
+describe "set commands" do
+  it "add / rem / members / card / pop / rand / move / is-member" do
+    expect_call(2_i64, ["SADD", "s", "a", "b"], &.sadd("s", "a", "b")).should eq(2_i64)
+    expect_call(1_i64, ["SREM", "s", "a"], &.srem("s", "a")).should eq(1_i64)
+    expect_call(Set(Redis::Value){"a"}, ["SMEMBERS", "s"], &.smembers("s")).should eq(["a"])
+    expect_call(["a"] of Redis::Value, ["SMEMBERS", "s"], &.smembers("s")).should eq(["a"])
+    expect_call(1_i64, ["SISMEMBER", "s", "a"], &.sismember("s", "a")).should be_true
+    expect_call([1_i64, 0_i64] of Redis::Value, ["SMISMEMBER", "s", "a", "b"], &.smismember("s", "a", "b")).should eq([true, false])
+    expect_call(1_i64, ["SCARD", "s"], &.scard("s")).should eq(1_i64)
+    expect_call("a", ["SPOP", "s"], &.spop("s")).should eq("a")
+    expect_call(["a"] of Redis::Value, ["SPOP", "s", 1], &.spop("s", 1)).should eq(["a"])
+    expect_call("a", ["SRANDMEMBER", "s"], &.srandmember("s")).should eq("a")
+    expect_call(["a"] of Redis::Value, ["SRANDMEMBER", "s", 1], &.srandmember("s", 1)).should eq(["a"])
+    expect_call(1_i64, ["SMOVE", "s", "t", "a"], &.smove("s", "t", "a")).should be_true
+  end
+
+  it "set algebra" do
+    expect_call(["a"] of Redis::Value, ["SINTER", "s", "t"], &.sinter("s", "t")).should eq(["a"])
+    expect_call(["a"] of Redis::Value, ["SUNION", "s", "t"], &.sunion("s", "t")).should eq(["a"])
+    expect_call(["a"] of Redis::Value, ["SDIFF", "s", "t"], &.sdiff("s", "t")).should eq(["a"])
+    expect_call(1_i64, ["SINTERSTORE", "d", "s", "t"], &.sinterstore("d", "s", "t")).should eq(1_i64)
+    expect_call(1_i64, ["SUNIONSTORE", "d", "s", "t"], &.sunionstore("d", "s", "t")).should eq(1_i64)
+    expect_call(1_i64, ["SDIFFSTORE", "d", "s", "t"], &.sdiffstore("d", "s", "t")).should eq(1_i64)
+  end
+
+  it "sscan" do
+    reply = ["0", ["a"] of Redis::Value] of Redis::Value
+    expect_call(reply, ["SSCAN", "s", "0", "COUNT", 3], &.sscan("s", "0", count: 3)).should eq({"0", ["a"]})
+  end
+end
