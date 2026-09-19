@@ -153,12 +153,20 @@ describe Redis::RESP do
     it "set" do
       parse("~3\r\n+a\r\n:1\r\n#t\r\n").should eq(Set(Redis::Value){"a", 1_i64, true})
     end
+    it "empty map" { parse("%0\r\n").should eq({} of Redis::Value => Redis::Value) }
+    it "empty set" { parse("~0\r\n").should eq(Set(Redis::Value).new) }
     it "nested errors stay values" do
       arr = parse("*2\r\n+OK\r\n-ERR bad\r\n").as(Array)
       arr[1].as(Redis::CommandError).code.should eq("ERR")
     end
     it "discards attributes and returns the following value" do
       parse("|1\r\n+ttl\r\n:3600\r\n:2039123\r\n").should eq(2039123_i64)
+    end
+    it "discards several consecutive attributes and returns the following value" do
+      parse("|0\r\n" * 3 + "+x\r\n").should eq("x")
+    end
+    it "rejects attribute frames nested deeper than max_depth" do
+      expect_raises(Redis::ProtocolError, /depth/) { parse("|0\r\n" * 600 + "+x\r\n", max_depth: 512) }
     end
     it "routes push frames to the handler and keeps reading" do
       pushes = [] of Array(Redis::Value)

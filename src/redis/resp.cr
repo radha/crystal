@@ -128,7 +128,7 @@ module Redis
         when '*' then read_array_body(depth)
         when '%' then read_map_body(depth)
         when '~' then read_set_body(depth)
-        when '|' then read_map_body(depth); read_value(depth)
+        when '|' then read_map_body(depth); read_value(enter(depth))
         when '>' then raise ProtocolError.new("push frame inside an aggregate")
         else          raise ProtocolError.new("unknown RESP type byte #{type.unsafe_chr.inspect}")
         end
