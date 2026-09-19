@@ -27,8 +27,9 @@ module Redis
     end
 
     # The typed reply. Raises `ArgumentError` before the pipeline executes,
-    # the `CommandError` or `ConnectionError` the command failed with, or
-    # `ProtocolError` if the reply has an unexpected shape.
+    # the `CommandError`, `ConnectionError` or `IO::TimeoutError` the
+    # command failed with, or `ProtocolError` if the reply has an
+    # unexpected shape.
     def value : T
       raise ArgumentError.new("pipeline not executed yet") unless @resolved
       raw = @raw

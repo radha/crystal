@@ -18,6 +18,10 @@ module Redis
   # `call` accepts any command, including blocking ones, but a blocking
   # command holds up every other caller until it returns; use a dedicated
   # `Connection` for those.
+  #
+  # Connecting happens under the client's lock, so concurrent callers wait
+  # for one connection attempt and `close` may block for up to
+  # `connect_timeout` while a connect is in flight.
   class Client
     include Commands
 
@@ -34,8 +38,10 @@ module Redis
 
     # Receives RESP3 push frames as the reader fiber decodes them.
     # Assigning it takes effect on the very next frame, on the connection
-    # that is open as well as on later ones. An exception raised by the
-    # handler tears the connection down and fails every command in flight.
+    # that is open as well as on later ones. The handler runs on the
+    # reader fiber, so a slow handler stalls every reply on that
+    # connection; an exception raised by it tears the connection down and
+    # fails every command in flight.
     property push_handler : (Array(Value) ->)?
 
     @mutex = Mutex.new
@@ -92,16 +98,16 @@ module Redis
 
     # :ditto:
     def call(args : Indexable) : Value
-      waiter, wakeup = @mutex.synchronize do
+      waiter, wakeup, conn = @mutex.synchronize do
         check_open
-        ensure_connected
+        c = ensure_connected
         RESP.write_command(@out, args)
         w = take_waiter
         @pending.push(w)
-        {w, @wakeup}
+        {w, @wakeup, c}
       end
       signal(wakeup)
-      value, error = wait(waiter)
+      value, error = wait(waiter, conn)
       raise error if error
       raise value if value.is_a?(CommandError)
       value
@@ -116,7 +122,9 @@ module Redis
     # single write, and returns the raw replies in order. Error replies
     # stay in the array as `CommandError` values (and are raised by the
     # corresponding `Future#value`); a lost connection raises
-    # `ConnectionError` after every future has been resolved.
+    # `ConnectionError`, and an expired `read_timeout` raises
+    # `IO::TimeoutError`, in both cases after every future has been
+    # resolved with that failure.
     #
     # ```
     # first = nil
@@ -129,18 +137,20 @@ module Redis
     def pipelined(& : Pipeline ->) : Array(Value)
       pipeline = Pipeline.new
       yield pipeline
+      # A closed client raises even when the block queued nothing.
+      @mutex.synchronize { check_open }
       return [] of Value if pipeline.size == 0
       waiters = Array(Waiter).new(pipeline.size)
-      wakeup = @mutex.synchronize do
+      wakeup, conn = @mutex.synchronize do
         check_open
-        ensure_connected
+        c = ensure_connected
         @out.write(pipeline.buffer.to_slice)
         pipeline.size.times do
           w = take_waiter
           @pending.push(w)
           waiters << w
         end
-        @wakeup
+        {@wakeup, c}
       end
       signal(wakeup)
       results = Array(Value).new(waiters.size)
@@ -148,7 +158,7 @@ module Redis
       resolved = 0
       begin
         waiters.each_with_index do |waiter, i|
-          value, error = wait(waiter)
+          value, error = wait(waiter, conn)
           if error
             pipeline.resolve(i, error)
             failure ||= error
@@ -221,17 +231,22 @@ module Redis
     end
 
     # Blocks until the reader or a disconnect delivers into *waiter* and
-    # returns its reply and the failure that ended it, if any. A waiter
-    # that timed out is abandoned (its channel will still receive the
-    # disconnect), so only clean completions return to the pool.
-    private def wait(waiter : Waiter) : {Value, ConnectionError?}
+    # returns its reply and the failure that ended it, if any. *conn* is
+    # the connection the command was enqueued on. A waiter that timed out
+    # is abandoned (its channel will still receive the disconnect), so
+    # only clean completions return to the pool.
+    private def wait(waiter : Waiter, conn : Connection) : {Value, ConnectionError?}
       value = if deadline = @read_timeout
                 select
                 when r = waiter.channel.receive
                   r
                 when timeout(deadline)
-                  conn = @connection
-                  disconnect(conn, IO::TimeoutError.new("Redis command timed out after #{deadline}")) if conn
+                  # *conn*, never `@connection`: by the time the timeout
+                  # fires the client may already have reconnected, and
+                  # tearing that fresh connection down would fail commands
+                  # belonging to other callers. `disconnect` compares it
+                  # with the current connection, so a stale one is a no-op.
+                  disconnect(conn, IO::TimeoutError.new("Redis command timed out after #{deadline}"))
                   raise IO::TimeoutError.new("Redis command timed out after #{deadline}")
                 end
               else
@@ -273,7 +288,12 @@ module Redis
       socket = conn.socket
       loop do
         value = RESP.read(socket, max_bulk_size: @max_bulk_size, push: @push_handler)
-        waiter = @mutex.synchronize { @pending.shift? }
+        waiter = @mutex.synchronize do
+          # A reader whose connection has been replaced stops, mirroring
+          # `write_loop`; `disconnect` has already failed its waiters.
+          return unless @connection.same?(conn)
+          @pending.shift?
+        end
         raise ProtocolError.new("unsolicited reply #{value.inspect}") unless waiter
         waiter.channel.send(value)
       end
