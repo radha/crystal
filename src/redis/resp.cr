@@ -17,8 +17,9 @@ module Redis
       write_command(io, args)
     end
 
-    # :ditto:
-    def self.write_command(io : IO, args : Enumerable) : Nil
+    # :ditto: *args* is an `Indexable` (for example an `Array`, `Tuple`, or
+    # `Deque`) so its size can be read without draining it.
+    def self.write_command(io : IO, args : Indexable) : Nil
       io << '*' << args.size << "\r\n"
       args.each { |arg| write_bulk(io, arg) }
     end
