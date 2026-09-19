@@ -177,6 +177,15 @@ module Redis
       def self.unexpected(v : Value, expected : String) : NoReturn
         raise ProtocolError.new("unexpected reply: expected #{expected}, got #{v.inspect}")
       end
+
+      # `{cursor, elements}` as returned by the SCAN family.
+      def self.scan_page(v : Value) : {String, Array(String)}
+        page = elements(v, "scan page")
+        unexpected(v, "scan page") unless page.size == 2
+        {string(page[0]), strings(page[1])}
+      end
     end
   end
 end
+
+require "./commands/*"
