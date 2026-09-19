@@ -155,6 +155,7 @@ describe "key commands" do
     expect_call(1_i64, ["EXPIRE", "a", 60], &.expire("a", 60.seconds)).should be_true
     expect_call(1_i64, ["EXPIRE", "a", 5, "NX"], &.expire("a", 5, nx: true)).should be_true
     expect_call(1_i64, ["PEXPIRE", "a", 1500], &.pexpire("a", 1.5.seconds)).should be_true
+    expect_call(1_i64, ["PEXPIRE", "a", 1500, "NX"], &.expire("a", 1.5.seconds, nx: true)).should be_true
     expect_call(0_i64, ["EXPIREAT", "a", 1700000000], &.expireat("a", 1700000000)).should be_false
     expect_call(1_i64, ["PEXPIREAT", "a", 1700000000000, "GT"], &.pexpireat("a", 1700000000000, gt: true)).should be_true
     expect_call(-2_i64, ["TTL", "a"], &.ttl("a")).should eq(-2_i64)
@@ -184,6 +185,8 @@ describe "string commands" do
     expect_call(nil, ["GET", "k"], &.get("k")).should be_nil
     expect_call("OK", ["SET", "k", "v"], &.set("k", "v")).should eq("OK")
     expect_call("OK", ["SET", "k", "v", "EX", 60], &.set("k", "v", ex: 60.seconds)).should eq("OK")
+    expect_call("OK", ["SET", "k", "v", "EX", 2], &.set("k", "v", ex: 2.seconds)).should eq("OK")
+    expect_call("OK", ["SET", "k", "v", "PX", 1500], &.set("k", "v", ex: 1.5.seconds)).should eq("OK")
     expect_call("OK", ["SET", "k", "v", "PX", 1500, "NX"], &.set("k", "v", px: 1500, nx: true)).should eq("OK")
     expect_call(nil, ["SET", "k", "v", "XX", "KEEPTTL"], &.set("k", "v", xx: true, keepttl: true)).should be_nil
     expect_call("old", ["SET", "k", "v", "GET"], &.set("k", "v", get: true)).should eq("old")
@@ -199,6 +202,7 @@ describe "string commands" do
   it "setnx / setex / psetex / getset / getdel / mget / mset / msetnx" do
     expect_call(1_i64, ["SETNX", "k", "v"], &.setnx("k", "v")).should be_true
     expect_call("OK", ["SETEX", "k", 10, "v"], &.setex("k", 10.seconds, "v")).should be_nil
+    expect_call("OK", ["PSETEX", "k", 1500, "v"], &.setex("k", 1.5.seconds, "v")).should be_nil
     expect_call("OK", ["PSETEX", "k", 10, "v"], &.psetex("k", 10, "v")).should be_nil
     expect_call("old", ["GETSET", "k", "v"], &.getset("k", "v")).should eq("old")
     expect_call("v", ["GETDEL", "k"], &.getdel("k")).should eq("v")
