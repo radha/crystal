@@ -8,11 +8,23 @@ module RedisSpec
 
   HELLO_REPLY = "%3\r\n$6\r\nserver\r\n$5\r\nredis\r\n$5\r\nproto\r\n:3\r\n$2\r\nid\r\n:1\r\n"
 
-  # Whether a server answers at URL. Probed once, at load, with a short timeout.
+  # Whether a server answers at URL. Probed once, at load, with a short
+  # round trip: a bare TCP connect can appear to succeed on some hosts even
+  # with nothing listening (the refusal only surfaces on a later syscall),
+  # so this sends a real PING and requires a real reply instead of trusting
+  # `connect` alone.
   AVAILABLE = begin
     uri = URI.parse(URL)
-    TCPSocket.new(uri.host || "localhost", uri.port || 6379, connect_timeout: 0.2.seconds).close
-    true
+    sock = TCPSocket.new(uri.host || "localhost", uri.port || 6379, connect_timeout: 0.2.seconds)
+    begin
+      sock.read_timeout = 0.2.seconds
+      sock << "*1\r\n$4\r\nPING\r\n"
+      sock.flush
+      reply = Redis::RESP.read(sock)
+      reply.is_a?(String) || reply.is_a?(Redis::CommandError)
+    ensure
+      sock.close
+    end
   rescue
     false
   end
