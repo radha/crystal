@@ -58,6 +58,11 @@ describe Redis::Client do
     server.close
   end
 
+  # Relies on the single-threaded scheduler: `spawn` only enqueues, so all
+  # 32 callers append to the outbound buffer before the writer fiber gets a
+  # turn and they leave in one write. Under a parallel execution context
+  # this would need a synchronization point (a barrier releasing the
+  # callers together) instead of the spawn ordering.
   it "batches commands from concurrent fibers into one write" do
     script = Script.new
     server = script.server
