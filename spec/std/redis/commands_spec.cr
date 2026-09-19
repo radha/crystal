@@ -342,6 +342,13 @@ describe "sorted set commands" do
     expect_raises(ArgumentError) { stub(nil).zrange("z", 0, 1, by_score: true, by_lex: true) }
   end
 
+  it "rejects contradictory zadd and zrange options" do
+    expect_raises(ArgumentError, /gt and lt/) { stub(1_i64).zadd("z", [{"a", 1.0}], gt: true, lt: true) }
+    expect_raises(ArgumentError, /nx cannot/) { stub(1_i64).zadd("z", [{"a", 1.0}], nx: true, gt: true) }
+    expect_raises(ArgumentError, /nx cannot/) { stub(1.0).zadd_incr("z", 1.0, "a", nx: true, lt: true) }
+    expect_raises(ArgumentError, /with_scores/) { stub(nil).zrange_with_scores("z", "[a", "[z", by_lex: true) }
+  end
+
   it "zpopmin / zpopmax" do
     expect_call(["a", "1"] of Redis::Value, ["ZPOPMIN", "z"], &.zpopmin("z")).should eq([{"a", 1.0}])
     expect_call([["a", 1.0] of Redis::Value] of Redis::Value, ["ZPOPMAX", "z", 2], &.zpopmax("z", 2)).should eq([{"a", 1.0}])
