@@ -26,7 +26,8 @@ describe RedisSpec::FakeServer do
     end
   end
 
-  it "reports availability of a live server as a Bool" do
-    RedisSpec::AVAILABLE.should be_a(Bool)
+  it "parses RedisSpec::URL into a URI with a host" do
+    uri = URI.parse(RedisSpec::URL)
+    uri.host.should_not be_nil
   end
 end

@@ -36,6 +36,7 @@
 require "socket"
 require "openssl"
 require "uri"
+require "set"
 require "./redis/error"
 require "./redis/value"
 require "./redis/resp"

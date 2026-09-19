@@ -86,11 +86,3 @@ def pending_redis(description = "assert", file = __FILE__, line = __LINE__, end_
     pending("#{description} [no redis server at #{RedisSpec::URL}]", file, line, end_line)
   end
 end
-
-def pending_redis(*, describe, file = __FILE__, line = __LINE__, end_line = __END_LINE__, &block)
-  if RedisSpec::AVAILABLE
-    describe(describe, file, line, end_line, &block)
-  else
-    pending("#{describe} [no redis server at #{RedisSpec::URL}]", file, line, end_line)
-  end
-end

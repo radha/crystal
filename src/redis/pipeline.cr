@@ -1,6 +1,10 @@
 module Redis
   # :nodoc:
   abstract class AbstractFuture
+    # *raw* is `Value | Exception`, not `Value | ConnectionError`: besides
+    # `ConnectionError`, `IO::TimeoutError` also flows through here when a
+    # pipeline's `read_timeout` expires, and `Future#value` raises whatever
+    # `Exception` was resolved.
     abstract def resolve(raw : Value | Exception) : Nil
   end
 
@@ -55,7 +59,10 @@ module Redis
 
     # Number of queued commands.
     getter size = 0
+    # :nodoc:
+    #
     # The encoded commands, appended to the client's outbound buffer.
+    # Internal to `Client#pipelined`.
     getter buffer = IO::Memory.new
     @futures = [] of AbstractFuture
 
@@ -80,6 +87,9 @@ module Redis
 
     # :nodoc:
     def resolve(index : Int32, raw : Value | Exception) : Nil
+      # See `AbstractFuture#resolve`: *raw* is `Value | Exception`, not
+      # `Value | ConnectionError`, because `IO::TimeoutError` also flows
+      # through here.
       @futures[index].resolve(raw)
     end
 

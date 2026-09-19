@@ -6,6 +6,10 @@ module Redis
   # Raised when a connection cannot be established, is lost, or is used
   # after `close`. In-flight commands on a multiplexed `Client` receive this
   # error when the connection drops.
+  #
+  # This does not mean the command did not execute: if its bytes reached
+  # the server before the connection dropped, the command may have run and
+  # only its reply was lost. There is no automatic retry.
   class ConnectionError < Error
   end
 
