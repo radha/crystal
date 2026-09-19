@@ -18,6 +18,8 @@ module Redis
   class Connection
     include Commands
 
+    # The default URL used when `new` is given none: localhost on the
+    # standard Redis port, protocol negotiation on, no auth, database 0.
     DEFAULT_URL = "redis://localhost:6379"
 
     # The parsed server URL.
@@ -33,7 +35,18 @@ module Redis
     @username : String?
     @password : String?
     @db : Int32?
+    @max_bulk_size : Int32
 
+    # Connects to *url* (or `DEFAULT_URL`) and runs the handshake: `HELLO 3`
+    # (falling back to RESP2 if the server does not understand it, unless
+    # *protocol* is `2`, which skips `HELLO` and speaks RESP2 with legacy
+    # `AUTH`/`CLIENT SETNAME`), then `SELECT` if a database is set. *db*,
+    # *username* and *password* override the corresponding parts of *url*
+    # (its path/`?db=` query parameter and userinfo). Raises `ArgumentError`
+    # for an unsupported URL scheme, an invalid database, or *protocol*
+    # outside `2..3`; raises `ConnectionError` if the socket cannot be
+    # opened; raises `CommandError` if the server rejects the handshake
+    # (for example a bad password).
     def initialize(url : String | URI = DEFAULT_URL, *, db : Int32? = nil, username : String? = nil,
                    password : String? = nil, client_name : String? = nil, protocol : Int32 = 3,
                    connect_timeout : Time::Span = 5.seconds, read_timeout : Time::Span? = nil,
@@ -58,13 +71,13 @@ module Redis
     # :nodoc:
     def self.db_from(url : URI) : Int32?
       if db = url.query_params["db"]?
-        return db.to_i
+        return db.to_i? || raise ArgumentError.new("invalid database in URL #{url}: #{db.inspect}")
       end
       # For unix schemes the path is the socket path, not a database index.
       return nil if url.scheme == "redis+unix" || url.scheme == "unix"
       path = url.path
       return nil if path.empty? || path == "/"
-      path.lchop('/').to_i? || raise ArgumentError.new("invalid database in URL path #{path.inspect}")
+      path.lchop('/').to_i? || raise ArgumentError.new("invalid database in URL #{url}: #{path.inspect}")
     end
 
     # :nodoc:
@@ -75,30 +88,46 @@ module Redis
         host = url.host.presence || "localhost"
         port = url.port || 6379
         tcp = TCPSocket.new(host, port, connect_timeout: connect_timeout)
-        tcp.tcp_nodelay = true
-        tcp.sync = false
-        tcp.read_timeout = read_timeout if read_timeout
-        if url.scheme == "rediss"
-          context = tls_context || OpenSSL::SSL::Context::Client.new
-          ssl = OpenSSL::SSL::Socket::Client.new(tcp, context: context, sync_close: true, hostname: host)
-          ssl.sync = false
-          ssl
-        else
-          tcp
+        begin
+          tcp.tcp_nodelay = true
+          tcp.sync = false
+          tcp.read_timeout = read_timeout if read_timeout
+          if url.scheme == "rediss"
+            context = tls_context || OpenSSL::SSL::Context::Client.new
+            ssl = OpenSSL::SSL::Socket::Client.new(tcp, context: context, sync_close: true, hostname: host)
+            ssl.sync = false
+            ssl
+          else
+            tcp
+          end
+        rescue ex : IO::Error | OpenSSL::SSL::Error
+          tcp.close rescue nil
+          raise ex
         end
       when "redis+unix", "unix"
         sock = UNIXSocket.new(url.path)
-        sock.sync = false
-        sock.read_timeout = read_timeout if read_timeout
-        sock
+        begin
+          sock.sync = false
+          sock.read_timeout = read_timeout if read_timeout
+          sock
+        rescue ex : IO::Error
+          sock.close rescue nil
+          raise ex
+        end
       else
         raise ArgumentError.new("unsupported URL scheme #{url.scheme.inspect}; expected redis, rediss or redis+unix")
       end
-    rescue ex : IO::Error
+    rescue ex : IO::Error | OpenSSL::SSL::Error
       raise ConnectionError.new("failed to connect to #{url}: #{ex.message}", cause: ex)
     end
 
     private def handshake(client_name : String?) : Nil
+      # True whenever the legacy `AUTH`/`CLIENT SETNAME` commands must run:
+      # either `HELLO` was never attempted (caller asked for RESP2 up
+      # front) or it was attempted and the server rejected it. A `HELLO`
+      # that *succeeds* never re-sends AUTH/SETNAME, whatever `proto` it
+      # reports back.
+      hello_failed = @protocol != 3
       if @protocol == 3
         args = Array(RESP::Arg).new(7)
         args << "HELLO" << "3"
@@ -108,16 +137,17 @@ module Redis
         args << "SETNAME" << client_name if client_name
         begin
           reply = call(args)
-          if proto = reply.as?(Hash).try(&.["proto"]?).as?(Int64)
-            @protocol = proto.to_i
+          if proto = Connection.proto_from(reply)
+            @protocol = proto
           end
         rescue ex : CommandError
           fallback = ex.code == "NOPROTO" || (ex.code == "ERR" && ex.message.to_s.includes?("unknown command"))
           raise ex unless fallback
           @protocol = 2
+          hello_failed = true
         end
       end
-      if @protocol == 2
+      if hello_failed
         if password = @password
           call({"AUTH", @username || "default", password})
         end
@@ -125,6 +155,30 @@ module Redis
       end
       if (db = @db) && db != 0
         call({"SELECT", db})
+      end
+    end
+
+    # :nodoc:
+    #
+    # The negotiated protocol version out of a `HELLO` reply, or `nil` if
+    # none is present. Accepts the RESP3 map shape and, for servers that
+    # answer `HELLO` with a flat array instead, scans it as key-value pairs.
+    def self.proto_from(reply : Value) : Int32?
+      case reply
+      when Hash
+        proto = reply["proto"]?
+        proto.is_a?(Int64) ? proto.to_i : nil
+      when Array
+        i = 0
+        while i < reply.size - 1
+          if reply[i] == "proto" && (proto = reply[i + 1]).is_a?(Int64)
+            return proto.to_i
+          end
+          i += 2
+        end
+        nil
+      else
+        nil
       end
     end
 
@@ -155,6 +209,9 @@ module Redis
       raise value if value.is_a?(CommandError)
       value
     rescue ex : IO::TimeoutError
+      close
+      raise ex
+    rescue ex : ProtocolError
       close
       raise ex
     rescue ex : IO::Error
@@ -190,6 +247,9 @@ module Redis
       @socket.flush
       Array(Value).new(count) { RESP.read(@socket, max_bulk_size: @max_bulk_size, push: @push_handler) }
     rescue ex : IO::TimeoutError
+      close
+      raise ex
+    rescue ex : ProtocolError
       close
       raise ex
     rescue ex : IO::Error
