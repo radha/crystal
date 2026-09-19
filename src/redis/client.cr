@@ -32,8 +32,10 @@ module Redis
       property error : ConnectionError?
     end
 
-    # Receives RESP3 push frames. Set before the first call, or it applies
-    # from the next reconnect.
+    # Receives RESP3 push frames as the reader fiber decodes them.
+    # Assigning it takes effect on the very next frame, on the connection
+    # that is open as well as on later ones. An exception raised by the
+    # handler tears the connection down and fails every command in flight.
     property push_handler : (Array(Value) ->)?
 
     @mutex = Mutex.new
@@ -143,15 +145,26 @@ module Redis
       signal(wakeup)
       results = Array(Value).new(waiters.size)
       failure = nil
-      waiters.each_with_index do |waiter, i|
-        value, error = wait(waiter)
-        if error
-          pipeline.resolve(i, error)
-          failure ||= error
-        else
-          pipeline.resolve(i, value)
-          results << value
+      resolved = 0
+      begin
+        waiters.each_with_index do |waiter, i|
+          value, error = wait(waiter)
+          if error
+            pipeline.resolve(i, error)
+            failure ||= error
+          else
+            pipeline.resolve(i, value)
+            results << value
+          end
+          resolved = i + 1
         end
+      rescue ex : IO::TimeoutError
+        # The timeout already tore the connection down. Every future that
+        # has not been given a reply is resolved with it, so that
+        # `Future#value` raises the timeout instead of reporting a
+        # pipeline that never executed.
+        (resolved...waiters.size).each { |j| pipeline.resolve(j, ex) }
+        raise ex
       end
       raise failure if failure
       results
@@ -247,15 +260,13 @@ module Redis
           end
         end
         next unless full
-        begin
-          socket.write(full.to_slice)
-          socket.flush
-        rescue ex : IO::Error
-          disconnect(conn, ex)
-          return
-        end
+        socket.write(full.to_slice)
+        socket.flush
         full.clear
       end
+    rescue ex
+      # Anything at all: the writer must not die leaving callers blocked.
+      disconnect(conn, ex)
     end
 
     private def read_loop(conn : Connection) : Nil
@@ -266,7 +277,9 @@ module Redis
         raise ProtocolError.new("unsolicited reply #{value.inspect}") unless waiter
         waiter.channel.send(value)
       end
-    rescue ex : IO::Error | ProtocolError
+    rescue ex
+      # Anything at all, including an exception raised by `push_handler`:
+      # the reader must not die leaving waiters blocked.
       disconnect(conn, ex)
     end
 

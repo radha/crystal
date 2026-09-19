@@ -167,6 +167,40 @@ describe Redis::Client do
     server.close
   end
 
+  it "disconnects when the push handler raises" do
+    script = Script.new
+    server = script.server
+    client = Redis::Client.new(server.url)
+    client.push_handler = ->(p : Array(Redis::Value)) { raise "boom" }
+    ex = expect_raises(Redis::ConnectionError, /boom/) { client.call("PUSHY") }
+    ex.cause.try(&.message).should eq("boom")
+    client.connected?.should be_false
+    client.ping.should eq("PONG")
+    script.connections.should eq(2)
+    client.close
+    server.close
+  end
+
+  it "resolves every remaining future when read_timeout fires mid-pipeline" do
+    server = Script.new.server
+    client = Redis::Client.new(server.url, read_timeout: 50.milliseconds)
+    first = nil
+    second = nil
+    expect_raises(IO::TimeoutError) do
+      client.pipelined do |p|
+        first = p.ping
+        second = p.call("HANG")
+      end
+    end
+    first.not_nil!.value.should eq("PONG")
+    second.not_nil!.resolved?.should be_true
+    expect_raises(IO::TimeoutError) { second.not_nil!.value }
+    client.connected?.should be_false
+    client.ping.should eq("PONG")
+    client.close
+    server.close
+  end
+
   it "pipelined raises ConnectionError when the connection drops mid-pipeline" do
     server = Script.new.server
     client = Redis::Client.new(server.url)
