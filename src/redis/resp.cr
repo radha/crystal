@@ -46,9 +46,21 @@ module Redis
     end
 
     # Number of characters `Int#to_s` produces, without allocating.
-    private def self.decimal_length(value : Int) : Int32
+    private def self.decimal_length(value : Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64) : Int32
       length = value < 0 ? 1 : 0
       magnitude = value < 0 ? (0_u64 &- value.to_i64!.to_u64!) : value.to_u64!
+      loop do
+        length += 1
+        magnitude //= 10
+        break if magnitude == 0
+      end
+      length
+    end
+
+    # :ditto:
+    private def self.decimal_length(value : Int128 | UInt128) : Int32
+      length = value < 0 ? 1 : 0
+      magnitude = value < 0 ? (0_u128 &- value.to_i128!.to_u128!) : value.to_u128!
       loop do
         length += 1
         magnitude //= 10
