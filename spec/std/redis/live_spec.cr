@@ -240,9 +240,11 @@ describe "Redis live concurrency" do
   pending_redis "dedicated Connection runs a blocking command" do
     with_redis(3) do |r|
       conn = Redis::Connection.new(RedisSpec::URL, db: RedisSpec::DB)
-      spawn { sleep 0.05.seconds; r.rpush("q", "job") }
+      done = Channel(Nil).new
+      spawn { sleep 0.05.seconds; r.rpush("q", "job"); done.send(nil) }
       conn.call("BLPOP", "q", 2).should eq(["q", "job"] of Redis::Value)
       conn.close
+      done.receive
     end
   end
 
