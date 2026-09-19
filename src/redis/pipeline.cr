@@ -11,6 +11,7 @@ module Redis
     @raw : Value | Exception = nil
     @resolved = false
 
+    # :nodoc:
     def initialize(@mapper : Proc(Value, T))
     end
 
@@ -35,7 +36,9 @@ module Redis
       @mapper.call(raw)
     end
 
-    # Like `value`, but `nil` when unresolved or failed.
+    # Like `value`, but `nil` when unresolved or failed. For a nilable `T` a
+    # `nil` result is ambiguous; check `resolved?` first to tell the cases
+    # apart.
     def value? : T?
       return nil unless @resolved
       raw = @raw
