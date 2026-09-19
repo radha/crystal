@@ -138,3 +138,52 @@ describe Redis::RESP do
     end
   end
 end
+
+describe Redis::RESP do
+  describe ".read aggregates" do
+    it "array" { parse("*2\r\n$3\r\nfoo\r\n:42\r\n").should eq(["foo", 42_i64] of Redis::Value) }
+    it "empty array" { parse("*0\r\n").should eq([] of Redis::Value) }
+    it "nested array with nulls" do
+      parse("*3\r\n*1\r\n+a\r\n$-1\r\n_\r\n").should eq([["a"] of Redis::Value, nil, nil] of Redis::Value)
+    end
+    it "map" do
+      parse("%2\r\n+first\r\n:1\r\n+second\r\n:2\r\n").should eq(
+        {"first" => 1_i64, "second" => 2_i64} of Redis::Value => Redis::Value)
+    end
+    it "set" do
+      parse("~3\r\n+a\r\n:1\r\n#t\r\n").should eq(Set(Redis::Value){"a", 1_i64, true})
+    end
+    it "nested errors stay values" do
+      arr = parse("*2\r\n+OK\r\n-ERR bad\r\n").as(Array)
+      arr[1].as(Redis::CommandError).code.should eq("ERR")
+    end
+    it "discards attributes and returns the following value" do
+      parse("|1\r\n+ttl\r\n:3600\r\n:2039123\r\n").should eq(2039123_i64)
+    end
+    it "routes push frames to the handler and keeps reading" do
+      pushes = [] of Array(Redis::Value)
+      io = IO::Memory.new(">2\r\n+message\r\n+hi\r\n+PONG\r\n")
+      Redis::RESP.read(io, push: ->(p : Array(Redis::Value)) { pushes << p }).should eq("PONG")
+      pushes.should eq([["message", "hi"] of Redis::Value])
+    end
+    it "drops push frames without a handler" do
+      parse(">1\r\n+x\r\n+PONG\r\n").should eq("PONG")
+    end
+    it "rejects a push frame inside an aggregate" do
+      expect_raises(Redis::ProtocolError, /push frame inside/) { parse("*1\r\n>1\r\n+x\r\n") }
+    end
+    it "rejects an oversized element count before presizing" do
+      expect_raises(Redis::ProtocolError, /exceeds/) { parse("*2147483647\r\n", max_bulk_size: 1000) }
+      expect_raises(Redis::ProtocolError, /exceeds/) { parse("%2147483647\r\n", max_bulk_size: 1000) }
+      expect_raises(Redis::ProtocolError, /exceeds/) { parse("~2147483647\r\n", max_bulk_size: 1000) }
+    end
+    it "rejects nesting deeper than max_depth" do
+      deep = "*1\r\n" * 5 + "+x\r\n"
+      parse(deep, max_depth: 5).should eq([[[[["x"] of Redis::Value] of Redis::Value] of Redis::Value] of Redis::Value] of Redis::Value)
+      expect_raises(Redis::ProtocolError, /depth/) { parse(deep, max_depth: 4) }
+    end
+    it "raises ProtocolError on EOF inside an aggregate" do
+      expect_raises(Redis::ProtocolError) { parse("*2\r\n+a\r\n") }
+    end
+  end
+end
