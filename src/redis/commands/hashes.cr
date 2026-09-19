@@ -41,6 +41,7 @@ module Redis::Commands
     end
   end
 
+  # Shared by `sscan` (sets.cr) and `zscan` (sorted_sets.cr, next task).
   private def scan_args(cmd : String, key : String, cursor : String, match : String?, count : Int?) : Array(RESP::Arg)
     args = Array(RESP::Arg).new(7)
     args << cmd << key << cursor
