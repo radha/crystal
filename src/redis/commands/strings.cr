@@ -5,8 +5,9 @@ module Redis::Commands
   # Sets *key* to *value*. Options: `ex`/`px` relative TTL (`Time::Span` or
   # seconds/milliseconds), `exat`/`pxat` absolute Unix timestamps, `nx` only
   # if absent, `xx` only if present, `keepttl`, and `get` to return the old
-  # value. Returns `"OK"`, `nil` when an `nx`/`xx` condition fails, or the
-  # previous value with `get: true`.
+  # value. An `ex` given as a `Time::Span` with a sub-second remainder is
+  # sent as `PX` instead. Returns `"OK"`, `nil` when an `nx`/`xx` condition
+  # fails, or the previous value with `get: true`.
   def set(key : String, value : RESP::Arg, *, ex : Time::Span | Int | Nil = nil, px : Time::Span | Int | Nil = nil,
           exat : Int? = nil, pxat : Int? = nil, nx : Bool = false, xx : Bool = false,
           keepttl : Bool = false, get : Bool = false)
@@ -16,9 +17,13 @@ module Redis::Commands
     args = Array(RESP::Arg).new(8)
     args << "SET" << key << value
     if ex
-      args << "EX" << (ex.is_a?(Time::Span) ? ex.total_seconds.to_i64 : ex)
+      if sub_second?(ex)
+        args << "PX" << ttl_millis(ex)
+      else
+        args << "EX" << ttl_seconds(ex)
+      end
     elsif px
-      args << "PX" << (px.is_a?(Time::Span) ? px.total_milliseconds.to_i64 : px)
+      args << "PX" << ttl_millis(px)
     elsif exat
       args << "EXAT" << exat
     elsif pxat
@@ -34,14 +39,19 @@ module Redis::Commands
   # Sets *key* only if it does not exist.
   def_command setnx, "SETNX", key : String, value : RESP::Arg, cast: :bool
 
-  # Sets *key* with a TTL in seconds.
+  # Sets *key* with a TTL in seconds. A *ttl* that is a `Time::Span` with a
+  # sub-second remainder switches to the millisecond form (`PSETEX`).
   def setex(key : String, ttl : Time::Span | Int, value : RESP::Arg)
-    typed_call({"SETEX", key, ttl.is_a?(Time::Span) ? ttl.total_seconds.to_i64 : ttl, value}) { |v| Cast.ok(v) }
+    if sub_second?(ttl)
+      typed_call({"PSETEX", key, ttl_millis(ttl), value}) { |v| Cast.ok(v) }
+    else
+      typed_call({"SETEX", key, ttl_seconds(ttl), value}) { |v| Cast.ok(v) }
+    end
   end
 
   # Sets *key* with a TTL in milliseconds.
   def psetex(key : String, ttl : Time::Span | Int, value : RESP::Arg)
-    typed_call({"PSETEX", key, ttl.is_a?(Time::Span) ? ttl.total_milliseconds.to_i64 : ttl, value}) { |v| Cast.ok(v) }
+    typed_call({"PSETEX", key, ttl_millis(ttl), value}) { |v| Cast.ok(v) }
   end
 
   # Sets *key* and returns its previous value.

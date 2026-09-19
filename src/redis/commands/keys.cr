@@ -20,15 +20,21 @@ module Redis::Commands
   # Remaining time to live in milliseconds.
   def_command pttl, "PTTL", key : String, cast: :int
 
-  # Sets a timeout on *key*. *ttl* is a `Time::Span` or seconds. Returns
-  # `true` if the timeout was set. Flags map to `NX`/`XX`/`GT`/`LT`.
+  # Sets a timeout on *key*. *ttl* is a `Time::Span` or seconds. A *ttl* that
+  # is a `Time::Span` with a sub-second remainder switches to the
+  # millisecond form (`PEXPIRE`). Returns `true` if the timeout was set.
+  # Flags map to `NX`/`XX`/`GT`/`LT`.
   def expire(key : String, ttl : Time::Span | Int, *, nx = false, xx = false, gt = false, lt = false)
-    expire_command("EXPIRE", key, ttl.is_a?(Time::Span) ? ttl.total_seconds.to_i64 : ttl, nx, xx, gt, lt)
+    if sub_second?(ttl)
+      expire_command("PEXPIRE", key, ttl_millis(ttl), nx, xx, gt, lt)
+    else
+      expire_command("EXPIRE", key, ttl_seconds(ttl), nx, xx, gt, lt)
+    end
   end
 
   # Like `expire` with a millisecond *ttl*.
   def pexpire(key : String, ttl : Time::Span | Int, *, nx = false, xx = false, gt = false, lt = false)
-    expire_command("PEXPIRE", key, ttl.is_a?(Time::Span) ? ttl.total_milliseconds.to_i64 : ttl, nx, xx, gt, lt)
+    expire_command("PEXPIRE", key, ttl_millis(ttl), nx, xx, gt, lt)
   end
 
   # Sets the expiration of *key* to a Unix timestamp in seconds.
@@ -49,6 +55,22 @@ module Redis::Commands
     args << "GT" if gt
     args << "LT" if lt
     typed_call(args) { |v| Cast.bool(v) }
+  end
+
+  # Converts a `Time::Span` or plain `Int` *ttl* to whole seconds.
+  private def ttl_seconds(ttl : Time::Span | Int) : Int64
+    ttl.is_a?(Time::Span) ? ttl.total_seconds.to_i64 : ttl.to_i64
+  end
+
+  # Converts a `Time::Span` or plain `Int` *ttl* to milliseconds.
+  private def ttl_millis(ttl : Time::Span | Int) : Int64
+    ttl.is_a?(Time::Span) ? ttl.total_milliseconds.to_i64 : ttl.to_i64
+  end
+
+  # `true` only when *ttl* is a `Time::Span` that does not fall on a whole
+  # second, meaning it needs the millisecond command variant.
+  private def sub_second?(ttl : Time::Span | Int) : Bool
+    ttl.is_a?(Time::Span) && ttl.total_milliseconds.to_i64 % 1000 != 0
   end
 
   # One `SCAN` step. Returns `{next_cursor, keys}`; the cursor `"0"` marks
