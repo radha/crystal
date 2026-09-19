@@ -57,6 +57,7 @@ module Redis
 
     # Reply-shape conversions. Each accepts the RESP3 shape and the RESP2
     # shape of the same command and raises `ProtocolError` otherwise.
+    # :nodoc:
     module Cast
       def self.value(v : Value) : Value
         v
@@ -157,8 +158,7 @@ module Redis
       end
 
       # Array, or Set for RESP3 set replies (SMEMBERS, SINTER, ...).
-      # Public (`:nodoc:`) because hand-written commands use it.
-      # :nodoc:
+      # Public because hand-written commands use it.
       def self.elements(v : Value, expected : String) : Array(Value)
         case v
         when Array then v
@@ -174,7 +174,6 @@ module Redis
         end
       end
 
-      # :nodoc:
       def self.unexpected(v : Value, expected : String) : NoReturn
         raise ProtocolError.new("unexpected reply: expected #{expected}, got #{v.inspect}")
       end
