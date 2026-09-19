@@ -23,9 +23,15 @@ describe Redis::RESP do
         "*6\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\n42\r\n$2\r\n-7\r\n$3\r\n1.5\r\n$2\r\n\u0000\xFF\r\n")
     end
 
-    it "accepts an Enumerable of args" do
+    it "accepts an Indexable of args" do
       io = IO::Memory.new
       Redis::RESP.write_command(io, ["PING"])
+      io.to_s.should eq("*1\r\n$4\r\nPING\r\n")
+    end
+
+    it "accepts a Deque of args" do
+      io = IO::Memory.new
+      Redis::RESP.write_command(io, Deque{"PING"})
       io.to_s.should eq("*1\r\n$4\r\nPING\r\n")
     end
 
