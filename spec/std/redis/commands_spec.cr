@@ -305,3 +305,65 @@ describe "set commands" do
     expect_call(reply, ["SSCAN", "s", "0", "COUNT", 3], &.sscan("s", "0", count: 3)).should eq({"0", ["a"]})
   end
 end
+
+describe "sorted set commands" do
+  it "zadd forms and flags" do
+    expect_call(1_i64, ["ZADD", "z", 1.5, "a"], &.zadd("z", 1.5, "a")).should eq(1_i64)
+    expect_call(2_i64, ["ZADD", "z", "NX", "CH", 1.0, "a", 2.0, "b"],
+      &.zadd("z", [{"a", 1.0}, {"b", 2.0}], nx: true, ch: true)).should eq(2_i64)
+    expect_call(1_i64, ["ZADD", "z", "GT", 1.0, "a"], &.zadd("z", [{"a", 1.0}], gt: true)).should eq(1_i64)
+    expect_call("3.5", ["ZADD", "z", "INCR", 2.0, "a"], &.zadd_incr("z", 2.0, "a")).should eq(3.5)
+    expect_call(nil, ["ZADD", "z", "XX", "INCR", 2.0, "a"], &.zadd_incr("z", 2.0, "a", xx: true)).should be_nil
+    expect_raises(ArgumentError) { stub(1_i64).zadd("z", [{"a", 1.0}], nx: true, xx: true) }
+  end
+
+  it "scores, ranks, counts" do
+    expect_call(1_i64, ["ZREM", "z", "a", "b"], &.zrem("z", "a", "b")).should eq(1_i64)
+    expect_call("1.5", ["ZSCORE", "z", "a"], &.zscore("z", "a")).should eq(1.5)
+    expect_call(nil, ["ZSCORE", "z", "a"], &.zscore("z", "a")).should be_nil
+    expect_call([1.5, nil] of Redis::Value, ["ZMSCORE", "z", "a", "b"], &.zmscore("z", "a", "b")).should eq([1.5, nil])
+    expect_call(2_i64, ["ZCARD", "z"], &.zcard("z")).should eq(2_i64)
+    expect_call(1_i64, ["ZCOUNT", "z", "-inf", "(2"], &.zcount("z", "-inf", "(2")).should eq(1_i64)
+    expect_call("2.5", ["ZINCRBY", "z", 1.0, "a"], &.zincrby("z", 1.0, "a")).should eq(2.5)
+    expect_call(0_i64, ["ZRANK", "z", "a"], &.zrank("z", "a")).should eq(0_i64)
+    expect_call(nil, ["ZREVRANK", "z", "a"], &.zrevrank("z", "a")).should be_nil
+  end
+
+  it "zrange variants" do
+    expect_call(["a"] of Redis::Value, ["ZRANGE", "z", 0, -1], &.zrange("z", 0, -1)).should eq(["a"])
+    expect_call(["a"] of Redis::Value, ["ZRANGE", "z", "(1", "+inf", "BYSCORE", "LIMIT", 0, 10],
+      &.zrange("z", "(1", "+inf", by_score: true, limit: {0, 10})).should eq(["a"])
+    expect_call(["a"] of Redis::Value, ["ZRANGE", "z", "[a", "[z", "BYLEX", "REV"],
+      &.zrange("z", "[a", "[z", by_lex: true, rev: true)).should eq(["a"])
+    expect_call([["a", 1.0] of Redis::Value] of Redis::Value, ["ZRANGE", "z", 0, -1, "WITHSCORES"],
+      &.zrange_with_scores("z", 0, -1)).should eq([{"a", 1.0}])
+    expect_call(["a", "1"] of Redis::Value, ["ZRANGE", "z", 0, -1, "REV", "WITHSCORES"],
+      &.zrange_with_scores("z", 0, -1, rev: true)).should eq([{"a", 1.0}])
+    expect_raises(ArgumentError) { stub(nil).zrange("z", 0, 1, by_score: true, by_lex: true) }
+  end
+
+  it "zpopmin / zpopmax" do
+    expect_call(["a", "1"] of Redis::Value, ["ZPOPMIN", "z"], &.zpopmin("z")).should eq([{"a", 1.0}])
+    expect_call([["a", 1.0] of Redis::Value] of Redis::Value, ["ZPOPMAX", "z", 2], &.zpopmax("z", 2)).should eq([{"a", 1.0}])
+    expect_call([] of Redis::Value, ["ZPOPMIN", "z"], &.zpopmin("z")).should eq([] of {String, Float64})
+  end
+
+  it "zscan" do
+    reply = ["0", ["a", "1.5"] of Redis::Value] of Redis::Value
+    expect_call(reply, ["ZSCAN", "z", "0", "MATCH", "a*"], &.zscan("z", "0", match: "a*")).should eq({"0", [{"a", 1.5}]})
+  end
+end
+
+describe "scripting commands" do
+  it "eval / evalsha with keys and args" do
+    expect_call(2_i64, ["EVAL", "return 2", 0], &.eval("return 2")).should eq(2_i64)
+    expect_call("x", ["EVAL", "s", 2, "k1", "k2", "a", 1], &.eval("s", keys: ["k1", "k2"], args: ["a", 1] of Redis::RESP::Arg)).should eq("x")
+    expect_call("x", ["EVALSHA", "abc", 1, "k"], &.evalsha("abc", keys: ["k"])).should eq("x")
+  end
+
+  it "script load / exists / flush" do
+    expect_call("abc", ["SCRIPT", "LOAD", "return 1"], &.script_load("return 1")).should eq("abc")
+    expect_call([1_i64, 0_i64] of Redis::Value, ["SCRIPT", "EXISTS", "a", "b"], &.script_exists("a", "b")).should eq([true, false])
+    expect_call("OK", ["SCRIPT", "FLUSH"], &.script_flush).should be_nil
+  end
+end
