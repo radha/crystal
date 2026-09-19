@@ -36,5 +36,13 @@ describe Redis::RESP do
     it "encodes Int64::MIN" do
       encode("X", Int64::MIN).should eq("*2\r\n$1\r\nX\r\n$20\r\n-9223372036854775808\r\n")
     end
+
+    it "encodes Int128::MIN" do
+      encode("X", Int128::MIN).should eq("*2\r\n$1\r\nX\r\n$40\r\n-170141183460469231731687303715884105728\r\n")
+    end
+
+    it "encodes UInt128::MAX" do
+      encode("X", UInt128::MAX).should eq("*2\r\n$1\r\nX\r\n$39\r\n340282366920938463463374607431768211455\r\n")
+    end
   end
 end
