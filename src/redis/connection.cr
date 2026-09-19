@@ -149,7 +149,15 @@ module Redis
       end
       if hello_failed
         if password = @password
-          call({"AUTH", @username || "default", password})
+          # Pre-6.0 servers (the only ones that reject `HELLO`) only
+          # understand single-argument `AUTH`; the two-argument form is a
+          # 6.0+ addition. `HELLO`'s own `AUTH` above is unaffected: it
+          # only ever runs against a 6.0+ server by construction.
+          if username = @username
+            call({"AUTH", username, password})
+          else
+            call({"AUTH", password})
+          end
         end
         call({"CLIENT", "SETNAME", client_name}) if client_name
       end
