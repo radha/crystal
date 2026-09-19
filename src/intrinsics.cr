@@ -178,7 +178,11 @@ lib LibIntrinsics
   {% else %}
     fun frameaddress = "llvm.frameaddress.p0"(level : Int32) : Void*
   {% end %}
-  fun returnaddress = "llvm.returnaddress"(level : Int32) : Void*
+  {% if compare_versions(Crystal::LLVM_VERSION, "23.0.0") < 0 %}
+    fun returnaddress = "llvm.returnaddress"(level : Int32) : Void*
+  {% else %}
+    fun returnaddress = "llvm.returnaddress.p0"(level : Int32) : Void*
+  {% end %}
 
   {% if flag?(:i386) || flag?(:x86_64) %}
     {% if flag?(:interpreted) %} @[Primitive(:interpreter_intrinsics_pause)] {% end %}
