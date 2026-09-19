@@ -55,9 +55,10 @@ module Redis
       end
     end
 
+    # :nodoc:
+    #
     # Reply-shape conversions. Each accepts the RESP3 shape and the RESP2
     # shape of the same command and raises `ProtocolError` otherwise.
-    # :nodoc:
     module Cast
       def self.value(v : Value) : Value
         v
@@ -184,6 +185,16 @@ module Redis
         unexpected(v, "scan page") unless page.size == 2
         {string(page[0]), strings(page[1])}
       end
+    end
+
+    # Shared by `hscan` (hashes.cr), `sscan` (sets.cr) and `zscan`
+    # (sorted_sets.cr).
+    private def scan_args(cmd : String, key : String, cursor : String, match : String?, count : Int?) : Array(RESP::Arg)
+      args = Array(RESP::Arg).new(7)
+      args << cmd << key << cursor
+      args << "MATCH" << match if match
+      args << "COUNT" << count if count
+      args
     end
   end
 end

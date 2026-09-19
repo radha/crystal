@@ -33,6 +33,8 @@ describe Redis::Value do
   it "admits every RESP3 shape" do
     v = [nil, true, 1_i64, 1.5, "s", Redis::BigNumber.new("1"), Set(Redis::Value){1_i64},
          {"k" => "v"} of Redis::Value => Redis::Value] of Redis::Value
-    v.size.should eq(8)
+    v[5].should be_a(Redis::BigNumber)
+    v[6].should be_a(Set(Redis::Value))
+    v[7].should be_a(Hash(Redis::Value, Redis::Value))
   end
 end

@@ -22,6 +22,11 @@ module Redis
   # Connecting happens under the client's lock, so concurrent callers wait
   # for one connection attempt and `close` may block for up to
   # `connect_timeout` while a connect is in flight.
+  #
+  # `close` is required: a `Client` owns a reader and a writer fiber that
+  # keep running for as long as it is connected, so it is never collected
+  # by the GC while those fibers run, and it has no finalizer to do this
+  # for you.
   class Client
     include Commands
 
@@ -74,17 +79,23 @@ module Redis
       raise ArgumentError.new("protocol must be 2 or 3, got #{@protocol_option}") unless @protocol_option == 2 || @protocol_option == 3
     end
 
-    # The negotiated protocol version, or `nil` while disconnected.
+    # The negotiated protocol version, or `nil` while disconnected. An
+    # advisory snapshot: it is read without the lock, so it can be stale by
+    # the time the caller acts on it under concurrent reconnects.
     def protocol : Int32?
       @connection.try &.protocol
     end
 
-    # Whether a connection is currently open.
+    # Whether a connection is currently open. An advisory snapshot: it is
+    # read without the lock, so it can be stale by the time the caller acts
+    # on it under concurrent reconnects.
     def connected? : Bool
       !@connection.nil?
     end
 
-    # Whether `close` has been called.
+    # Whether `close` has been called. An advisory snapshot: it is read
+    # without the lock, so it can be stale by the time the caller acts on
+    # it under a concurrent `close`.
     def closed? : Bool
       @closed
     end
@@ -92,6 +103,12 @@ module Redis
     # Sends *args* and returns the reply. Raises `CommandError` for an
     # error reply, `ConnectionError` if the connection cannot be opened or
     # drops, `IO::TimeoutError` if `read_timeout` elapses.
+    #
+    # A `ConnectionError` does not mean the command did not execute: if the
+    # bytes reached the server before the connection dropped, the command
+    # may have run and its reply was simply lost. There is no automatic
+    # retry, so a non-idempotent command needs the caller's own judgement
+    # about whether to resend it.
     def call(*args : RESP::Arg) : Value
       call(args)
     end
@@ -125,6 +142,11 @@ module Redis
     # `ConnectionError`, and an expired `read_timeout` raises
     # `IO::TimeoutError`, in both cases after every future has been
     # resolved with that failure.
+    #
+    # `read_timeout` applies per reply, not to the pipeline as a whole: it
+    # resets for each command in turn, and the first reply that stalls past
+    # it tears the connection down and fails every future that has not yet
+    # been resolved.
     #
     # ```
     # first = nil
@@ -204,7 +226,9 @@ module Redis
       conn = Connection.new(@url, db: @db, username: @username, password: @password, client_name: @client_name,
         protocol: @protocol_option, connect_timeout: @connect_timeout, read_timeout: nil,
         tls_context: @tls_context, max_bulk_size: @max_bulk_size)
-      conn.push_handler = @push_handler
+      # Not `conn.push_handler = @push_handler`: `read_loop` below passes
+      # `@push_handler` to `RESP.read` on every frame directly, so setting
+      # it on `conn` would be write-only and never consulted.
       wakeup = Channel(Nil).new(1)
       @connection = conn
       @wakeup = wakeup

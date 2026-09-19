@@ -40,13 +40,4 @@ module Redis::Commands
       {Cast.string(page[0]), Cast.string_hash(page[1])}
     end
   end
-
-  # Shared by `sscan` (sets.cr) and `zscan` (sorted_sets.cr, next task).
-  private def scan_args(cmd : String, key : String, cursor : String, match : String?, count : Int?) : Array(RESP::Arg)
-    args = Array(RESP::Arg).new(7)
-    args << cmd << key << cursor
-    args << "MATCH" << match if match
-    args << "COUNT" << count if count
-    args
-  end
 end
