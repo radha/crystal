@@ -221,18 +221,38 @@ module Redis
         end
       end
 
-      # Aggregates are implemented in Task 4; keep these stubs so Task 3 compiles.
       private def read_array_body(depth : Int32) : Array(Value)?
-        return nil if read_length == -1
-        raise ProtocolError.new("aggregates not implemented")
+        count = read_length
+        return nil if count < 0
+        depth = enter(depth)
+        Array(Value).new(count) { read_value(depth) }
       end
 
       private def read_map_body(depth : Int32) : Hash(Value, Value)
-        raise ProtocolError.new("aggregates not implemented")
+        count = read_length
+        raise ProtocolError.new("null map") if count < 0
+        depth = enter(depth)
+        hash = Hash(Value, Value).new(initial_capacity: count)
+        count.times do
+          key = read_value(depth)
+          hash[key] = read_value(depth)
+        end
+        hash
       end
 
       private def read_set_body(depth : Int32) : Set(Value)
-        raise ProtocolError.new("aggregates not implemented")
+        count = read_length
+        raise ProtocolError.new("null set") if count < 0
+        depth = enter(depth)
+        set = Set(Value).new(count)
+        count.times { set << read_value(depth) }
+        set
+      end
+
+      private def enter(depth : Int32) : Int32
+        depth += 1
+        raise ProtocolError.new("nesting depth #{depth} exceeds max_depth #{@max_depth}") if depth > @max_depth
+        depth
       end
     end
   end
