@@ -36,6 +36,10 @@ module Redis
 
     @socket : IO
     @closed = false
+    # Whether a `watch` is in effect on this connection: set by `watch`,
+    # cleared by `unwatch` and by a `multi` that sent `EXEC` (Redis
+    # discards every watch when `EXEC` runs, even an aborted one).
+    getter? watching = false
     @username : String?
     @password : String?
     @db : Int32?
@@ -210,8 +214,8 @@ module Redis
       check_open
       RESP.write_command(@socket, args)
       @socket.flush
-    rescue ex : IO::Error
-      fail(ex)
+    rescue ex : IO::Error | OpenSSL::SSL::Error
+      lost(ex)
     end
 
     # Reads one reply. Raises `CommandError` for an error reply.
@@ -226,8 +230,8 @@ module Redis
     rescue ex : ProtocolError
       close
       raise ex
-    rescue ex : IO::Error
-      fail(ex)
+    rescue ex : IO::Error | OpenSSL::SSL::Error
+      lost(ex)
     end
 
     # Sends *args* and returns the reply. Raises `CommandError` for an
@@ -264,8 +268,8 @@ module Redis
     rescue ex : ProtocolError
       close
       raise ex
-    rescue ex : IO::Error
-      fail(ex)
+    rescue ex : IO::Error | OpenSSL::SSL::Error
+      lost(ex)
     end
 
     # Runs the block against a `Pipeline`, sends every queued command in a
@@ -303,7 +307,7 @@ module Redis
         close
         fail_futures(pipeline, results.size, ex)
         raise ex
-      rescue ex : IO::Error
+      rescue ex : IO::Error | OpenSSL::SSL::Error
         close
         error = connection_error(ex)
         fail_futures(pipeline, results.size, error)
@@ -326,7 +330,17 @@ module Redis
     # ```
     def multi(&block : Transaction ->) : Array(Value)
       exec = nil
-      pipelined { |p| exec = p.multi(&block) }
+      sent = false
+      begin
+        pipelined do |p|
+          exec = p.multi(&block)
+          sent = p.size > 0
+        end
+      ensure
+        # EXEC, even an aborted one, discards every WATCH server-side. An
+        # empty block sends nothing and leaves the watch in place.
+        @watching = false if sent
+      end
       exec.not_nil!.value
     end
 
@@ -338,18 +352,23 @@ module Redis
     # Marks *keys* for optimistic locking: a following `multi` on this
     # connection raises `AbortedError` if any of them changed in between.
     # `WATCH` is per connection, which is why it exists only here and not
-    # on `Client`; see `Client#watch`.
+    # on `Client`; see `Client#watch`, which also sends `UNWATCH` for you
+    # when a block leaves without running `multi`. A `Connection` borrowed
+    # from a `Pool` and handed back while `watching?` carries the watch to
+    # its next user, so call `unwatch` yourself in that case.
     def watch(*keys : String) : Nil
       args = Array(RESP::Arg).new(keys.size + 1)
       args << "WATCH"
       keys.each { |k| args << k }
       call(args)
+      @watching = true
       nil
     end
 
     # Forgets every key marked with `watch`.
     def unwatch : Nil
       call({"UNWATCH"})
+      @watching = false
       nil
     end
 
@@ -370,12 +389,12 @@ module Redis
       raise ConnectionError.new("connection is closed") if @closed
     end
 
-    private def fail(ex : IO::Error) : NoReturn
+    private def lost(ex : Exception) : NoReturn
       close
       raise connection_error(ex)
     end
 
-    private def connection_error(ex : IO::Error) : ConnectionError
+    private def connection_error(ex : Exception) : ConnectionError
       ConnectionError.new("connection lost: #{ex.message}", cause: ex)
     end
 

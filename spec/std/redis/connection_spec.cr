@@ -253,3 +253,60 @@ describe Redis::Connection do
     File.delete?(path)
   end
 end
+
+describe "Redis::Connection#watching?" do
+  it "tracks WATCH until EXEC or UNWATCH" do
+    server = RedisSpec::FakeServer.new do |io|
+      while cmd = RedisSpec::FakeServer.read_command(io)
+        case cmd[0]
+        when "HELLO" then io << RedisSpec::HELLO_REPLY
+        when "EXEC"  then io << "*1\r\n+OK\r\n"
+        else              io << "+OK\r\n"
+        end
+        io.flush
+      end
+    end
+    conn = Redis::Connection.new(server.url)
+    conn.watching?.should be_false
+    conn.watch("k")
+    conn.watching?.should be_true
+    conn.multi { |tx| tx.set("k", "v") }
+    conn.watching?.should be_false
+    conn.watch("k")
+    conn.multi { |tx| } # nothing sent: still watching
+    conn.watching?.should be_true
+    conn.unwatch
+    conn.watching?.should be_false
+    conn.close
+    server.close
+  end
+end
+
+describe "Redis::Connection over TLS" do
+  it "maps a torn-down TLS socket to ConnectionError" do
+    context = OpenSSL::SSL::Context::Server.new
+    context.certificate_chain = File.join(__DIR__, "..", "data", "openssl", "openssl.crt")
+    context.private_key = File.join(__DIR__, "..", "data", "openssl", "openssl.key")
+    server = RedisSpec::FakeServer.new do |io|
+      begin
+        ssl = OpenSSL::SSL::Socket::Server.new(io, context: context, sync_close: false)
+        cmd = RedisSpec::FakeServer.read_command(ssl)
+        ssl << RedisSpec::HELLO_REPLY if cmd && cmd[0] == "HELLO"
+        ssl.flush
+        RedisSpec::FakeServer.read_command(ssl) # PING
+      rescue OpenSSL::SSL::Error
+      end
+      # Reset instead of a clean close_notify, so the client sees a failure
+      # rather than a graceful EOF.
+      io.as(TCPSocket).linger = 0
+      io.close
+    end
+    client_context = OpenSSL::SSL::Context::Client.new
+    client_context.verify_mode = OpenSSL::SSL::VerifyMode::NONE
+    conn = Redis::Connection.new("rediss://127.0.0.1:#{server.port}", tls_context: client_context)
+    conn.protocol.should eq(3)
+    expect_raises(Redis::ConnectionError) { conn.ping }
+    conn.closed?.should be_true
+    server.close
+  end
+end
