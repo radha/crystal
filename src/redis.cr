@@ -30,13 +30,14 @@
 # `String`, `Redis::BigNumber`, `Redis::CommandError`, `Array`, `Set` and
 # `Hash`. Typed commands normalize RESP2 and RESP3 replies to the same
 # Crystal type. Errors: `Redis::CommandError` (server error reply, with
-# `code`), `Redis::ConnectionError`, `Redis::ProtocolError`.
+# `code`), `Redis::ConnectionError`, `Redis::ProtocolError`,
+# `Redis::ClusterError`, `Redis::PoolTimeoutError`.
 #
 # Pub/sub: `Redis::Subscriber` (or `Client#subscriber`) receives on its
 # own connection and reconnects by itself; `Client#publish` sends.
 # Transactions: `Client#multi { |tx| ... }` runs a `MULTI`..`EXEC` block
 # atomically with typed futures; `Client#watch(*keys) { |conn| ... }`
-# gives optimistic locking on a dedicated connection. Scripts:
+# gives optimistic locking on a pooled dedicated connection. Scripts:
 # `Redis::Script` with `run`, which sends `EVALSHA` and falls back to
 # `EVAL` when the server has not cached the script.
 #
@@ -52,12 +53,28 @@
 # redis.run(script, keys: ["hits"], args: [5]) # => 6_i64
 # ```
 #
-# Not in this slice: cluster routing, connection pools, sharded pub/sub.
+# Blocking commands: `Client#with_connection { |conn| ... }` borrows a
+# dedicated `Connection` from the client's pool, and `Redis::Pool` is
+# that pool on its own. Cluster: `Redis::Cluster` routes every command
+# by key slot to the owning master, follows `MOVED`/`ASK`, reloads the
+# topology when it changes, and splits pipelines by node.
+#
+# ```
+# redis.with_connection { |conn| conn.call("BLPOP", "jobs", 0) }
+#
+# cluster = Redis::Cluster.new(["redis://10.0.0.1:7000", "redis://10.0.0.2:7000"])
+# cluster.set("user:1", "x")
+# cluster.pipelined { |p| p.get("a"); p.get("b") } # split by node, replies in order
+# cluster.close
+# ```
+#
+# Not included: replica reads, sharded pub/sub, Sentinel, streams helpers.
 require "socket"
 require "openssl"
 require "uri"
 require "set"
 require "digest/sha1"
+require "wait_group"
 require "./redis/error"
 require "./redis/value"
 require "./redis/crc16"

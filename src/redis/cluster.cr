@@ -1,5 +1,3 @@
-require "wait_group"
-
 module Redis
   # A client for Redis Cluster: routes every command to the master that
   # owns its key's hash slot, follows `MOVED`, `ASK` and `TRYAGAIN`
