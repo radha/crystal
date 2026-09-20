@@ -55,7 +55,9 @@ module Redis
       @mutex.synchronize { @in_use }
     end
 
-    # Whether `close` has been called.
+    # Whether `close` has been called. An advisory snapshot: it is read
+    # without the lock, so it can be stale by the time the caller acts on
+    # it under a concurrent `close`.
     def closed? : Bool
       @closed
     end
@@ -66,6 +68,8 @@ module Redis
     # opened, `CommandError` if the server rejects the handshake. Hand it
     # back with `checkin`; the block form does that for you.
     def checkout : Connection
+      # Unlocked pre-check to fail fast; the check under the mutex below is
+      # the one that counts.
       raise ConnectionError.new("pool is closed") if @closed
       select
       when @permits.receive
