@@ -17,6 +17,17 @@ private def with_cluster(live : RedisSpec::LiveCluster, protocol : Int32, &block
   end
 end
 
+# The next message, or a failure instead of a hang if the cluster bus
+# never delivers one.
+private def receive_within(sub : Redis::Subscriber, span : Time::Span) : Redis::Subscriber::Message
+  select
+  when message = sub.messages.receive
+    message
+  when timeout(span)
+    raise "no message within #{span}"
+  end
+end
+
 private def other_master(cluster : Redis::Cluster, than : Redis::Cluster::Node) : Redis::Cluster::Node
   cluster.nodes.find { |node| node.master? && !node.same?(than) }.not_nil!
 end
@@ -109,7 +120,7 @@ private def live_cluster_specs(protocol : Int32)
           sub.subscribe("news")
           masters = c.nodes.select(&.master?)
           masters.each { |node| node.client.publish("news", node.address) }
-          received = Array.new(3) { sub.receive.payload }
+          received = Array.new(3) { receive_within(sub, 5.seconds).payload }
           received.sort.should eq(masters.map(&.address).sort)
         ensure
           sub.close

@@ -441,11 +441,7 @@ module Redis
     # and must be closed on its own.
     def subscriber(*, capacity : Int32 = 64, reconnect : Bool = true) : Subscriber
       check_open
-      node = route(nil)
-      Subscriber.new(node_uri(node.host, node.port), username: @username, password: @password,
-        client_name: @client_name, protocol: @protocol_option, connect_timeout: @connect_timeout,
-        read_timeout: @read_timeout, tls_context: @tls_context, max_bulk_size: @max_bulk_size,
-        capacity: capacity, reconnect: reconnect)
+      route(nil).client.subscriber(capacity: capacity, reconnect: reconnect)
     end
 
     # Copies the group's commands out of *bytes* and runs them on *node*,

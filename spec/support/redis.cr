@@ -220,11 +220,13 @@ module RedisSpec
       return @@instance if @@instance
       return nil if @@failure
       if env = ENV["REDIS_CLUSTER_URL"]?
-        return @@instance = new(env.split(','), [] of Process, nil)
+        seeds = env.split(',', remove_empty: true).map(&.strip).reject(&.empty?)
+        raise "REDIS_CLUSTER_URL is empty" if seeds.empty?
+        return @@instance = new(seeds, [] of Process, nil)
       end
       @@instance = spawn_local
     rescue ex
-      @@failure = ex.message
+      @@failure = ex.message || ex.class.name
       nil
     end
 
