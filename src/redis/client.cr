@@ -206,6 +206,70 @@ module Redis
       results
     end
 
+    # Runs the block's commands as one `MULTI`..`EXEC` transaction, sent in
+    # a single write so that no other fiber's command can land between
+    # `MULTI` and `EXEC`, and returns the `EXEC` array. Typed methods on the
+    # transaction return futures resolved from that array. Raises the
+    # `EXECABORT` `CommandError` if a command was rejected at queue time,
+    # `ConnectionError` if the socket drops. Error replies inside the array
+    # stay values; only the matching command's future raises them.
+    #
+    # `WATCH` is not available here (it is per-connection state that
+    # concurrent fibers would clobber); use `watch` for optimistic locking.
+    #
+    # ```
+    # count = nil
+    # redis.multi do |tx|
+    #   tx.set("a", "1")
+    #   count = tx.incr("hits")
+    # end                  # => ["OK", 1_i64]
+    # count.not_nil!.value # => 1_i64
+    # ```
+    def multi(&block : Transaction ->) : Array(Value)
+      exec = nil
+      pipelined { |p| exec = p.multi(&block) }
+      exec.not_nil!.value
+    end
+
+    # Opens a dedicated `Connection` with this client's options, sends
+    # `WATCH` for *keys*, yields the connection for the read-then-`multi`
+    # sequence, and closes it afterwards, whatever the block does. Returns
+    # the block's value. An `AbortedError` raised by `Connection#multi`
+    # inside the block means a watched key changed; retrying is the
+    # caller's loop:
+    #
+    # ```
+    # loop do
+    #   begin
+    #     redis.watch("balance") do |conn|
+    #       balance = conn.get("balance").not_nil!.to_i
+    #       conn.multi { |tx| tx.set("balance", balance - 10) }
+    #     end
+    #     break
+    #   rescue Redis::AbortedError
+    #   end
+    # end
+    # ```
+    #
+    # Raises `ArgumentError` without keys, `ConnectionError` if the
+    # dedicated connection cannot be opened.
+    def watch(&block : Connection -> T) : T forall T
+      raise ArgumentError.new("WATCH needs at least one key")
+    end
+
+    # :ditto:
+    def watch(*keys : String, &block : Connection -> T) : T forall T
+      conn = Connection.new(@url, db: @db, username: @username, password: @password, client_name: @client_name,
+        protocol: @protocol_option, connect_timeout: @connect_timeout, read_timeout: @read_timeout,
+        tls_context: @tls_context, max_bulk_size: @max_bulk_size)
+      begin
+        conn.watch(*keys)
+        block.call(conn)
+      ensure
+        conn.close
+      end
+    end
+
     # Closes the connection; pending commands raise `ConnectionError`, and
     # every later call raises too.
     def close : Nil

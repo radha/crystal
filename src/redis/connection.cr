@@ -268,6 +268,85 @@ module Redis
       fail(ex)
     end
 
+    # Runs the block against a `Pipeline`, sends every queued command in a
+    # single write, and returns the raw replies in order. Error replies
+    # stay in the array as `CommandError` values and are raised by the
+    # corresponding `Future#value`. `IO::TimeoutError` and `ProtocolError`
+    # close the connection and propagate; a lost socket raises
+    # `ConnectionError`. In every failure case the futures not yet given a
+    # reply are resolved with that exception first.
+    def pipelined(& : Pipeline ->) : Array(Value)
+      pipeline = Pipeline.new(@script_cache)
+      yield pipeline
+      check_open
+      return [] of Value if pipeline.size == 0
+      results = Array(Value).new(pipeline.size)
+      begin
+        @socket.write(pipeline.buffer.to_slice)
+        @socket.flush
+        pipeline.size.times do |i|
+          value = RESP.read(@socket, max_bulk_size: @max_bulk_size, push: @push_handler)
+          pipeline.resolve(i, value)
+          results << value
+        end
+      rescue ex : IO::TimeoutError
+        close
+        (results.size...pipeline.size).each { |i| pipeline.resolve(i, ex) }
+        raise ex
+      rescue ex : ProtocolError
+        close
+        (results.size...pipeline.size).each { |i| pipeline.resolve(i, ex) }
+        raise ex
+      rescue ex : IO::Error
+        close
+        error = ConnectionError.new("connection lost: #{ex.message}", cause: ex)
+        (results.size...pipeline.size).each { |i| pipeline.resolve(i, error) }
+        raise error
+      end
+      results
+    end
+
+    # Runs the block's commands as one `MULTI`..`EXEC` transaction and
+    # returns the `EXEC` array. Raises `AbortedError` if a key marked with
+    # `watch` changed (`EXEC` replied nil), the `EXECABORT` `CommandError`
+    # if a command was rejected at queue time, `ConnectionError` if the
+    # socket drops. Error replies inside the array stay values; the
+    # matching command's future raises them.
+    #
+    # ```
+    # conn.watch("balance")
+    # balance = conn.get("balance").not_nil!.to_i
+    # conn.multi { |tx| tx.set("balance", balance - 10) } # => ["OK"]
+    # ```
+    def multi(&block : Transaction ->) : Array(Value)
+      exec = nil
+      pipelined { |p| exec = p.multi(&block) }
+      exec.not_nil!.value
+    end
+
+    # Raises `ArgumentError`: `watch` needs at least one key.
+    def watch : Nil
+      raise ArgumentError.new("WATCH needs at least one key")
+    end
+
+    # Marks *keys* for optimistic locking: a following `multi` on this
+    # connection raises `AbortedError` if any of them changed in between.
+    # `WATCH` is per connection, which is why it exists only here and not
+    # on `Client`; see `Client#watch`.
+    def watch(*keys : String) : Nil
+      args = Array(RESP::Arg).new(keys.size + 1)
+      args << "WATCH"
+      keys.each { |k| args << k }
+      call(args)
+      nil
+    end
+
+    # Forgets every key marked with `watch`.
+    def unwatch : Nil
+      call({"UNWATCH"})
+      nil
+    end
+
     # Closes the socket. Every later call raises `ConnectionError`.
     def close : Nil
       return if @closed
