@@ -72,6 +72,17 @@ module Redis
         @cache.add(@sha)
       end
     end
+
+    # :nodoc:
+    #
+    # Restated (rather than left inherited from `Future(T)`) so that a
+    # virtual call through `AbstractFuture` — as `ExecFuture#resolve` makes
+    # when fanning an error out to a transaction's futures — finds it; a
+    # method a generic ancestor implements for an `abstract def` is not
+    # visible through the non-generic root without a direct override.
+    def resolved? : Bool
+      super
+    end
   end
 
   # Collects commands inside `Client#pipelined`. Every typed command
@@ -137,6 +148,37 @@ module Redis
       # `Value | ConnectionError`, because `IO::TimeoutError` also flows
       # through here.
       @futures[index].resolve(raw)
+    end
+
+    # Queues a `MULTI`..`EXEC` block. The block's commands return futures
+    # resolved from the `EXEC` array; the returned future resolves to that
+    # array itself, raises `AbortedError` if `EXEC` replied nil (a watched
+    # key changed), the `EXECABORT` error if a command was rejected at
+    # queue time, and `ProtocolError` on a malformed reply. Error replies
+    # inside the array stay values; only the matching command's future
+    # raises them.
+    #
+    # `size` grows by the block's command count plus two. The raw replies
+    # returned by `Client#pipelined` include the `MULTI` `"OK"`, one
+    # `"QUEUED"` per command, and the `EXEC` array. An empty block queues
+    # nothing and returns a future already resolved to an empty array.
+    def multi(& : Transaction ->) : Future(Array(Value))
+      tx = Transaction.new(@script_cache)
+      yield tx
+      targets = tx.futures
+      exec = ExecFuture.new(targets)
+      if targets.empty?
+        exec.resolve([] of Value)
+        return exec
+      end
+      RESP.write_command(@buffer, {"MULTI"})
+      @futures << Future(Nil).new(->(v : Value) { nil })
+      @buffer.write(tx.buffer.to_slice)
+      targets.each { |target| @futures << QueuedFuture.new(target) }
+      RESP.write_command(@buffer, {"EXEC"})
+      @futures << exec
+      @size += targets.size + 2
+      exec
     end
 
     # Not available on a pipeline: iteration needs each cursor reply

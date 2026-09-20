@@ -45,6 +45,7 @@ require "./redis/resp"
 require "./redis/commands"
 require "./redis/connection"
 require "./redis/pipeline"
+require "./redis/transaction"
 require "./redis/client"
 
 module Redis
