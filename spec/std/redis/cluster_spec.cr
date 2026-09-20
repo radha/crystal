@@ -194,7 +194,9 @@ describe Redis::Cluster do
     end
     wg.wait
     results.should eq(Array(String?).new(20, "v"))
-    # Every MOVED marked the map stale; the next round reloads exactly once.
+    # Every MOVED marked the map stale; the next round reloads exactly
+    # once, however many of round one's reloads the scheduler let through.
+    before = fake.slots_calls
     wg = WaitGroup.new(20)
     20.times do
       spawn do
@@ -206,7 +208,7 @@ describe Redis::Cluster do
       end
     end
     wg.wait
-    fake.slots_calls.should eq(2)
+    (fake.slots_calls - before).should eq(1)
     cluster.close
     fake.close
   end
@@ -300,6 +302,74 @@ describe Redis::Cluster do
     clients.all?(&.closed?).should be_true
     expect_raises(Redis::ConnectionError, /closed/) { cluster.get("b") }
     expect_raises(Redis::ConnectionError, /closed/) { cluster.refresh }
+    fake.close
+  end
+
+  it "falls back to the asked host for a node that reports none" do
+    fake = fake_two { false }
+    fake.host = ""
+    cluster = Redis::Cluster.new(fake.url(0))
+    cluster.get("b").should eq("v")
+    cluster.get("a").should eq("v")
+    cluster.nodes.map(&.host).should eq(["127.0.0.1", "127.0.0.1"])
+    cluster.nodes.map(&.address).should eq(["127.0.0.1:#{fake.port(0)}", "127.0.0.1:#{fake.port(1)}"])
+    fake.commands(1).should eq([["GET", "a"]])
+    cluster.close
+    fake.close
+  end
+
+  it "raises ProtocolError on a malformed CLUSTER SLOTS reply and keeps the topology" do
+    port : Int32? = nil
+    good = false
+    server = RedisSpec::FakeServer.new do |io|
+      while cmd = RedisSpec::FakeServer.read_command(io)
+        case cmd[0]
+        when "HELLO"
+          io << RedisSpec::HELLO_REPLY
+        when "CLUSTER"
+          if good
+            io << "*1\r\n*3\r\n:0\r\n:16383\r\n*3\r\n$9\r\n127.0.0.1\r\n:#{port}\r\n$5\r\nnode0\r\n"
+          else
+            # A first range that demotes the known node to a replica of
+            # another address, then a range that is not an array at all.
+            io << "*2\r\n*4\r\n:0\r\n:8191\r\n"
+            io << "*3\r\n$9\r\n127.0.0.1\r\n:9999\r\n$5\r\nnodeX\r\n"
+            io << "*3\r\n$9\r\n127.0.0.1\r\n:#{port}\r\n$5\r\nnode0\r\n"
+            io << ":1\r\n"
+          end
+        else
+          io << "$1\r\nv\r\n"
+        end
+        io.flush
+      end
+    end
+    port = server.port
+    cluster = Redis::Cluster.new(server.url)
+    expect_raises(Redis::ProtocolError, /CLUSTER SLOTS/) { cluster.get("b") }
+    cluster.nodes.should be_empty
+    good = true
+    cluster.get("b").should eq("v")
+    node = cluster.node_for("b")
+    # A reply that goes bad partway leaves the nodes and their clients alone.
+    good = false
+    expect_raises(Redis::ProtocolError, /CLUSTER SLOTS/) { cluster.refresh }
+    cluster.nodes.map(&.address).should eq([node.address])
+    cluster.node_for("b").should be(node)
+    node.client.closed?.should be_false
+    cluster.get("b").should eq("v")
+    cluster.close
+    server.close
+  end
+
+  it "routes a slot no range covers to a master" do
+    fake = fake_two { false }
+    fake.ranges = [{0, 8191, 0}]
+    cluster = Redis::Cluster.new(fake.url(0))
+    # "a" hashes to 15495, which the one range leaves unassigned.
+    cluster.get("a").should eq("v")
+    fake.commands(0).should eq([["CLUSTER", "SLOTS"], ["GET", "a"]])
+    fake.commands(1).should be_empty
+    cluster.close
     fake.close
   end
 end

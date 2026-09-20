@@ -100,24 +100,35 @@ module RedisSpec
   # to its master's); every other command goes to the handler, which gets
   # the cluster, the node index, the parsed command and the socket. `seen`
   # records every command with its node index in arrival order.
+  #
+  # Every node serves its connections on fibers of its own, so the command
+  # log and the `CLUSTER SLOTS` counter are written from several of them:
+  # both are guarded by a lock, and `seen`, `commands` and `slots_calls`
+  # read them under it.
   class FakeCluster
     getter servers = [] of FakeServer
-    getter seen = [] of {Int32, Array(String)}
-    getter slots_calls = 0
     property ranges : Array({Int32, Int32, Int32})
     property replicas = {} of Int32 => Int32
+    # The host `CLUSTER SLOTS` reports for every node; `""` makes the
+    # fake answer like a node that does not know its own address.
+    property host = "127.0.0.1"
 
     def initialize(count : Int32, @ranges : Array({Int32, Int32, Int32}),
                    &handler : FakeCluster, Int32, Array(String), IO ->)
+      @lock = Mutex.new
+      @seen = [] of {Int32, Array(String)}
+      @slots_calls = 0
       count.times do |index|
         @servers << FakeServer.new do |io|
           while cmd = FakeServer.read_command(io)
-            @seen << {index, cmd}
+            @lock.synchronize do
+              @seen << {index, cmd}
+              @slots_calls += 1 if cmd[0] == "CLUSTER"
+            end
             case cmd[0]
             when "HELLO"
               io << HELLO_REPLY
             when "CLUSTER"
-              @slots_calls += 1
               io << slots_reply
             else
               handler.call(self, index, cmd, io)
@@ -126,6 +137,16 @@ module RedisSpec
           end
         end
       end
+    end
+
+    # Every command every node saw, with its node index, in arrival order.
+    def seen : Array({Int32, Array(String)})
+      @lock.synchronize { @seen.dup }
+    end
+
+    # How many `CLUSTER SLOTS` commands the fake has answered.
+    def slots_calls : Int32
+      @lock.synchronize { @slots_calls }
     end
 
     def port(index : Int32) : Int32
@@ -146,7 +167,7 @@ module RedisSpec
 
     # Every command node *index* saw except `HELLO`, in order.
     def commands(index : Int32) : Array(Array(String))
-      @seen.select { |i, _| i == index }.map { |_, cmd| cmd }.reject { |cmd| cmd[0] == "HELLO" }
+      seen.select { |i, _| i == index }.map { |_, cmd| cmd }.reject { |cmd| cmd[0] == "HELLO" }
     end
 
     def moved(slot : Int32, node : Int32) : String
@@ -169,7 +190,7 @@ module RedisSpec
           followers = @replicas.select { |_, master| master == node }.keys
           s << '*' << 3 + followers.size << "\r\n:" << first << "\r\n:" << last << "\r\n"
           ([node] + followers).each do |n|
-            s << "*3\r\n" << FakeCluster.bulk("127.0.0.1") << ':' << port(n) << "\r\n" << FakeCluster.bulk("node#{n}")
+            s << "*3\r\n" << FakeCluster.bulk(@host) << ':' << port(n) << "\r\n" << FakeCluster.bulk("node#{n}")
           end
         end
       end

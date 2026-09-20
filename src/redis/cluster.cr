@@ -365,7 +365,7 @@ module Redis
           _, node = parse_redirect(error)
           asking = true
         when "TRYAGAIN"
-          sleep({10.milliseconds * (1 << attempt), 500.milliseconds}.min)
+          sleep({10.milliseconds * (1 << {attempt, 6}.min), 500.milliseconds}.min)
         else
           raise error
         end
@@ -477,17 +477,26 @@ module Redis
       Node.new(host, port, id, master, ->node_client(String, Int32))
     end
 
+    # One node exactly as a `CLUSTER SLOTS` reply describes it, before any
+    # existing `Node` is consulted.
+    private alias Described = NamedTuple(host: String, port: Int32, id: String, master: Bool)
+
     # Parses a `CLUSTER SLOTS` reply (`[[first, last, [host, port, id, ...],
     # replica...], ...]`) and swaps the topology in, keeping the `Node`
     # objects (and their clients) of addresses already known. *asked_host*
     # stands in for a node whose own address the server left empty. Nodes
     # that disappeared, and masters that turned replica, are closed.
+    #
+    # The whole reply is parsed into plain descriptions first and no
+    # existing `Node` is touched until that succeeded, so a malformed
+    # reply leaves the topology exactly as it was. An address listed as
+    # the master of any range is a master, whatever a replica entry
+    # elsewhere in the reply says about it.
     private def install(reply : Value, asked_host : String) : Nil
       ranges = reply.as?(Array) || raise ProtocolError.new("unexpected CLUSTER SLOTS reply #{reply.inspect}")
-      slots = Array(Node?).new(SLOTS, nil)
-      nodes = {} of String => Node
-      masters = [] of Node
-      old = @mutex.synchronize { @nodes.dup }
+      described = {} of String => Described
+      master_order = [] of String
+      assignments = [] of {Int32, Int32, String?}
       ranges.each do |range|
         entry = range.as?(Array) || raise ProtocolError.new("unexpected CLUSTER SLOTS range #{range.inspect}")
         first = entry[0]?.as?(Int64)
@@ -495,7 +504,7 @@ module Redis
         unless first && last && 0 <= first && first <= last && last < SLOTS
           raise ProtocolError.new("unexpected CLUSTER SLOTS range #{range.inspect}")
         end
-        master = nil
+        master_address = nil
         entry.each_with_index do |item, i|
           next if i < 2
           desc = item.as?(Array) || raise ProtocolError.new("unexpected CLUSTER SLOTS node #{item.inspect}")
@@ -505,27 +514,43 @@ module Redis
           id = desc[2]?.as?(String) || ""
           address = "#{host}:#{port}"
           is_master = i == 2
-          node = nodes[address]? || old[address]? || new_node(host, port.to_i, id, is_master)
-          node.master = is_master
-          node.id = id unless id.empty?
-          nodes[address] = node
-          if is_master
-            masters << node unless masters.includes?(node)
-            master = node
+          previous = described[address]?
+          if previous
+            id = previous[:id] if id.empty?
+            is_master ||= previous[:master]
+          end
+          described[address] = {host: host, port: port.to_i, id: id, master: is_master}
+          if i == 2
+            master_address = address
+            master_order << address unless master_order.includes?(address)
           end
         end
-        (first..last).each { |slot| slots[slot] = master }
+        assignments << {first.to_i, last.to_i, master_address}
       end
-      gone = @mutex.synchronize do
+      gone, demoted = @mutex.synchronize do
+        nodes = {} of String => Node
+        leaving = [] of Node
+        described.each do |address, desc|
+          node = @nodes[address]? || new_node(desc[:host], desc[:port], desc[:id], desc[:master])
+          node.master = desc[:master]
+          node.id = desc[:id] unless desc[:id].empty?
+          nodes[address] = node
+          leaving << node unless desc[:master]
+        end
+        slots = Array(Node?).new(SLOTS, nil)
+        assignments.each do |first, last, address|
+          master = address ? nodes[address] : nil
+          (first..last).each { |slot| slots[slot] = master }
+        end
         removed = @nodes.values.reject { |node| nodes.has_key?(node.address) }
         @slots = slots
         @nodes = nodes
-        @masters = masters
+        @masters = master_order.map { |address| nodes[address] }
         @stale = false
-        removed
+        {removed, leaving}
       end
       gone.each(&.close)
-      nodes.each_value { |node| node.close unless node.master? }
+      demoted.each(&.close)
     end
   end
 end
