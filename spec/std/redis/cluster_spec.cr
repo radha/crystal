@@ -26,6 +26,10 @@ private def fake_two(&override : RedisSpec::FakeCluster, Int32, Array(String), I
   end
 end
 
+private def values(*items) : Array(Redis::Value)
+  Array(Redis::Value).new(items.size) { |i| items[i].as(Redis::Value) }
+end
+
 private def dead_port : Int32
   server = TCPServer.new("127.0.0.1", 0)
   port = server.local_address.port
@@ -369,6 +373,140 @@ describe Redis::Cluster do
     cluster.get("a").should eq("v")
     fake.commands(0).should eq([["CLUSTER", "SLOTS"], ["GET", "a"]])
     fake.commands(1).should be_empty
+    cluster.close
+    fake.close
+  end
+end
+
+describe "Redis::Cluster#pipelined" do
+  it "splits by node, keeps caller order and resolves every future" do
+    fake = fake_two { false }
+    cluster = Redis::Cluster.new(fake.url(0))
+    futures = [] of Redis::Future(String?)
+    replies = cluster.pipelined do |p|
+      futures << p.get("a") # node 1
+      futures << p.get("b") # node 0
+      p.set("x", "1")       # node 1
+      futures << p.get("k") # node 0
+      p.command("PING")     # any master
+    end
+    replies.size.should eq(5)
+    replies[0..3].should eq(values("v", "v", "OK", "v"))
+    replies[4].should eq("PONG")
+    futures.map(&.value).should eq(["v", "v", "v"])
+    fake.commands(0).reject { |c| c[0] == "PING" }.should eq([["CLUSTER", "SLOTS"], ["GET", "b"], ["GET", "k"]])
+    fake.commands(1).reject { |c| c[0] == "PING" }.should eq([["GET", "a"], ["SET", "x", "1"]])
+    cluster.pipelined { |p| }.should eq([] of Redis::Value)
+    cluster.close
+    fake.close
+  end
+
+  it "re-issues a redirected command on its own" do
+    moved = true
+    asked = true
+    fake = fake_two do |fk, index, cmd, io|
+      if index == 0 && cmd[0] == "GET" && cmd[1] == "b" && moved
+        moved = false
+        io << fk.moved(Redis::Cluster.key_slot("b"), 1)
+        true
+      elsif index == 0 && cmd[0] == "GET" && cmd[1] == "k" && asked
+        asked = false
+        io << fk.ask(Redis::Cluster.key_slot("k"), 1)
+        true
+      else
+        false
+      end
+    end
+    cluster = Redis::Cluster.new(fake.url(0))
+    b = k = nil
+    replies = cluster.pipelined do |p|
+      p.get("a")
+      b = p.get("b")
+      k = p.get("k")
+    end
+    replies.should eq(values("v", "v", "v"))
+    b.not_nil!.value.should eq("v")
+    k.not_nil!.value.should eq("v")
+    fake.commands(1).should eq([["GET", "a"], ["GET", "b"], ["ASKING"], ["GET", "k"]])
+    cluster.close
+    fake.close
+  end
+
+  it "keeps a multi block contiguous on one node" do
+    fake = fake_two do |fk, index, cmd, io|
+      if cmd[0] == "EXEC"
+        io << "*2\r\n:1\r\n:2\r\n"
+        true
+      else
+        false
+      end
+    end
+    cluster = Redis::Cluster.new(fake.url(0))
+    a = b = nil
+    exec = nil
+    replies = cluster.pipelined do |p|
+      p.get("b")
+      exec = p.multi do |tx|
+        a = tx.incr("{t}a")
+        b = tx.incr("{t}b")
+      end
+      p.get("k")
+    end
+    replies.size.should eq(6)
+    exec.not_nil!.value.should eq(values(1_i64, 2_i64))
+    a.not_nil!.value.should eq(1_i64)
+    b.not_nil!.value.should eq(2_i64)
+    fake.commands(1).should eq([["MULTI"], ["INCR", "{t}a"], ["INCR", "{t}b"], ["EXEC"]])
+    fake.commands(0).should eq([["CLUSTER", "SLOTS"], ["GET", "b"], ["GET", "k"]])
+    cluster.multi { |tx| tx.incr("{t}a"); tx.incr("{t}b") }.should eq(values(1_i64, 2_i64))
+    cluster.close
+    fake.close
+  end
+
+  it "surfaces CROSSSLOT and does not retry a redirect inside a transaction" do
+    fake = fake_two do |fk, index, cmd, io|
+      case cmd[0]
+      when "MGET"
+        io << "-CROSSSLOT Keys in request don't hash to the same slot\r\n"
+        true
+      when "INCR"
+        io << fk.moved(Redis::Cluster.key_slot(cmd[1]), 1 - index)
+        true
+      when "EXEC"
+        io << "-EXECABORT Transaction discarded because of previous errors.\r\n"
+        true
+      else
+        false
+      end
+    end
+    cluster = Redis::Cluster.new(fake.url(0))
+    expect_raises(Redis::CommandError, /CROSSSLOT/) { cluster.mget("a", "b") }
+    f = nil
+    expect_raises(Redis::CommandError, /EXECABORT/) { cluster.multi { |tx| f = tx.incr("{t}a") } }
+    expect_raises(Redis::CommandError, /MOVED/) { f.not_nil!.value }
+    fake.commands(0).count { |c| c[0] == "INCR" }.should eq(0)
+    fake.commands(1).count { |c| c[0] == "INCR" }.should eq(1)
+    cluster.close
+    fake.close
+  end
+
+  it "fails one node's futures on a lost connection and raises after the rest answered" do
+    fake = fake_two { false }
+    cluster = Redis::Cluster.new(fake.url(0))
+    cluster.ping
+    fa = fb = nil
+    expect_raises(Redis::ConnectionError) do
+      cluster.pipelined do |p|
+        fa = p.get("a")
+        p.command("DIE", "b")
+        fb = p.get("b")
+      end
+    end
+    fa.not_nil!.value.should eq("v")
+    expect_raises(Redis::ConnectionError) { fb.not_nil!.value }
+    fake.slots_calls.should eq(1)
+    cluster.get("a").should eq("v")
+    fake.slots_calls.should eq(2)
     cluster.close
     fake.close
   end

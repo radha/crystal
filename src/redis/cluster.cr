@@ -1,3 +1,5 @@
+require "wait_group"
+
 module Redis
   # A client for Redis Cluster: routes every command to the master that
   # owns its key's hash slot, follows `MOVED`, `ASK` and `TRYAGAIN`
@@ -278,6 +280,144 @@ module Redis
     # :nodoc:
     def typed_call(args : Indexable, &block : Value -> T) forall T
       block.call(call(args))
+    end
+
+    # Runs the block against a `Pipeline`, sends every node its commands in
+    # one write with the nodes in parallel, and returns the raw replies in
+    # the order the block queued them. Commands are grouped by the master
+    # owning their key's slot; keyless commands all go to one master.
+    # Error replies stay in the array as `CommandError` values (and are
+    # raised by the matching `Future#value`). A `MOVED`, `ASK` or
+    # `TRYAGAIN` reply to a single command is followed for that command
+    # alone; a `multi` block stays on its node and a redirect at queue
+    # time fails it with `EXECABORT` like any queue-time error. A lost
+    # connection or `read_timeout` on one node fails that node's futures
+    # with it while the other nodes' replies are kept, then the first such
+    # failure is raised once every node has answered.
+    #
+    # ```
+    # first = nil
+    # cluster.pipelined do |p|
+    #   p.set("a", "1")
+    #   first = p.get("b")
+    # end
+    # first.not_nil!.value
+    # ```
+    def pipelined(& : Pipeline ->) : Array(Value)
+      pipeline = Pipeline.new(@script_cache, routing: true)
+      yield pipeline
+      check_open
+      size = pipeline.size
+      return [] of Value if size == 0
+      refresh_if_stale
+      routes = pipeline.routes
+      offsets = pipeline.offsets
+      bytes = pipeline.buffer.to_slice
+      groups = {} of Node => Array(Int32)
+      order = [] of Node
+      @mutex.synchronize do
+        raise ClusterError.new("cluster has no masters") if @masters.empty?
+        fallback = @masters.sample
+        size.times do |i|
+          key = routes[i].key
+          node = (key ? @slots[Cluster.key_slot(key)] : nil) || fallback
+          indices = groups[node]?
+          unless indices
+            indices = groups[node] = [] of Int32
+            order << node
+          end
+          indices << i
+        end
+      end
+      values = Array(Value).new(size, nil)
+      failures = Array(Exception?).new(size, nil)
+      wg = WaitGroup.new
+      order.each_with_index do |node, position|
+        indices = groups[node]
+        if position == order.size - 1
+          run_group(node, indices, bytes, offsets, values, failures)
+        else
+          wg.add(1)
+          spawn do
+            begin
+              run_group(node, indices, bytes, offsets, values, failures)
+            ensure
+              wg.done
+            end
+          end
+        end
+      end
+      wg.wait
+      size.times do |i|
+        next if failures[i]
+        value = values[i]
+        next unless value.is_a?(CommandError) && routes[i].retry && REDIRECT_CODES.includes?(value.code)
+        slot = routes[i].key.try { |key| Cluster.key_slot(key) }
+        command = bytes[offsets[i], command_end(offsets, i, bytes.size) - offsets[i]]
+        begin
+          values[i] = execute(slot, value) { |node, asking| node.client.call_raw(command, asking) }
+        rescue ex : CommandError
+          values[i] = ex
+        rescue ex : ClusterError | ConnectionError | IO::TimeoutError
+          failures[i] = ex
+        end
+      end
+      results = Array(Value).new(size)
+      first_failure = nil
+      size.times do |i|
+        if error = failures[i]
+          pipeline.fail(i, error)
+          first_failure ||= error
+        else
+          pipeline.resolve(i, values[i])
+          results << values[i]
+        end
+      end
+      raise first_failure if first_failure
+      results
+    end
+
+    # Runs the block's commands as one `MULTI`..`EXEC` transaction on the
+    # master owning the first keyed command's slot, in one write, and
+    # returns the `EXEC` array; every key must be in that slot (hash tags).
+    # Raises `AbortedError` if a key marked with `watch` changed, the
+    # `EXECABORT` `CommandError` if a command was rejected at queue time
+    # (a `MOVED` at queue time included), `ConnectionError` if the socket
+    # drops. Error replies inside the array stay values; the matching
+    # command's future raises them.
+    #
+    # ```
+    # cluster.multi { |tx| tx.incr("{acct}a"); tx.incr("{acct}b") } # => [1_i64, 1_i64]
+    # ```
+    def multi(&block : Transaction ->) : Array(Value)
+      exec = nil
+      pipelined { |p| exec = p.multi(&block) }
+      exec.not_nil!.value
+    end
+
+    # Copies the group's commands out of *bytes* and runs them on *node*,
+    # storing each reply or failure at its original index. A connection
+    # loss or timeout marks the map stale; the failures are already stored
+    # by `pipeline_raw`, except when the send itself failed.
+    private def run_group(node : Node, indices : Array(Int32), bytes : Bytes, offsets : Array(Int32),
+                          values : Array(Value), failures : Array(Exception?)) : Nil
+      chunk = IO::Memory.new
+      indices.each do |i|
+        chunk.write(bytes[offsets[i], command_end(offsets, i, bytes.size) - offsets[i]])
+      end
+      node.client.pipeline_raw(chunk.to_slice, indices.size) do |j, value, error|
+        i = indices[j]
+        values[i] = value
+        failures[i] = error
+      end
+    rescue ex : ConnectionError | IO::TimeoutError
+      @mutex.synchronize { @stale = true }
+      indices.each { |i| failures[i] ||= ex }
+    end
+
+    # The byte offset just past command *i*.
+    private def command_end(offsets : Array(Int32), i : Int32, total : Int32) : Int32
+      i + 1 < offsets.size ? offsets[i + 1] : total
     end
 
     # Iterates every key matching *match* on every master in turn. `SCAN`
