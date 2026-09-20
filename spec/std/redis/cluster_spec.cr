@@ -309,6 +309,47 @@ describe Redis::Cluster do
     fake.close
   end
 
+  it "never opens a node client again once the cluster is closed" do
+    # Node 0 answers every GET with TRYAGAIN, so the command spends its
+    # retries in `execute`'s backoff, where `close` catches it.
+    answered = Channel(Nil).new(32)
+    fake = fake_two do |f, index, cmd, io|
+      if cmd[0] == "GET"
+        io << "-TRYAGAIN Multiple keys request during rehashing of slot\r\n"
+        io.flush
+        answered.send(nil)
+        true
+      else
+        false
+      end
+    end
+    cluster = Redis::Cluster.new(fake.url(0))
+    cluster.set("b", "1").should eq("OK")
+    # The seed probe and node 0's client.
+    opened = fake.accepted(0)
+    opened.should eq(2)
+    error = nil
+    wg = WaitGroup.new(1)
+    spawn do
+      begin
+        cluster.get("b")
+      rescue ex
+        error = ex
+      ensure
+        wg.done
+      end
+    end
+    answered.receive
+    sleep 1.millisecond
+    cluster.close
+    wg.wait
+    error.should be_a(Redis::ConnectionError)
+    error.not_nil!.message.should match(/closed/)
+    # The retry did not build a second client behind the closed cluster.
+    fake.accepted(0).should eq(opened)
+    fake.close
+  end
+
   it "falls back to the asked host for a node that reports none" do
     fake = fake_two { false }
     fake.host = ""
@@ -428,6 +469,40 @@ describe "Redis::Cluster#pipelined" do
     b.not_nil!.value.should eq("v")
     k.not_nil!.value.should eq("v")
     fake.commands(1).should eq([["GET", "a"], ["GET", "b"], ["ASKING"], ["GET", "k"]])
+    cluster.close
+    fake.close
+  end
+
+  it "reloads the topology once for a pipeline full of MOVED replies" do
+    moved = Set(String).new
+    fake = fake_two do |fk, index, cmd, io|
+      if index == 0 && cmd[0] == "GET" && moved.add?(cmd[1])
+        io << fk.moved(Redis::Cluster.key_slot(cmd[1]), 1)
+        true
+      else
+        false
+      end
+    end
+    cluster = Redis::Cluster.new(fake.url(0))
+    cluster.get("a").should eq("v") # the one topology load so far, on node 1
+    before = fake.slots_calls
+    before.should eq(1)
+    # "b", "k" and "c" all belong to node 0, which moves each of them once.
+    cluster.pipelined do |p|
+      p.get("b")
+      p.get("k")
+      p.get("c")
+    end.should eq(values("v", "v", "v"))
+    fake.commands(1).should eq([["GET", "a"], ["GET", "b"], ["GET", "k"], ["GET", "c"]])
+    # Every MOVED marks the map stale, but a retry takes its node from the
+    # redirect itself instead of routing, so no reload happens between the
+    # retries; without that, each retry after the first would reload.
+    (fake.slots_calls - before).should eq(0)
+    # The stale mark stands, so the next ordinary command reloads once.
+    cluster.get("a").should eq("v")
+    (fake.slots_calls - before).should eq(1)
+    cluster.get("a").should eq("v")
+    (fake.slots_calls - before).should eq(1)
     cluster.close
     fake.close
   end

@@ -153,6 +153,11 @@ module Redis
       # Whether the node is a master; only masters are routed to.
       getter? master : Bool
       @client : Client?
+      # Guards `@client` and `@closed`: a fiber that holds a `Node` can
+      # ask for its client at any time, including while another fiber is
+      # closing the node or the whole cluster.
+      @client_mutex = Mutex.new
+      @closed = false
 
       # :nodoc:
       def initialize(@host : String, @port : Int32, @id : String, @master : Bool,
@@ -166,10 +171,16 @@ module Redis
 
       # The node's multiplexed client, created on first use with the
       # cluster's options and connected on its first command. Raises
-      # `ArgumentError` on a replica.
+      # `ArgumentError` on a replica and `ConnectionError` once the node
+      # has been closed (because the cluster was closed, or because a
+      # topology reload dropped or demoted the node): a client created
+      # then would be reachable by nobody and never closed.
       def client : Client
         raise ArgumentError.new("#{address} is a replica") unless @master
-        @client ||= @factory.call(@host, @port)
+        @client_mutex.synchronize do
+          raise ConnectionError.new("#{address} is closed") if @closed
+          @client ||= @factory.call(@host, @port)
+        end
       end
 
       # :nodoc:
@@ -181,11 +192,27 @@ module Redis
       end
 
       # :nodoc:
+      #
+      # Closes the node's client, if it opened one, and refuses to make
+      # another. The client is closed outside the node's mutex.
       def close : Nil
-        @client.try &.close
-        @client = nil
+        existing = @client_mutex.synchronize do
+          @closed = true
+          current, @client = @client, nil
+          current
+        end
+        existing.try &.close
       end
 
+      # :nodoc:
+      #
+      # Lets the node open a client again, for a node a reload kept (or
+      # brought back) as a master after an earlier close.
+      def reopen : Nil
+        @client_mutex.synchronize { @closed = false }
+      end
+
+      # Appends `"host:port (master)"` or `"host:port (replica)"` to *io*.
       def to_s(io : IO) : Nil
         io << address << (@master ? " (master)" : " (replica)")
       end
@@ -271,7 +298,7 @@ module Redis
     # ```
     # cluster.command("MYMODULE.DO", "k", 1, key: "k")
     # ```
-    def command(*args : RESP::Arg, key : String)
+    def command(*args : RESP::Arg, key : String) : Value
       call(args, key: key)
     end
 
@@ -528,9 +555,15 @@ module Redis
     # retries there once with the asking flag; a `TRYAGAIN` retries after
     # a growing pause. *redirect* is a redirect reply already received
     # (from a pipeline), processed before the first send.
+    #
+    # A pending `MOVED` or `ASK` names its own node, so the slot map is
+    # not consulted at all in that case: `route` would reload a map that
+    # the pipeline's previous redirect has just marked stale, and a
+    # pipeline retrying N redirected commands would reload N times. The
+    # stale mark still stands, so the next ordinary command reloads once.
     private def execute(slot : Int32?, redirect : CommandError? = nil, & : Node, Bool -> Value) : Value
       check_open
-      node = route(slot)
+      node = redirect && redirect.code != "TRYAGAIN" ? parse_redirect(redirect)[1] : route(slot)
       asking = false
       attempt = 0
       pending = redirect
@@ -726,6 +759,11 @@ module Redis
           node = @nodes[address]? || new_node(desc[:host], desc[:port], desc[:id], desc[:master])
           node.master = desc[:master]
           node.id = desc[:id] unless desc[:id].empty?
+          # A master this reload keeps may have been closed by an earlier
+          # one that listed it as a replica, or as gone; it serves
+          # commands again, so let it open a client. Never after `close`:
+          # nobody would close that client.
+          node.reopen if desc[:master] && !@closed
           nodes[address] = node
           leaving << node unless desc[:master]
         end
