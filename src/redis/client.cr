@@ -291,7 +291,10 @@ module Redis
     # for the read-then-`multi` sequence, and hands it back. Returns the
     # block's value. If the block leaves without having run `multi` (it
     # returned early or raised), `UNWATCH` is sent so the watch cannot leak
-    # to the connection's next borrower. An `AbortedError` raised by
+    # to the connection's next borrower; a `ConnectionError` from that
+    # `UNWATCH` is not raised, since the connection is closed by then and
+    # the pool drops it, so the block's own outcome always reaches the
+    # caller. An `AbortedError` raised by
     # `Connection#multi` inside the block means a watched key changed;
     # retrying is the caller's loop:
     #
@@ -316,7 +319,15 @@ module Redis
         begin
           block.call(conn)
         ensure
-          conn.unwatch if conn.watching? && !conn.closed?
+          begin
+            conn.unwatch if conn.watching? && !conn.closed?
+          rescue ConnectionError
+            # `UNWATCH` is a round trip and can fail on its own. The
+            # failure closed the connection, so the pool drops it and the
+            # watch dies with it; raising here instead would replace
+            # whatever the block raised (an `AbortedError` the caller
+            # retries on, say) with this.
+          end
         end
       end
     end

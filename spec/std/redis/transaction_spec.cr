@@ -164,6 +164,8 @@ private class TxServer
   getter chunks = [] of Int32
   getter seen = [] of Array(String)
   property abort = false
+  # Closes the socket on `UNWATCH` instead of answering it.
+  property die_on_unwatch = false
 
   def server
     RedisSpec::FakeServer.new do |io|
@@ -201,12 +203,19 @@ private class TxServer
             when "MULTI"
               queued = [] of Array(String)
               io << "+OK\r\n"
+            when "UNWATCH"
+              if @die_on_unwatch
+                io.close
+                break
+              end
+              io << "+OK\r\n"
             else
               io << reply_for(cmd)
             end
           end
         end
         @chunks << count if count > 0
+        break if io.closed?
         io.flush
       end
     end
@@ -423,6 +432,29 @@ describe "Redis::Client#watch" do
     inner.not_nil!.closed?.should be_false
     fake.seen.should_not contain(["UNWATCH"])
     expect_raises(Exception, "boom") { client.watch("k") { |conn| raise "boom" } }
+    fake.seen.last.should eq(["UNWATCH"])
+    client.close
+    server.close
+  end
+
+  it "keeps the block's exception when UNWATCH itself fails" do
+    fake = TxServer.new
+    server = fake.server
+    client = Redis::Client.new(server.url)
+    client.ping
+    server.accepted.should eq(1)
+    fake.die_on_unwatch = true
+    # The block raises and the UNWATCH in the ensure loses the connection;
+    # the caller must still see the block's own exception, or a retry loop
+    # around `AbortedError` would never fire.
+    expect_raises(Exception, "boom") { client.watch("k") { |conn| raise "boom" } }
+    fake.seen.last.should eq(["UNWATCH"])
+    # The pooled connection was closed by the failure and dropped, so the
+    # next watch opens a fresh one.
+    server.accepted.should eq(2)
+    fake.die_on_unwatch = false
+    client.watch("k") { |conn| conn.get("k") }.should eq("v")
+    server.accepted.should eq(3)
     fake.seen.last.should eq(["UNWATCH"])
     client.close
     server.close
