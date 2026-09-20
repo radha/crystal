@@ -32,7 +32,27 @@
 # Crystal type. Errors: `Redis::CommandError` (server error reply, with
 # `code`), `Redis::ConnectionError`, `Redis::ProtocolError`.
 #
-# Not in this slice: pub/sub, MULTI/EXEC, script caching, cluster routing.
+# Pub/sub: `Redis::Subscriber` (or `Client#subscriber`) receives on its
+# own connection and reconnects by itself; `Client#publish` sends.
+# Transactions: `Client#multi { |tx| ... }` runs a `MULTI`..`EXEC` block
+# atomically with typed futures; `Client#watch(*keys) { |conn| ... }`
+# gives optimistic locking on a dedicated connection. Scripts:
+# `Redis::Script` with `run`, which sends `EVALSHA` and falls back to
+# `EVAL` when the server has not cached the script.
+#
+# ```
+# sub = redis.subscriber
+# sub.subscribe("news")
+# redis.publish("news", "hello")
+# sub.receive.payload # => "hello"
+#
+# redis.multi { |tx| tx.set("a", "1"); tx.incr("hits") } # => ["OK", 1_i64]
+#
+# script = Redis::Script.new("return redis.call('INCRBY', KEYS[1], ARGV[1])")
+# redis.run(script, keys: ["hits"], args: [5]) # => 6_i64
+# ```
+#
+# Not in this slice: cluster routing, connection pools, sharded pub/sub.
 require "socket"
 require "openssl"
 require "uri"
