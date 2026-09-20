@@ -12,6 +12,10 @@ private class PubSubServer
   getter seen = [] of Array(Array(String))
   property confirm_delay : Time::Span? = nil
   property swallow_control = false
+  # While positive, each newly accepted connection is closed by the server
+  # right after the handshake (before reading any command), decrementing
+  # this by one; used to make a freshly reconnected socket die again.
+  property kill_next = 0
   @sockets = [] of IO
   @protocol : Int32
 
@@ -32,6 +36,14 @@ private class PubSubServer
       mine = [] of Array(String)
       @seen << mine
       @sockets << io
+      if @kill_next > 0
+        @kill_next -= 1
+        if @protocol == 3 && (cmd = RedisSpec::FakeServer.read_command(io))
+          RedisSpec::FakeServer.serve_hello(io, cmd)
+        end
+        io.close
+        next
+      end
       # Per-connection subscription state, tracked like a real server so
       # that a bare UNSUBSCRIBE/PUNSUBSCRIBE can answer with one frame per
       # channel or pattern actually subscribed (counting down to 0), and a
@@ -311,6 +323,27 @@ private def subscriber_specs(protocol : Int32)
       server.close
     end
 
+    it "retries when the reconnected socket is killed again before resubscribing lands" do
+      fake = PubSubServer.new(protocol)
+      server = fake.server
+      sub = Redis::Subscriber.new(server.url, protocol: protocol)
+      sub.subscribe("a")
+      fake.kill_next = 1
+      fake.kill
+      # The first reconnect attempt (connection 2) is killed by the server
+      # right after the handshake, before it reads SUBSCRIBE: its send or
+      # the read that follows fails, so the loop retries and lands on a
+      # third connection.
+      wait_until { fake.connections >= 3 && fake.commands_on(3).size >= 1 }
+      fake.commands_on(2).should be_empty
+      fake.commands_on(3).should eq([["SUBSCRIBE", "a"]])
+      sub.connected?.should be_true
+      fake.publish("a", "after")
+      sub.receive.payload.should eq("after")
+      sub.close
+      server.close
+    end
+
     it "keeps retrying with backoff while the server is down and close interrupts the wait" do
       fake = PubSubServer.new(protocol)
       server = fake.server
@@ -340,6 +373,19 @@ private def subscriber_specs(protocol : Int32)
       sub.receive?.should be_nil
       sub.closed?.should be_true
       sub.error.try(&.message).should eq("hook failed")
+      server.close
+    end
+
+    it "an on_reconnect hook calling a control command raises instead of deadlocking, closing the subscriber" do
+      fake = PubSubServer.new(protocol)
+      server = fake.server
+      sub = Redis::Subscriber.new(server.url, protocol: protocol)
+      sub.on_reconnect = -> { sub.ping }
+      sub.subscribe("a")
+      fake.kill
+      sub.receive?.should be_nil
+      sub.closed?.should be_true
+      sub.error.should be_a(ArgumentError)
       server.close
     end
   end

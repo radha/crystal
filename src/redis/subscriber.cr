@@ -24,6 +24,12 @@ module Redis
   # pub/sub has no history. `on_disconnect` and `on_reconnect` observe the
   # gap. Pub/sub is database-independent, so there is no `db` option.
   #
+  # `on_disconnect` and `on_reconnect` run on the reader fiber, so they
+  # must not call `subscribe`, `psubscribe`, `unsubscribe`, `punsubscribe`,
+  # `ping`, `receive`, `receive?` or `each` on this subscriber: each of
+  # those blocks waiting for the very fiber that is running the hook
+  # (`close`, `channels`, `patterns`, `connected?` and `error` are fine).
+  #
   # `close` is required: the subscriber owns a reader fiber and has no
   # finalizer. `Client#subscriber` opens one with the client's options.
   class Subscriber
@@ -48,11 +54,16 @@ module Redis
     # while reconnecting; `nil` while the connection is healthy.
     getter error : Exception?
     # Called on the reader fiber with the cause each time the connection
-    # drops. An exception raised by the hook closes the subscriber.
+    # drops. An exception raised by the hook closes the subscriber. Must
+    # not call `subscribe`, `psubscribe`, `unsubscribe`, `punsubscribe`,
+    # `ping`, `receive`, `receive?` or `each` on this subscriber (see the
+    # class docs): doing so deadlocks the reader fiber.
     property on_disconnect : (Exception ->)?
     # Called on the reader fiber after a reconnect has resubscribed every
     # channel and pattern. An exception raised by the hook closes the
-    # subscriber.
+    # subscriber. Must not call `subscribe`, `psubscribe`, `unsubscribe`,
+    # `punsubscribe`, `ping`, `receive`, `receive?` or `each` on this
+    # subscriber (see the class docs): doing so deadlocks the reader fiber.
     property on_reconnect : (->)?
 
     @mutex = Mutex.new
@@ -63,12 +74,21 @@ module Redis
     @closed = false
     @close_signal = Channel(Nil).new
     @url : URI
+    # The reader fiber, remembered so that `control`, `receive` and
+    # `receive?` can detect being called from a hook and fail fast instead
+    # of deadlocking it.
+    @reader : Fiber?
 
     # Connects to *url* (or `Connection::DEFAULT_URL`) and runs the same
     # handshake as `Connection.new`, raising the same errors. *capacity*
     # sizes the message channel; *read_timeout* bounds how long
     # `subscribe` and the other control commands wait for the server's
-    # confirmation, not how long the connection may stay idle. Raises
+    # confirmation, not how long the connection may stay idle. Because
+    # dispatch, message delivery and confirmations share the reader fiber,
+    # a full `messages` channel stalls that fiber, so while a consumer is
+    # slow a concurrent control command can hit `read_timeout` and tear
+    # the connection down even though the server is healthy;
+    # `Client#subscriber` forwards the client's `read_timeout` here. Raises
     # `ArgumentError` if *protocol* is outside `2..3`.
     def initialize(url : String | URI = Connection::DEFAULT_URL, *, @username : String? = nil,
                    @password : String? = nil, @client_name : String? = nil, protocol @protocol_option : Int32 = 3,
@@ -79,7 +99,7 @@ module Redis
       @messages = Channel(Message).new(capacity)
       conn = connect
       @connection = conn
-      spawn(name: "redis-subscriber") { run(conn) }
+      @reader = spawn(name: "redis-subscriber") { run(conn) }
     end
 
     # The negotiated protocol version, or `nil` while disconnected. An
@@ -193,16 +213,22 @@ module Redis
     end
 
     # Blocks until the next message. Raises `ConnectionError` once the
-    # subscriber is closed and no buffered message is left.
+    # subscriber is closed and no buffered message is left. Raises
+    # `ArgumentError` when called from a subscriber hook (see the class
+    # docs): the hook runs on the reader fiber, which would then be
+    # waiting on itself forever.
     def receive : Message
+      raise_if_called_from_hook("receive")
       @messages.receive
     rescue Channel::ClosedError
       raise ConnectionError.new("subscriber is closed")
     end
 
     # Blocks until the next message; `nil` once the subscriber is closed
-    # and no buffered message is left.
+    # and no buffered message is left. Raises `ArgumentError` when called
+    # from a subscriber hook; see `receive`.
     def receive? : Message?
+      raise_if_called_from_hook("receive?")
       @messages.receive?
     end
 
@@ -239,10 +265,20 @@ module Redis
         tls_context: @tls_context, max_bulk_size: @max_bulk_size)
     end
 
+    # Raises `ArgumentError` when running on the reader fiber, i.e. when
+    # *method* was called from `on_disconnect` or `on_reconnect`: those
+    # hooks calling back into a method that waits on the reader fiber
+    # would deadlock it.
+    private def raise_if_called_from_hook(method : String) : Nil
+      return unless Fiber.current.same?(@reader)
+      raise ArgumentError.new("Redis::Subscriber##{method} cannot be called from a subscriber hook (reader fiber)")
+    end
+
     # Records the change (the block runs under the mutex and returns the
     # number of confirmation frames to expect), sends *cmd* if connected,
     # and waits for the confirmations.
     private def control(cmd : String, names : Array(String), & : -> Int32) : Nil
+      raise_if_called_from_hook(cmd.downcase)
       # Returns `{connection, waiter}` or nil when only recorded. Both
       # come out of the block together: a variable assigned inside a block
       # is closured and the compiler will not narrow it afterwards.
@@ -337,9 +373,12 @@ module Redis
               true
             end
           end
-        rescue ex : ConnectionError
+        rescue ex : Error | IO::Error | OpenSSL::SSL::Error
           # The fresh socket died while resubscribing; count it as a
-          # failed attempt.
+          # failed attempt. Same union as the `connect` rescue above:
+          # `Connection#send` only maps `IO::Error` to `ConnectionError`,
+          # so a `rediss://` socket that fails its first write can raise a
+          # raw `OpenSSL::SSL::Error` here.
           drop(conn, ex)
           next
         end
