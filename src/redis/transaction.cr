@@ -27,9 +27,14 @@ module Redis
     def initialize(@target : AbstractFuture)
     end
 
-    def resolve(raw : Value | Exception) : Nil
+    def resolve(raw : Value) : Nil
       @resolved = true
       @target.resolve(raw) if raw.is_a?(CommandError)
+    end
+
+    # The `ExecFuture` fans a failure out to the targets; nothing to do here.
+    def fail(error : Exception) : Nil
+      @resolved = true
     end
 
     def resolved? : Bool
@@ -56,7 +61,7 @@ module Redis
       super
     end
 
-    def resolve(raw : Value | Exception) : Nil
+    def resolve(raw : Value) : Nil
       case raw
       when Array
         if raw.size == @targets.size
@@ -67,18 +72,28 @@ module Redis
         end
       when Nil
         fail_all(AbortedError.new)
-      when Exception
-        super(raw)
-        @targets.each { |target| target.resolve(raw) unless target.resolved? }
+      when CommandError
+        # `EXECABORT`: every future that has no queue-time error yet gets it.
+        fail(raw)
       else
         fail_all(ProtocolError.new("unexpected EXEC reply #{raw.inspect}"))
       end
     end
 
+    # :nodoc:
+    #
+    # Restated for virtual dispatch through `AbstractFuture`, like
+    # `resolved?`. A connection loss or timeout reaches every target that
+    # has not already been resolved (queue-time failures keep theirs).
+    def fail(error : Exception) : Nil
+      super
+      @targets.each { |target| target.fail(error) unless target.resolved? }
+    end
+
     private def fail_all(error : Exception) : Nil
       @raw = error
       @resolved = true
-      @targets.each { |target| target.resolve(error) }
+      @targets.each { |target| target.fail(error) }
     end
   end
 end

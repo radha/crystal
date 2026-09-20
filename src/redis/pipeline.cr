@@ -1,11 +1,15 @@
 module Redis
   # :nodoc:
   abstract class AbstractFuture
-    # *raw* is `Value | Exception`, not `Value | ConnectionError`: besides
-    # `ConnectionError`, `IO::TimeoutError` also flows through here when a
-    # pipeline's `read_timeout` expires, and `Future#value` raises whatever
-    # `Exception` was resolved.
-    abstract def resolve(raw : Value | Exception) : Nil
+    # Delivers a reply. An error reply (`CommandError`) is a value here.
+    abstract def resolve(raw : Value) : Nil
+
+    # Fails the future with *error* (`ConnectionError`, `IO::TimeoutError`,
+    # `ProtocolError`, `AbortedError`, ...). Kept apart from `resolve`
+    # because Crystal cannot pass a `Value | Exception`-typed argument to
+    # a `Value | Exception` restriction while `Value` itself contains an
+    # `Exception` subclass (`CommandError`).
+    abstract def fail(error : Exception) : Nil
 
     abstract def resolved? : Bool
   end
@@ -22,8 +26,14 @@ module Redis
     end
 
     # :nodoc:
-    def resolve(raw : Value | Exception) : Nil
+    def resolve(raw : Value) : Nil
       @raw = raw
+      @resolved = true
+    end
+
+    # :nodoc:
+    def fail(error : Exception) : Nil
+      @raw = error
       @resolved = true
     end
 
@@ -64,13 +74,20 @@ module Redis
       super(->(v : Value) { v })
     end
 
-    def resolve(raw : Value | Exception) : Nil
+    def resolve(raw : Value) : Nil
       super
       if raw.is_a?(CommandError)
         @cache.delete(@sha) if raw.code == "NOSCRIPT"
-      elsif !raw.is_a?(Exception)
+      else
         @cache.add(@sha)
       end
+    end
+
+    # :nodoc:
+    #
+    # Restated for the same reason as `resolved?` below.
+    def fail(error : Exception) : Nil
+      super
     end
 
     # :nodoc:
@@ -143,11 +160,13 @@ module Redis
     end
 
     # :nodoc:
-    def resolve(index : Int32, raw : Value | Exception) : Nil
-      # See `AbstractFuture#resolve`: *raw* is `Value | Exception`, not
-      # `Value | ConnectionError`, because `IO::TimeoutError` also flows
-      # through here.
+    def resolve(index : Int32, raw : Value) : Nil
       @futures[index].resolve(raw)
+    end
+
+    # :nodoc:
+    def fail(index : Int32, error : Exception) : Nil
+      @futures[index].fail(error)
     end
 
     # Queues a `MULTI`..`EXEC` block. The block's commands return futures

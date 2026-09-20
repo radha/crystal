@@ -192,7 +192,7 @@ module Redis
         waiters.each_with_index do |waiter, i|
           value, error = wait(waiter, conn)
           if error
-            pipeline.resolve(i, error)
+            pipeline.fail(i, error)
             failure ||= error
           else
             pipeline.resolve(i, value)
@@ -205,7 +205,7 @@ module Redis
         # has not been given a reply is resolved with it, so that
         # `Future#value` raises the timeout instead of reporting a
         # pipeline that never executed.
-        (resolved...waiters.size).each { |j| pipeline.resolve(j, ex) }
+        (resolved...waiters.size).each { |j| pipeline.fail(j, ex) }
         raise ex
       end
       raise failure if failure

@@ -49,4 +49,16 @@ describe Redis::Pipeline do
   it "refuses scan_each" do
     expect_raises(ArgumentError) { Redis::Pipeline.new.scan_each { } }
   end
+
+  it "fails a future with any exception through fail" do
+    p = Redis::Pipeline.new
+    f = p.get("a")
+    g = p.incr("n")
+    p.fail(0, IO::TimeoutError.new("slow"))
+    p.fail(1, Redis::ConnectionError.new("lost"))
+    f.resolved?.should be_true
+    f.value?.should be_nil
+    expect_raises(IO::TimeoutError, /slow/) { f.value }
+    expect_raises(Redis::ConnectionError, /lost/) { g.value }
+  end
 end

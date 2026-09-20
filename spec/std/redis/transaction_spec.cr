@@ -96,7 +96,7 @@ describe Redis::Transaction do
     exec = p.multi { |tx| f = tx.incr("n") }
     p.resolve(0, "OK")
     p.resolve(1, "QUEUED")
-    p.resolve(2, Redis::ConnectionError.new("connection lost"))
+    p.fail(2, Redis::ConnectionError.new("connection lost"))
     expect_raises(Redis::ConnectionError) { exec.value }
     expect_raises(Redis::ConnectionError) { f.not_nil!.value }
   end
