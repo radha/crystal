@@ -271,9 +271,10 @@ close `@messages`. Idempotent.
 before `close` are still delivered by `receive?` until the channel is
 empty, matching `Channel` semantics.
 
-Hooks run on the reader fiber; an exception raised by one propagates to
-the drop handler like any other reader error (for `on_reconnect`, that
-means an immediate second drop). Documented.
+Hooks run on the reader fiber. An exception raised by one closes the
+subscriber (as `close` does, with `error` set to that exception): there
+is no caller to report it to, and silently swallowing it would hide a bug.
+Documented.
 
 ## 3. Transactions (`src/redis/transaction.cr`)
 
@@ -397,9 +398,14 @@ struct Redis::Script
 end
 
 module Redis::Commands
-  def run(script : Script, *, keys : Array(String) = [] of String, args : Array(RESP::Arg) = [] of RESP::Arg)
+  def run(script : Script, *, keys : Indexable(String) = [] of String, args : Indexable = [] of RESP::Arg)
 end
 ```
+
+`args` is an unrestricted `Indexable` on purpose: a Crystal array literal
+does not adopt a union restriction, so `args: [5]` would not compile
+against `Array(RESP::Arg)`. Each element must still be a `RESP::Arg`
+member, which the encoder enforces at compile time.
 
 `sha` is computed in `initialize` with `Digest::SHA1.hexdigest(source)`
 (stdlib, no new dependency). Redis computes the same digest, so the
