@@ -47,6 +47,7 @@ require "./redis/connection"
 require "./redis/pipeline"
 require "./redis/transaction"
 require "./redis/client"
+require "./redis/subscriber"
 
 module Redis
 end

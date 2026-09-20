@@ -77,6 +77,22 @@ module RedisSpec
       true
     end
   end
+
+  # One pub/sub frame as the server sends it: a RESP3 push (`>`) or a
+  # RESP2 array (`*`). Strings become bulk strings, integers become
+  # integers, nil becomes a null bulk string.
+  def self.pubsub_frame(protocol : Int32, *items : String | Int32 | Nil) : String
+    String.build do |s|
+      s << (protocol == 3 ? '>' : '*') << items.size << "\r\n"
+      items.each do |item|
+        case item
+        when Int32  then s << ':' << item << "\r\n"
+        when String then s << '$' << item.bytesize << "\r\n" << item << "\r\n"
+        when Nil    then s << "$-1\r\n"
+        end
+      end
+    end
+  end
 end
 
 def pending_redis(description = "assert", file = __FILE__, line = __LINE__, end_line = __END_LINE__, &block)
