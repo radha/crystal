@@ -510,4 +510,22 @@ describe "Redis::Cluster#pipelined" do
     cluster.close
     fake.close
   end
+
+  it "keeps replies delivered before a node dropped" do
+    fake = fake_two { false }
+    cluster = Redis::Cluster.new(fake.url(0))
+    cluster.ping
+    fb = fk = nil
+    expect_raises(Redis::ConnectionError) do
+      cluster.pipelined do |p|
+        fb = p.get("b")
+        p.command("DIE", "k")
+        fk = p.get("k")
+      end
+    end
+    fb.not_nil!.value.should eq("v")
+    expect_raises(Redis::ConnectionError) { fk.not_nil!.value }
+    cluster.close
+    fake.close
+  end
 end

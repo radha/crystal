@@ -396,11 +396,15 @@ module Redis
     end
 
     # Copies the group's commands out of *bytes* and runs them on *node*,
-    # storing each reply or failure at its original index. A connection
-    # loss or timeout marks the map stale; the failures are already stored
-    # by `pipeline_raw`, except when the send itself failed.
+    # storing each reply or failure at its original index. A reply
+    # `pipeline_raw` already delivered is kept; only the commands it never
+    # reached are failed, with whatever it raised (a lost connection or
+    # timeout, or an error from a reconnect's handshake). A connection
+    # loss or timeout also marks the slot map stale. Never raises: this
+    # runs on a fiber of its own for every group but the last.
     private def run_group(node : Node, indices : Array(Int32), bytes : Bytes, offsets : Array(Int32),
                           values : Array(Value), failures : Array(Exception?)) : Nil
+      reached = 0
       chunk = IO::Memory.new
       indices.each do |i|
         chunk.write(bytes[offsets[i], command_end(offsets, i, bytes.size) - offsets[i]])
@@ -409,10 +413,11 @@ module Redis
         i = indices[j]
         values[i] = value
         failures[i] = error
+        reached = j + 1
       end
-    rescue ex : ConnectionError | IO::TimeoutError
-      @mutex.synchronize { @stale = true }
-      indices.each { |i| failures[i] ||= ex }
+    rescue ex : Exception
+      @mutex.synchronize { @stale = true } if ex.is_a?(ConnectionError) || ex.is_a?(IO::TimeoutError)
+      (reached...indices.size).each { |j| failures[indices[j]] ||= ex }
     end
 
     # The byte offset just past command *i*.
