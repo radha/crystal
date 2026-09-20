@@ -529,3 +529,48 @@ describe "Redis::Cluster#pipelined" do
     fake.close
   end
 end
+
+describe "Redis::Cluster blocking, watch and pub/sub" do
+  it "borrows a dedicated connection to the key's master" do
+    fake = fake_two { false }
+    cluster = Redis::Cluster.new(fake.url(0))
+    cluster.get("b")
+    cluster.with_connection("b") { |conn| conn.ping }.should eq("PONG")
+    # The seed probe, the node client, the pooled connection.
+    fake.accepted(0).should eq(3)
+    fake.accepted(1).should eq(0)
+    cluster.with_connection("b") { |conn| conn.ping }
+    fake.accepted(0).should eq(3)
+    cluster.close
+    fake.close
+  end
+
+  it "watches keys of one slot on that master and unwatches on the way out" do
+    fake = fake_two { false }
+    cluster = Redis::Cluster.new(fake.url(1))
+    cluster.watch("{w}a", "{w}b") { |conn| conn.get("{w}a") }.should eq("v")
+    fake.commands(0).should eq([["WATCH", "{w}a", "{w}b"], ["GET", "{w}a"], ["UNWATCH"]])
+    expect_raises(ArgumentError, /one slot/) { cluster.watch("a", "b") { |conn| } }
+    expect_raises(ArgumentError, /at least one key/) { cluster.watch { |conn| } }
+    cluster.close
+    fake.close
+  end
+
+  it "opens a subscriber on a master" do
+    fake = fake_two do |fk, index, cmd, io|
+      if cmd[0] == "SUBSCRIBE"
+        io << RedisSpec.pubsub_frame(3, "subscribe", cmd[1], 1)
+        true
+      else
+        false
+      end
+    end
+    cluster = Redis::Cluster.new(fake.url(0))
+    sub = cluster.subscriber(reconnect: false)
+    sub.subscribe("news")
+    (fake.commands(0).includes?(["SUBSCRIBE", "news"]) || fake.commands(1).includes?(["SUBSCRIBE", "news"])).should be_true
+    sub.close
+    cluster.close
+    fake.close
+  end
+end

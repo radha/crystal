@@ -1,4 +1,5 @@
 require "spec"
+require "file_utils"
 require "socket"
 require "redis"
 
@@ -200,6 +201,147 @@ module RedisSpec
       @servers.each(&.close)
     end
   end
+
+  # A three-master cluster for the live cluster specs, spawned on first
+  # use from `valkey-server` or `redis-server` on `PATH`: three random
+  # loopback ports, a temp dir, slots split evenly, `CLUSTER MEET`, and a
+  # wait for `cluster_state:ok` on every node; terminated at exit. Set
+  # `REDIS_CLUSTER_URL` to a comma-separated list of seeds to use an
+  # existing cluster instead. `failure` explains why none is available.
+  class LiveCluster
+    @@instance : LiveCluster?
+    @@failure : String?
+
+    getter urls : Array(String)
+    @processes : Array(Process)
+    @dir : String?
+
+    def self.instance : LiveCluster?
+      return @@instance if @@instance
+      return nil if @@failure
+      if env = ENV["REDIS_CLUSTER_URL"]?
+        return @@instance = new(env.split(','), [] of Process, nil)
+      end
+      @@instance = spawn_local
+    rescue ex
+      @@failure = ex.message
+      nil
+    end
+
+    def self.failure : String
+      @@failure || "not started"
+    end
+
+    def initialize(@urls : Array(String), @processes : Array(Process), @dir : String?)
+    end
+
+    private def self.spawn_local : LiveCluster
+      binary = Process.find_executable("valkey-server") || Process.find_executable("redis-server") ||
+               raise "no valkey-server or redis-server on PATH"
+      ports = free_ports(3)
+      dir = File.tempname("redis-cluster")
+      Dir.mkdir_p(dir)
+      processes = ports.map do |port|
+        node_dir = File.join(dir, port.to_s)
+        Dir.mkdir_p(node_dir)
+        Process.new(binary, ["--port", port.to_s, "--cluster-enabled", "yes", "--cluster-config-file", "nodes.conf",
+                             "--dir", node_dir, "--save", "", "--appendonly", "no", "--bind", "127.0.0.1",
+                             "--logfile", "log.txt"],
+          output: Process::Redirect::Close, error: Process::Redirect::Close)
+      end
+      cluster = new(ports.map { |port| "redis://127.0.0.1:#{port}" }, processes, dir)
+      at_exit { cluster.stop }
+      begin
+        cluster.configure(ports)
+      rescue ex
+        cluster.stop
+        raise ex
+      end
+      cluster
+    end
+
+    # *count* free loopback ports for cluster nodes. A node also listens
+    # on the cluster bus port `port + 10000`, so both must be free and a
+    # node whose port is above 55535 refuses to start at all; the
+    # ephemeral ports the kernel hands out for port 0 are all above that,
+    # so the ports are probed upwards from a random low base instead.
+    # Every socket is held until all of them are picked, so no two nodes
+    # can be given the same port.
+    private def self.free_ports(count : Int32) : Array(Int32)
+      held = [] of TCPServer
+      ports = [] of Int32
+      begin
+        port = Random.rand(20000..40000)
+        while ports.size < count
+          raise "no free port and cluster bus port below 55536" if port > 55535
+          node = bind(port)
+          bus = node ? bind(port + 10000) : nil
+          if node && bus
+            held << node << bus
+            ports << port
+          else
+            node.try &.close
+          end
+          port += 1
+        end
+      ensure
+        held.each(&.close)
+      end
+      ports
+    end
+
+    private def self.bind(port : Int32) : TCPServer?
+      TCPServer.new("127.0.0.1", port)
+    rescue Socket::BindError
+      nil
+    end
+
+    # Assigns the slots, meets the nodes and waits for convergence.
+    def configure(ports : Array(Int32)) : Nil
+      conns = ports.map { |port| wait_for(port) }
+      begin
+        step = Redis::Cluster::SLOTS // ports.size
+        conns.each_with_index do |conn, i|
+          first = i * step
+          last = i == ports.size - 1 ? Redis::Cluster::SLOTS - 1 : (i + 1) * step - 1
+          conn.call("CLUSTER", "ADDSLOTSRANGE", first, last)
+        end
+        ports[1..].each { |port| conns[0].call("CLUSTER", "MEET", "127.0.0.1", port) }
+        started = Time.instant
+        until conns.all? { |conn| conn.call("CLUSTER", "INFO").as(String).includes?("cluster_state:ok") }
+          raise "cluster did not converge within 15 s" if Time.instant - started > 15.seconds
+          sleep 100.milliseconds
+        end
+      ensure
+        conns.each(&.close)
+      end
+    end
+
+    private def wait_for(port : Int32) : Redis::Connection
+      started = Time.instant
+      loop do
+        begin
+          return Redis::Connection.new("redis://127.0.0.1:#{port}", connect_timeout: 1.second)
+        rescue Redis::ConnectionError
+          raise "node on port #{port} did not start within 5 s" if Time.instant - started > 5.seconds
+          sleep 50.milliseconds
+        end
+      end
+    end
+
+    # Terminates the nodes and removes their directory. Idempotent.
+    def stop : Nil
+      @processes.each do |process|
+        process.terminate rescue nil
+        process.wait rescue nil
+      end
+      @processes.clear
+      if dir = @dir
+        FileUtils.rm_rf(dir) rescue nil
+        @dir = nil
+      end
+    end
+  end
 end
 
 def pending_redis(description = "assert", file = __FILE__, line = __LINE__, end_line = __END_LINE__, &block)
@@ -207,5 +349,16 @@ def pending_redis(description = "assert", file = __FILE__, line = __LINE__, end_
     it(description, file, line, end_line, &block)
   else
     pending("#{description} [no redis server at #{RedisSpec::URL}]", file, line, end_line)
+  end
+end
+
+# Like `it`, but the example is pending when no live cluster is available;
+# the block receives the `RedisSpec::LiveCluster` (spawned on first use).
+def pending_cluster(description = "assert", file = __FILE__, line = __LINE__, end_line = __END_LINE__,
+                    &block : RedisSpec::LiveCluster ->)
+  it(description, file, line, end_line) do
+    cluster = RedisSpec::LiveCluster.instance
+    pending!("no cluster: #{RedisSpec::LiveCluster.failure}", file, line) unless cluster
+    block.call(cluster)
   end
 end

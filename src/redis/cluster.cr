@@ -395,6 +395,59 @@ module Redis
       exec.not_nil!.value
     end
 
+    # Borrows a dedicated `Connection` to the master owning *key*'s slot
+    # (from that node client's pool, see `Client#with_connection`), yields
+    # it, and hands it back. For blocking commands:
+    #
+    # ```
+    # cluster.with_connection("jobs") { |conn| conn.call("BLPOP", "jobs", 0) }
+    # ```
+    #
+    # Redirects are not followed inside the block: a `MOVED` or `ASK`
+    # reply is raised as a `CommandError`, and the caller retries the block.
+    def with_connection(key : String, &block : Connection -> T) : T forall T
+      check_open
+      node = route(Cluster.key_slot(key))
+      node.client.with_connection(&block)
+    end
+
+    # Raises `ArgumentError`: `watch` needs at least one key.
+    def watch(&block : Connection -> T) : T forall T
+      raise ArgumentError.new("WATCH needs at least one key")
+    end
+
+    # Optimistic locking on the master owning *keys*' slot: borrows a
+    # dedicated connection there, sends `WATCH`, yields the connection
+    # for the read-then-`multi` sequence, and hands it back (see
+    # `Client#watch`). Every key must hash to one slot (use hash tags);
+    # raises `ArgumentError` otherwise. Redirects are not followed inside
+    # the block: a `MOVED` or `ASK` reply is raised as a `CommandError`,
+    # and the caller retries the block just as for `AbortedError`.
+    def watch(*keys : String, &block : Connection -> T) : T forall T
+      check_open
+      slot = Cluster.key_slot(keys[0])
+      keys.each do |key|
+        unless Cluster.key_slot(key) == slot
+          raise ArgumentError.new("WATCH keys must hash to one slot; #{key.inspect} is not in slot #{slot}")
+        end
+      end
+      route(slot).client.watch(*keys, &block)
+    end
+
+    # Opens a `Subscriber` on one master, chosen at random, with the
+    # cluster's options; the cluster bus delivers every `publish` to it
+    # whichever node received the message. Its reconnects go back to the
+    # same node. The subscriber is independent of the cluster afterwards
+    # and must be closed on its own.
+    def subscriber(*, capacity : Int32 = 64, reconnect : Bool = true) : Subscriber
+      check_open
+      node = route(nil)
+      Subscriber.new(node_uri(node.host, node.port), username: @username, password: @password,
+        client_name: @client_name, protocol: @protocol_option, connect_timeout: @connect_timeout,
+        read_timeout: @read_timeout, tls_context: @tls_context, max_bulk_size: @max_bulk_size,
+        capacity: capacity, reconnect: reconnect)
+    end
+
     # Copies the group's commands out of *bytes* and runs them on *node*,
     # storing each reply or failure at its original index. A reply
     # `pipeline_raw` already delivered is kept; only the commands it never
