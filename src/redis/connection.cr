@@ -275,6 +275,12 @@ module Redis
     # close the connection and propagate; a lost socket raises
     # `ConnectionError`. In every failure case the futures not yet given a
     # reply are resolved with that exception first.
+    #
+    # A `multi` block inside the pipeline contributes its `MULTI` `"OK"`,
+    # one `"QUEUED"` per queued command, and the `EXEC` array as separate
+    # elements of these raw replies; read the transaction's own results
+    # through its commands' futures or the future `multi` returns, not by
+    # indexing into this array.
     def pipelined(& : Pipeline ->) : Array(Value)
       pipeline = Pipeline.new(@script_cache)
       yield pipeline

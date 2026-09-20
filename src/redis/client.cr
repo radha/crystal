@@ -152,6 +152,12 @@ module Redis
     # it tears the connection down and fails every future that has not yet
     # been resolved.
     #
+    # A `multi` block inside the pipeline contributes its `MULTI` `"OK"`,
+    # one `"QUEUED"` per queued command, and the `EXEC` array as separate
+    # elements of these raw replies; read the transaction's own results
+    # through its commands' futures or the future `multi` returns, not by
+    # indexing into this array.
+    #
     # ```
     # first = nil
     # redis.pipelined do |p|

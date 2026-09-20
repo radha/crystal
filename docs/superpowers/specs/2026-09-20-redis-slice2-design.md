@@ -425,13 +425,12 @@ back to `EVAL`. A `SCRIPT FLUSH` or server restart therefore costs one
 failed pipelined call per script, surfaced on that future, and heals
 itself.
 
-The known-script set is `Set(String)` on `Client` (guarded by the client
-mutex; `Pipeline.new` receives it and reads it without the lock, which is
-safe because a stale read only costs one fallback) and on `Connection`
-(single-fiber by contract). `Connection.new` and `Client.new` start empty;
-the client's set survives reconnects because a reconnect does not imply
-the server restarted, and the healing rule above covers the case where it
-did.
+The known-script set is `ScriptCache`, a small class with its own mutex,
+shared by a client (or connection), its pipelines and their futures, so
+pipeline reads and future updates need no other lock. `Connection.new` and
+`Client.new` start with an empty cache; the client's cache survives
+reconnects because a reconnect does not imply the server restarted, and
+the healing rule above covers the case where it did.
 
 ## 5. Commands additions
 
