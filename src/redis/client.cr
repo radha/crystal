@@ -29,6 +29,10 @@ module Redis
   # for you.
   class Client
     include Commands
+    include Commands::ScriptFallback
+
+    # :nodoc:
+    getter script_cache = ScriptCache.new
 
     # One slot for one in-flight command. The reply travels on the
     # channel; a failure arrives as `nil` on the channel with `error` set,
@@ -157,7 +161,7 @@ module Redis
     # first.not_nil!.value # => "1"
     # ```
     def pipelined(& : Pipeline ->) : Array(Value)
-      pipeline = Pipeline.new
+      pipeline = Pipeline.new(@script_cache)
       yield pipeline
       # A closed client raises even when the block queued nothing.
       @mutex.synchronize { check_open }

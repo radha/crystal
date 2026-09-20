@@ -17,6 +17,10 @@ module Redis
   # override URL parts.
   class Connection
     include Commands
+    include Commands::ScriptFallback
+
+    # :nodoc:
+    getter script_cache = ScriptCache.new
 
     # The default URL used when `new` is given none: localhost on the
     # standard Redis port, protocol negotiation on, no auth, database 0.

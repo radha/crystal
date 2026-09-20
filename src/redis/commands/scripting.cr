@@ -9,7 +9,7 @@ module Redis::Commands
     typed_call(script_args("EVALSHA", sha, keys, args)) { |v| Cast.value(v) }
   end
 
-  private def script_args(cmd : String, body : String, keys : Array(String), args : Array(RESP::Arg)) : Array(RESP::Arg)
+  private def script_args(cmd : String, body : String, keys : Indexable(String), args : Indexable) : Array(RESP::Arg)
     all = Array(RESP::Arg).new(3 + keys.size + args.size)
     all << cmd << body << keys.size
     keys.each { |k| all << k }

@@ -6,6 +6,8 @@ module Redis
     # pipeline's `read_timeout` expires, and `Future#value` raises whatever
     # `Exception` was resolved.
     abstract def resolve(raw : Value | Exception) : Nil
+
+    abstract def resolved? : Bool
   end
 
   # The pending result of a command issued inside `Client#pipelined`.
@@ -52,6 +54,26 @@ module Redis
     end
   end
 
+  # :nodoc:
+  #
+  # The future of a pipelined `run`: keeps the client's `ScriptCache`
+  # honest. A `NOSCRIPT` reply forgets the SHA, any successful reply
+  # records it (the pipeline may have sent `EVAL`, which loads the script).
+  class ScriptFuture < Future(Value)
+    def initialize(@cache : ScriptCache, @sha : String)
+      super(->(v : Value) { v })
+    end
+
+    def resolve(raw : Value | Exception) : Nil
+      super
+      if raw.is_a?(CommandError)
+        @cache.delete(@sha) if raw.code == "NOSCRIPT"
+      elsif !raw.is_a?(Exception)
+        @cache.add(@sha)
+      end
+    end
+  end
+
   # Collects commands inside `Client#pipelined`. Every typed command
   # method returns a `Future(T)` instead of `T`.
   class Pipeline
@@ -65,6 +87,30 @@ module Redis
     # Internal to `Client#pipelined`.
     getter buffer = IO::Memory.new
     @futures = [] of AbstractFuture
+
+    @script_cache : ScriptCache
+
+    # :nodoc:
+    #
+    # *script_cache* is the owning client's; `Client#pipelined` and
+    # `Connection#pipelined` pass theirs. The default is for a pipeline
+    # built by hand, which then always sends `EVAL`.
+    def initialize(@script_cache : ScriptCache = ScriptCache.new)
+    end
+
+    # :nodoc:
+    def script_run(script : Script, keys : Indexable(String), args : Indexable) : Future(Value)
+      wire = if @script_cache.known?(script.sha)
+               script_args("EVALSHA", script.sha, keys, args)
+             else
+               script_args("EVAL", script.source, keys, args)
+             end
+      RESP.write_command(@buffer, wire)
+      future = ScriptFuture.new(@script_cache, script.sha)
+      @futures << future
+      @size += 1
+      future
+    end
 
     # Queues *args* and returns a future for its raw reply.
     def call(*args : RESP::Arg) : Future(Value)

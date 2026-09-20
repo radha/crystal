@@ -26,6 +26,35 @@ module Redis
       call(args)
     end
 
+    # Runs *script*. On a `Client` or `Connection` this sends `EVALSHA` and,
+    # when the server replies `NOSCRIPT`, `EVAL` with the source, which also
+    # caches it server-side. On a `Pipeline` the choice is made up front:
+    # `EVALSHA` if this client has seen the server accept the script,
+    # `EVAL` otherwise; a `NOSCRIPT` reply then surfaces on the returned
+    # future and the next pipeline goes back to `EVAL`.
+    def run(script : Script, *, keys : Indexable(String) = [] of String, args : Indexable = [] of RESP::Arg)
+      script_run(script, keys, args)
+    end
+
+    # :nodoc:
+    #
+    # `script_run` for includers that execute synchronously (`Client`,
+    # `Connection`): `EVALSHA`, then `EVAL` on `NOSCRIPT`. The includer
+    # provides `script_cache : ScriptCache`.
+    module ScriptFallback
+      # :nodoc:
+      def script_run(script : Script, keys : Indexable(String), args : Indexable) : Value
+        value = begin
+          call(script_args("EVALSHA", script.sha, keys, args))
+        rescue ex : CommandError
+          raise ex unless ex.code == "NOSCRIPT"
+          call(script_args("EVAL", script.source, keys, args))
+        end
+        script_cache.add(script.sha)
+        value
+      end
+    end
+
     # Defines a typed command method. *params* are the fixed parameters in
     # wire order; with `splat: true` the last one becomes a splat. *cast* names
     # the `Cast` method applied to the reply. (`as` cannot be a macro
