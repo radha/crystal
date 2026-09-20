@@ -231,4 +231,29 @@ describe Redis::Client do
     client.closed?.should be_false
     client.close
   end
+
+  it "borrows a dedicated connection from its pool" do
+    script = Script.new
+    server = script.server
+    client = Redis::Client.new(server.url, pool_size: 2)
+    client.ping
+    inner = nil
+    client.with_connection do |conn|
+      inner = conn
+      conn.should be_a(Redis::Connection)
+      conn.ping.should eq("PONG")
+    end
+    server.accepted.should eq(2)
+    client.with_connection { |conn| conn.should be(inner) }
+    server.accepted.should eq(2)
+    inner.not_nil!.closed?.should be_false
+    client.close
+    inner.not_nil!.closed?.should be_true
+    expect_raises(Redis::ConnectionError, /closed/) { client.with_connection { } }
+    server.close
+  end
+
+  it "rejects a non-positive pool size" do
+    expect_raises(ArgumentError, /pool_size/) { Redis::Client.new(pool_size: 0) }
+  end
 end

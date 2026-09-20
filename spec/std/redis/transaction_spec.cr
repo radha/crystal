@@ -377,7 +377,7 @@ describe "Redis::Connection#pipelined and #multi" do
 end
 
 describe "Redis::Client#watch" do
-  it "opens a dedicated connection, sends WATCH, yields it and closes it" do
+  it "borrows a pooled connection, sends WATCH, yields it and hands it back" do
     fake = TxServer.new
     server = fake.server
     client = Redis::Client.new(server.url, db: 3)
@@ -390,16 +390,24 @@ describe "Redis::Client#watch" do
     end
     result.should eq(values("OK"))
     server.accepted.should eq(2)
-    inner.not_nil!.closed?.should be_true
-    # Once from the client's own connection, once from the dedicated one.
+    inner.not_nil!.closed?.should be_false
+    # Once from the client's own connection, once from the pooled one.
     fake.seen.count(["SELECT", "3"]).should eq(2)
     fake.seen.should contain(["WATCH", "k1", "k2"])
+    # EXEC discarded the watch; no UNWATCH round trip.
+    fake.seen.should_not contain(["UNWATCH"])
+    # A second watch reuses the pooled connection.
+    client.watch("k1") { |conn| conn.should be(inner) }
+    server.accepted.should eq(2)
+    # That block never ran multi, so the watch was cleared by hand.
+    fake.seen.last.should eq(["UNWATCH"])
     client.connected?.should be_true
     client.close
+    inner.not_nil!.closed?.should be_true
     server.close
   end
 
-  it "closes the connection when the block raises and refuses no keys" do
+  it "unwatches when the block raises before multi and refuses no keys" do
     fake = TxServer.new
     server = fake.server
     client = Redis::Client.new(server.url)
@@ -412,7 +420,10 @@ describe "Redis::Client#watch" do
         conn.multi { |tx| tx.set("k", "w") }
       end
     end
-    inner.not_nil!.closed?.should be_true
+    inner.not_nil!.closed?.should be_false
+    fake.seen.should_not contain(["UNWATCH"])
+    expect_raises(Exception, "boom") { client.watch("k") { |conn| raise "boom" } }
+    fake.seen.last.should eq(["UNWATCH"])
     client.close
     server.close
   end
