@@ -93,6 +93,92 @@ module RedisSpec
       end
     end
   end
+
+  # Scripted cluster nodes on random loopback ports. Every node answers
+  # `HELLO`, and `CLUSTER SLOTS` from `ranges` (`{first, last, node}`
+  # triples naming node indexes, plus `replicas` mapping a replica's index
+  # to its master's); every other command goes to the handler, which gets
+  # the cluster, the node index, the parsed command and the socket. `seen`
+  # records every command with its node index in arrival order.
+  class FakeCluster
+    getter servers = [] of FakeServer
+    getter seen = [] of {Int32, Array(String)}
+    getter slots_calls = 0
+    property ranges : Array({Int32, Int32, Int32})
+    property replicas = {} of Int32 => Int32
+
+    def initialize(count : Int32, @ranges : Array({Int32, Int32, Int32}),
+                   &handler : FakeCluster, Int32, Array(String), IO ->)
+      count.times do |index|
+        @servers << FakeServer.new do |io|
+          while cmd = FakeServer.read_command(io)
+            @seen << {index, cmd}
+            case cmd[0]
+            when "HELLO"
+              io << HELLO_REPLY
+            when "CLUSTER"
+              @slots_calls += 1
+              io << slots_reply
+            else
+              handler.call(self, index, cmd, io)
+            end
+            io.flush unless io.closed?
+          end
+        end
+      end
+    end
+
+    def port(index : Int32) : Int32
+      @servers[index].port
+    end
+
+    def url(index : Int32) : String
+      @servers[index].url
+    end
+
+    def urls : Array(String)
+      @servers.map(&.url)
+    end
+
+    def accepted(index : Int32) : Int32
+      @servers[index].accepted
+    end
+
+    # Every command node *index* saw except `HELLO`, in order.
+    def commands(index : Int32) : Array(Array(String))
+      @seen.select { |i, _| i == index }.map { |_, cmd| cmd }.reject { |cmd| cmd[0] == "HELLO" }
+    end
+
+    def moved(slot : Int32, node : Int32) : String
+      "-MOVED #{slot} 127.0.0.1:#{port(node)}\r\n"
+    end
+
+    def ask(slot : Int32, node : Int32) : String
+      "-ASK #{slot} 127.0.0.1:#{port(node)}\r\n"
+    end
+
+    def self.bulk(s : String) : String
+      "$#{s.bytesize}\r\n#{s}\r\n"
+    end
+
+    # The RESP `CLUSTER SLOTS` reply for `ranges` and `replicas`.
+    def slots_reply : String
+      String.build do |s|
+        s << '*' << @ranges.size << "\r\n"
+        @ranges.each do |first, last, node|
+          followers = @replicas.select { |_, master| master == node }.keys
+          s << '*' << 3 + followers.size << "\r\n:" << first << "\r\n:" << last << "\r\n"
+          ([node] + followers).each do |n|
+            s << "*3\r\n" << FakeCluster.bulk("127.0.0.1") << ':' << port(n) << "\r\n" << FakeCluster.bulk("node#{n}")
+          end
+        end
+      end
+    end
+
+    def close : Nil
+      @servers.each(&.close)
+    end
+  end
 end
 
 def pending_redis(description = "assert", file = __FILE__, line = __LINE__, end_line = __END_LINE__, &block)

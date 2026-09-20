@@ -1,6 +1,48 @@
 module Redis
-  # A client for Redis Cluster. Task 7 replaces this doc comment.
+  # A client for Redis Cluster: routes every command to the master that
+  # owns its key's hash slot, follows `MOVED`, `ASK` and `TRYAGAIN`
+  # redirects, and reloads the slot map when the cluster changes. Each
+  # master is driven by its own multiplexed `Client`, so any number of
+  # fibers can share a `Cluster`.
+  #
+  # ```
+  # cluster = Redis::Cluster.new(["redis://10.0.0.1:7000", "redis://10.0.0.2:7000"])
+  # cluster.set("user:1", "x")
+  # cluster.get("user:1")                            # => "x"
+  # cluster.pipelined { |p| p.get("a"); p.get("b") } # split by node, replies in order
+  # cluster.multi { |tx| tx.incr("{acct}a"); tx.incr("{acct}b") }
+  # cluster.close
+  # ```
+  #
+  # Keyed commands are routed by `Cluster.route_key`; commands with no key
+  # (`PING`, `INFO`, `DBSIZE`, ...) go to one master picked at random, and
+  # `nodes` gives every node's own `Client` for per-node administration.
+  # Multi-key commands must keep their keys in one slot (use hash tags):
+  # the server's `CROSSSLOT` error is raised as a `CommandError` otherwise.
+  # `scan_each` iterates every master in turn; a bare `scan` step lands on
+  # a random master and is of little use here. `run` shares one script
+  # cache across the cluster: a script one node has not seen yet answers
+  # `NOSCRIPT` there, which `run` handles by sending `EVAL`.
+  #
+  # The slot map is loaded on the first command and reloaded lazily: a
+  # `MOVED` reply or a lost connection marks it stale and the next command
+  # reloads it before routing, with concurrent callers sharing one reload.
+  # A lost connection is never retried, exactly as with `Client`;
+  # redirects are followed up to `max_redirects` times, then
+  # `ClusterError` is raised. Replicas are listed in `nodes` but never
+  # routed to.
+  #
+  # `close` is required, as for `Client`.
   class Cluster
+    include Commands
+    include Commands::ScriptFallback
+
+    # :nodoc:
+    getter script_cache = ScriptCache.new
+
+    # :nodoc:
+    REDIRECT_CODES = {"MOVED", "ASK", "TRYAGAIN"}
+
     # Number of hash slots in a Redis Cluster.
     SLOTS = 16384
 
@@ -97,6 +139,393 @@ module Redis
           else             nil
           end
       n && n > 0 ? string_at(args, at + 1) : nil
+    end
+
+    # One node of the cluster as the last topology load reported it.
+    class Node
+      # The host as reported by `CLUSTER SLOTS`.
+      getter host : String
+      # The port.
+      getter port : Int32
+      # The cluster node id (`""` for a node first seen in a redirect,
+      # until the next reload).
+      getter id : String
+      # Whether the node is a master; only masters are routed to.
+      getter? master : Bool
+      @client : Client?
+
+      # :nodoc:
+      def initialize(@host : String, @port : Int32, @id : String, @master : Bool,
+                     @factory : Proc(String, Int32, Client))
+      end
+
+      # `"host:port"`.
+      def address : String
+        "#{@host}:#{@port}"
+      end
+
+      # The node's multiplexed client, created on first use with the
+      # cluster's options and connected on its first command. Raises
+      # `ArgumentError` on a replica.
+      def client : Client
+        raise ArgumentError.new("#{address} is a replica") unless @master
+        @client ||= @factory.call(@host, @port)
+      end
+
+      # :nodoc:
+      def master=(@master : Bool)
+      end
+
+      # :nodoc:
+      def id=(@id : String)
+      end
+
+      # :nodoc:
+      def close : Nil
+        @client.try &.close
+        @client = nil
+      end
+
+      def to_s(io : IO) : Nil
+        io << address << (@master ? " (master)" : " (replica)")
+      end
+    end
+
+    @mutex = Mutex.new
+    @refresh_mutex = Mutex.new
+    @slots = Array(Node?).new(SLOTS, nil)
+    @nodes = {} of String => Node
+    @masters = [] of Node
+    @stale = true
+    @closed = false
+    @seeds : Array(URI)
+    @scheme : String
+    @username : String?
+    @password : String?
+
+    # Creates a cluster client. *seeds* are `redis://host:port` or
+    # `rediss://host:port` URLs (`String` or `URI`) of any nodes; the rest
+    # of the cluster is discovered from whichever answers first, and the
+    # seeds' scheme (with *tls_context*) is used for every node. The other
+    # options are those of `Client.new` and apply to every node's client;
+    # there is no `db` because a cluster has only database 0. Credentials
+    # in the first seed's URL are used when *username*/*password* are not
+    # given. Nothing is connected until the first command. Raises
+    # `ArgumentError` for no seeds, a seed with another scheme or a
+    # database other than 0, *protocol* outside `2..3`, a non-positive
+    # *pool_size* or a negative *max_redirects*.
+    def initialize(seeds : Indexable, *, username : String? = nil, password : String? = nil,
+                   @client_name : String? = nil, protocol @protocol_option : Int32 = 3,
+                   @connect_timeout : Time::Span = 5.seconds, @read_timeout : Time::Span? = nil,
+                   @tls_context : OpenSSL::SSL::Context::Client? = nil, @max_bulk_size : Int32 = RESP::MAX_BULK_SIZE,
+                   @pool_size : Int32 = 4, @max_redirects : Int32 = 5)
+      raise ArgumentError.new("at least one seed is required") if seeds.empty?
+      raise ArgumentError.new("protocol must be 2 or 3, got #{@protocol_option}") unless @protocol_option == 2 || @protocol_option == 3
+      raise ArgumentError.new("pool_size must be positive, got #{@pool_size}") unless @pool_size > 0
+      raise ArgumentError.new("max_redirects must not be negative, got #{@max_redirects}") if @max_redirects < 0
+      @seeds = Array(URI).new(seeds.size)
+      seeds.each do |seed|
+        uri = case seed
+              when URI    then seed
+              when String then URI.parse(seed)
+              else             raise ArgumentError.new("a seed must be a String or URI, got #{seed.class}")
+              end
+        unless uri.scheme == "redis" || uri.scheme == "rediss"
+          raise ArgumentError.new("unsupported cluster URL scheme #{uri.scheme.inspect} in #{uri}; expected redis or rediss")
+        end
+        if (db = Connection.db_from(uri)) && db != 0
+          raise ArgumentError.new("a cluster has only database 0, got database #{db} in #{uri}")
+        end
+        @seeds << uri
+      end
+      @scheme = @seeds.first.scheme.not_nil!
+      @username = username || @seeds.first.user.presence
+      @password = password || @seeds.first.password.presence
+    end
+
+    # :ditto:
+    def self.new(seed : String | URI, **options)
+      new([seed] of String | URI, **options)
+    end
+
+    # Sends *args* to the master owning the routing key's slot (see
+    # `Cluster.route_key`; *key* overrides it) and returns the reply,
+    # following redirects. Raises `CommandError` for an error reply,
+    # `ConnectionError` if a node's connection cannot be opened or drops,
+    # `IO::TimeoutError` if `read_timeout` elapses, `ClusterError` if the
+    # topology cannot be loaded or `max_redirects` is exceeded.
+    def call(*args : RESP::Arg) : Value
+      call(args)
+    end
+
+    # :ditto:
+    def call(args : Indexable, *, key : String? = nil) : Value
+      route = key || Cluster.route_key(args)
+      slot = route ? Cluster.key_slot(route) : nil
+      execute(slot) { |node, asking| asking ? ask(node, args) : node.client.call(args) }
+    end
+
+    # Sends an arbitrary command routed by *key*, for a command whose key
+    # `Cluster.route_key` does not find (a module command, for example).
+    #
+    # ```
+    # cluster.command("MYMODULE.DO", "k", 1, key: "k")
+    # ```
+    def command(*args : RESP::Arg, key : String)
+      call(args, key: key)
+    end
+
+    # :nodoc:
+    def typed_call(args : Indexable, &block : Value -> T) forall T
+      block.call(call(args))
+    end
+
+    # Iterates every key matching *match* on every master in turn. `SCAN`
+    # cursors are per node, so this is the only sensible form of `SCAN`
+    # on a cluster.
+    def scan_each(*, match : String? = nil, count : Int? = nil, type : String? = nil, & : String ->) : Nil
+      check_open
+      refresh_if_stale
+      masters = @mutex.synchronize { @masters.dup }
+      masters.each do |node|
+        node.client.scan_each(match: match, count: count, type: type) { |key| yield key }
+      end
+    end
+
+    # Every node the last topology load reported, masters first in the
+    # order `CLUSTER SLOTS` listed them. Empty before the first command.
+    def nodes : Array(Node)
+      @mutex.synchronize { @masters + @nodes.values.reject(&.master?) }
+    end
+
+    # The master owning *key*'s slot, after reloading the topology if it is
+    # stale. Raises `ClusterError` if the cluster has no masters.
+    def node_for(key : String) : Node
+      check_open
+      route(Cluster.key_slot(key))
+    end
+
+    # Reloads the slot map now. Raises `ClusterError` if no known master
+    # and no seed answers `CLUSTER SLOTS`.
+    def refresh : Nil
+      check_open
+      @refresh_mutex.synchronize { load_topology }
+    end
+
+    # Whether `close` has been called.
+    def closed? : Bool
+      @closed
+    end
+
+    # Closes every node's client. Every later call raises `ConnectionError`.
+    def close : Nil
+      nodes = @mutex.synchronize do
+        @closed = true
+        @nodes.values
+      end
+      nodes.each(&.close)
+    end
+
+    private def check_open : Nil
+      raise ConnectionError.new("cluster is closed") if @closed
+    end
+
+    # The redirect loop. Picks the node for *slot* (any master when nil or
+    # unassigned) and calls *send* with it; a `MOVED` reply patches the
+    # slot, marks the map stale and retries on the named node; an `ASK`
+    # retries there once with the asking flag; a `TRYAGAIN` retries after
+    # a growing pause. *redirect* is a redirect reply already received
+    # (from a pipeline), processed before the first send.
+    private def execute(slot : Int32?, redirect : CommandError? = nil, & : Node, Bool -> Value) : Value
+      check_open
+      node = route(slot)
+      asking = false
+      attempt = 0
+      pending = redirect
+      last = nil
+      while attempt <= @max_redirects
+        error = pending || begin
+          return yield node, asking
+        rescue ex : CommandError
+          ex
+        rescue ex : ConnectionError
+          @mutex.synchronize { @stale = true }
+          raise ex
+        end
+        pending = nil
+        case error.code
+        when "MOVED"
+          moved_slot, node = parse_redirect(error)
+          @mutex.synchronize do
+            @slots[moved_slot] = node
+            @stale = true
+          end
+          asking = false
+        when "ASK"
+          _, node = parse_redirect(error)
+          asking = true
+        when "TRYAGAIN"
+          sleep({10.milliseconds * (1 << attempt), 500.milliseconds}.min)
+        else
+          raise error
+        end
+        last = error
+        attempt += 1
+      end
+      raise ClusterError.new("too many redirects (#{@max_redirects}) for slot #{slot}: #{last.try(&.message)}", cause: last)
+    end
+
+    # Sends `ASKING` and *args* contiguously on *node*'s client and returns
+    # the command's reply, raising an error reply so the loop can act on
+    # a further redirect.
+    private def ask(node : Node, args : Indexable) : Value
+      replies = node.client.pipelined do |p|
+        p.command("ASKING")
+        p.command(args)
+      end
+      value = replies[1]
+      raise value if value.is_a?(CommandError)
+      value
+    end
+
+    # `MOVED 3999 127.0.0.1:6381` → `{3999, node}`; same for `ASK`.
+    private def parse_redirect(error : CommandError) : {Int32, Node}
+      parts = error.message.to_s.split(' ')
+      slot = parts[1]?.try(&.to_i?)
+      address = parts[2]?
+      unless slot && address && 0 <= slot < SLOTS
+        raise ProtocolError.new("malformed redirect #{error.message.inspect}")
+      end
+      colon = address.rindex(':') || raise ProtocolError.new("malformed redirect #{error.message.inspect}")
+      host = address[0, colon]
+      port = address[colon + 1..].to_i? || raise ProtocolError.new("malformed redirect #{error.message.inspect}")
+      host = @seeds.first.host.presence || "localhost" if host.empty?
+      {slot, node_at(host, port)}
+    end
+
+    # The known node at *host*:*port*, or a new master node for an address
+    # the last reload did not list (the next reload fills in its id).
+    private def node_at(host : String, port : Int32) : Node
+      address = "#{host}:#{port}"
+      @mutex.synchronize do
+        @nodes[address] ||= new_node(host, port, "", true)
+      end
+    end
+
+    # The node for *slot*, any master when *slot* is nil or unassigned,
+    # after reloading a stale map. Raises `ClusterError` with no masters.
+    private def route(slot : Int32?) : Node
+      refresh_if_stale
+      @mutex.synchronize do
+        raise ClusterError.new("cluster has no masters") if @masters.empty?
+        (slot ? @slots[slot] : nil) || @masters.sample
+      end
+    end
+
+    private def refresh_if_stale : Nil
+      return unless @stale
+      @refresh_mutex.synchronize { load_topology if @stale }
+    end
+
+    # Under `@refresh_mutex`. Asks every known master, then every seed not
+    # already tried, for `CLUSTER SLOTS`, and installs the first answer.
+    private def load_topology : Nil
+      last_error = nil
+      masters = @mutex.synchronize { @masters.dup }
+      masters.each do |node|
+        begin
+          install(node.client.call({"CLUSTER", "SLOTS"}), node.host)
+          return
+        rescue ex : ConnectionError | CommandError | IO::TimeoutError
+          last_error = ex
+        end
+      end
+      tried = masters.map(&.address)
+      @seeds.each do |seed|
+        host = seed.host.presence || "localhost"
+        port = seed.port || 6379
+        next if tried.includes?("#{host}:#{port}")
+        begin
+          conn = Connection.new(node_uri(host, port), username: @username, password: @password,
+            client_name: @client_name, protocol: @protocol_option, connect_timeout: @connect_timeout,
+            read_timeout: @read_timeout, tls_context: @tls_context, max_bulk_size: @max_bulk_size)
+          reply = begin
+            conn.call({"CLUSTER", "SLOTS"})
+          ensure
+            conn.close
+          end
+          install(reply, host)
+          return
+        rescue ex : ConnectionError | CommandError | IO::TimeoutError
+          last_error = ex
+        end
+      end
+      raise ClusterError.new("no cluster node reachable: #{last_error.try(&.message)}", cause: last_error)
+    end
+
+    private def node_uri(host : String, port : Int32) : URI
+      URI.new(scheme: @scheme, host: host, port: port)
+    end
+
+    private def node_client(host : String, port : Int32) : Client
+      Client.new(node_uri(host, port), username: @username, password: @password, client_name: @client_name,
+        protocol: @protocol_option, connect_timeout: @connect_timeout, read_timeout: @read_timeout,
+        tls_context: @tls_context, max_bulk_size: @max_bulk_size, pool_size: @pool_size)
+    end
+
+    private def new_node(host : String, port : Int32, id : String, master : Bool) : Node
+      Node.new(host, port, id, master, ->node_client(String, Int32))
+    end
+
+    # Parses a `CLUSTER SLOTS` reply (`[[first, last, [host, port, id, ...],
+    # replica...], ...]`) and swaps the topology in, keeping the `Node`
+    # objects (and their clients) of addresses already known. *asked_host*
+    # stands in for a node whose own address the server left empty. Nodes
+    # that disappeared, and masters that turned replica, are closed.
+    private def install(reply : Value, asked_host : String) : Nil
+      ranges = reply.as?(Array) || raise ProtocolError.new("unexpected CLUSTER SLOTS reply #{reply.inspect}")
+      slots = Array(Node?).new(SLOTS, nil)
+      nodes = {} of String => Node
+      masters = [] of Node
+      old = @mutex.synchronize { @nodes.dup }
+      ranges.each do |range|
+        entry = range.as?(Array) || raise ProtocolError.new("unexpected CLUSTER SLOTS range #{range.inspect}")
+        first = entry[0]?.as?(Int64)
+        last = entry[1]?.as?(Int64)
+        unless first && last && 0 <= first && first <= last && last < SLOTS
+          raise ProtocolError.new("unexpected CLUSTER SLOTS range #{range.inspect}")
+        end
+        master = nil
+        entry.each_with_index do |item, i|
+          next if i < 2
+          desc = item.as?(Array) || raise ProtocolError.new("unexpected CLUSTER SLOTS node #{item.inspect}")
+          reported = desc[0]?.as?(String)
+          host = reported.nil? || reported.empty? || reported == "?" ? asked_host : reported
+          port = desc[1]?.as?(Int64) || raise ProtocolError.new("unexpected CLUSTER SLOTS node #{item.inspect}")
+          id = desc[2]?.as?(String) || ""
+          address = "#{host}:#{port}"
+          is_master = i == 2
+          node = nodes[address]? || old[address]? || new_node(host, port.to_i, id, is_master)
+          node.master = is_master
+          node.id = id unless id.empty?
+          nodes[address] = node
+          if is_master
+            masters << node unless masters.includes?(node)
+            master = node
+          end
+        end
+        (first..last).each { |slot| slots[slot] = master }
+      end
+      gone = @mutex.synchronize do
+        removed = @nodes.values.reject { |node| nodes.has_key?(node.address) }
+        @slots = slots
+        @nodes = nodes
+        @masters = masters
+        @stale = false
+        removed
+      end
+      gone.each(&.close)
+      nodes.each_value { |node| node.close unless node.master? }
     end
   end
 end
