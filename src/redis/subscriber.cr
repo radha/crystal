@@ -1,4 +1,3 @@
-# src/redis/subscriber.cr
 module Redis
   # A pub/sub subscription on its own connection.
   #
@@ -255,7 +254,12 @@ module Redis
         names.each { |n| args << n }
         w = Channel(Exception?).new(1)
         @pending.push(Ack.new(remaining, w))
-        c.send(args)
+        begin
+          c.send(args)
+        rescue ex
+          @pending.pop
+          raise ex
+        end
         {c, w}
       end
       return unless sent
@@ -278,18 +282,89 @@ module Redis
       raise error if error
     end
 
-    # The reader fiber. Reads until the connection fails, then closes the
-    # subscriber (Task 6 adds the reconnect loop here).
+    # The reader fiber: reads until the connection fails, then either
+    # reconnects and resubscribes or, with `reconnect: false`, closes.
     private def run(conn : Connection) : Nil
-      cause = read_loop(conn)
-      return if @closed
-      drop(conn, cause)
-      on_disconnect.try &.call(cause)
-      close
+      loop do
+        cause = read_loop(conn)
+        return if @closed
+        drop(conn, cause)
+        on_disconnect.try &.call(@mutex.synchronize { @error } || cause)
+        unless @reconnect
+          close
+          return
+        end
+        conn = reconnect_loop || return
+        on_reconnect.try &.call
+      end
     rescue ex
-      # A hook raised: there is nobody to report it to, so shut down.
+      # A hook raised: there is nobody to report it to, so shut down. This
+      # always follows a `drop`, which already recorded the disconnect
+      # cause, so the hook's own exception is what the caller wants to see
+      # (see the "a hook that raises" spec).
       @mutex.synchronize { @error = ex }
       close
+    end
+
+    # Tries to reconnect with exponential backoff until it succeeds or the
+    # subscriber is closed (nil). On success the desired channels and
+    # patterns have been resubscribed on the returned connection.
+    private def reconnect_loop : Connection?
+      delay = 100.milliseconds
+      loop do
+        select
+        when @close_signal.receive?
+          return nil
+        when timeout(delay)
+        end
+        delay = {delay * 2, 5.seconds}.min
+        conn = begin
+          connect
+        rescue Error | IO::Error | OpenSSL::SSL::Error
+          next
+        end
+        installed = begin
+          @mutex.synchronize do
+            if @closed
+              false
+            else
+              @connection = conn
+              @error = nil
+              resubscribe(conn)
+              true
+            end
+          end
+        rescue ex : ConnectionError
+          # The fresh socket died while resubscribing; count it as a
+          # failed attempt.
+          drop(conn, ex)
+          next
+        end
+        unless installed
+          conn.close
+          return nil
+        end
+        return conn
+      end
+    end
+
+    # Under @mutex. Sends one SUBSCRIBE for every desired channel and one
+    # PSUBSCRIBE for every desired pattern, with acks nobody waits on.
+    private def resubscribe(conn : Connection) : Nil
+      unless @channels.empty?
+        args = Array(RESP::Arg).new(@channels.size + 1)
+        args << "SUBSCRIBE"
+        @channels.each { |c| args << c }
+        @pending.push(Ack.new(@channels.size, nil))
+        conn.send(args)
+      end
+      unless @patterns.empty?
+        args = Array(RESP::Arg).new(@patterns.size + 1)
+        args << "PSUBSCRIBE"
+        @patterns.each { |p| args << p }
+        @pending.push(Ack.new(@patterns.size, nil))
+        conn.send(args)
+      end
     end
 
     # Reads frames until the connection fails; returns the failure.
@@ -299,9 +374,14 @@ module Redis
       loop do
         value = RESP.read(socket, max_bulk_size: @max_bulk_size, push: push)
         case value
-        when Array  then dispatch(value) # RESP2: pub/sub frames are plain arrays
-        when String then confirm         # RESP3: `PING` answers `+PONG`
-        else             raise ProtocolError.new("unexpected reply in subscribed mode: #{value.inspect}")
+        when Array
+          dispatch(value) # RESP2: pub/sub frames are plain arrays
+        when "PONG"
+          confirm # RESP3: `PING` answers `+PONG`
+        when CommandError
+          raise value
+        else
+          raise ProtocolError.new("unexpected reply in subscribed mode: #{value.inspect}")
         end
       end
     rescue ex

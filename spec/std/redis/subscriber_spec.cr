@@ -1,4 +1,3 @@
-# spec/std/redis/subscriber_spec.cr
 require "spec"
 require "../../support/redis"
 
@@ -104,9 +103,9 @@ private class PubSubServer
 end
 
 private def wait_until(timeout = 2.seconds, &)
-  deadline = Time.monotonic + timeout
+  deadline = Time.instant + timeout
   until yield
-    raise "timed out waiting" if Time.monotonic > deadline
+    raise "timed out waiting" if Time.instant > deadline
     sleep 5.milliseconds
   end
 end
@@ -120,9 +119,9 @@ private def subscriber_specs(protocol : Int32)
       sub = Redis::Subscriber.new(server.url, protocol: protocol)
       sub.connected?.should be_true
       sub.protocol.should eq(protocol)
-      started = Time.monotonic
+      started = Time.instant
       sub.subscribe("a", "b")
-      (Time.monotonic - started).should be >= 50.milliseconds
+      (Time.instant - started).should be >= 50.milliseconds
       sub.channels.should eq(["a", "b"])
       fake.commands_on(1).should eq([["SUBSCRIBE", "a", "b"]])
       sub.close
@@ -203,7 +202,7 @@ private def subscriber_specs(protocol : Int32)
       fake.publish("a", "1")
       fake.publish("a", "2")
       sub.receive.payload.should eq("1")
-      sleep 20.milliseconds # let "2" reach the channel before closing
+      sub.ping # ordered after "2" on the wire; returns only once it's read
       sub.close
       sub.receive?.try(&.payload).should eq("2")
       sub.receive?.should be_nil
@@ -261,6 +260,86 @@ private def subscriber_specs(protocol : Int32)
       expect_raises(IO::TimeoutError) { sub.subscribe("a") }
       sub.channels.should eq(["a"])
       sub.receive?.should be_nil
+      server.close
+    end
+
+    it "reconnects, resubscribes channels then patterns, and keeps delivering" do
+      fake = PubSubServer.new(protocol)
+      server = fake.server
+      sub = Redis::Subscriber.new(server.url, protocol: protocol)
+      disconnected = Channel(Exception).new(1)
+      reconnected = Channel(Nil).new(1)
+      sub.on_disconnect = ->(ex : Exception) { disconnected.send(ex); nil }
+      sub.on_reconnect = -> { reconnected.send(nil); nil }
+      sub.subscribe("a", "b")
+      sub.psubscribe("log.*")
+      fake.kill
+      disconnected.receive.should be_a(IO::Error)
+      sub.error.should be_a(IO::Error)
+      reconnected.receive
+      # The hook fires when the resubscribe has been sent, which can be
+      # before the fake server has read it.
+      wait_until { fake.connections == 2 && fake.commands_on(2).size == 2 }
+      fake.commands_on(2).should eq([["SUBSCRIBE", "a", "b"], ["PSUBSCRIBE", "log.*"]])
+      sub.connected?.should be_true
+      sub.error.should be_nil
+      sub.channels.should eq(["a", "b"])
+      fake.publish("a", "after")
+      sub.receive.payload.should eq("after")
+      sub.ping
+      sub.close
+      server.close
+    end
+
+    it "records a subscribe made while disconnected and applies it on reconnect" do
+      fake = PubSubServer.new(protocol)
+      server = fake.server
+      sub = Redis::Subscriber.new(server.url, protocol: protocol)
+      disconnected = Channel(Nil).new(1)
+      reconnected = Channel(Nil).new(1)
+      sub.on_disconnect = ->(ex : Exception) { disconnected.send(nil); nil }
+      sub.on_reconnect = -> { reconnected.send(nil); nil }
+      sub.subscribe("a")
+      fake.kill
+      disconnected.receive
+      sub.subscribe("late") # returns at once: recorded only
+      sub.channels.should eq(["a", "late"])
+      reconnected.receive
+      wait_until { fake.connections == 2 && fake.commands_on(2).size >= 1 }
+      fake.commands_on(2).first.should eq(["SUBSCRIBE", "a", "late"])
+      sub.close
+      server.close
+    end
+
+    it "keeps retrying with backoff while the server is down and close interrupts the wait" do
+      fake = PubSubServer.new(protocol)
+      server = fake.server
+      sub = Redis::Subscriber.new(server.url, protocol: protocol, connect_timeout: 200.milliseconds)
+      disconnected = Channel(Nil).new(1)
+      sub.on_disconnect = ->(ex : Exception) { disconnected.send(nil); nil }
+      sub.subscribe("a")
+      server.close
+      fake.kill
+      disconnected.receive
+      sleep 400.milliseconds # at least the 100 ms and 200 ms attempts have failed
+      sub.connected?.should be_false
+      sub.closed?.should be_false
+      started = Time.instant
+      sub.close
+      (Time.instant - started).should be < 100.milliseconds
+      sub.receive?.should be_nil
+    end
+
+    it "a hook that raises closes the subscriber" do
+      fake = PubSubServer.new(protocol)
+      server = fake.server
+      sub = Redis::Subscriber.new(server.url, protocol: protocol)
+      sub.on_disconnect = ->(ex : Exception) : Nil { raise "hook failed" }
+      sub.subscribe("a")
+      fake.kill
+      sub.receive?.should be_nil
+      sub.closed?.should be_true
+      sub.error.try(&.message).should eq("hook failed")
       server.close
     end
   end
