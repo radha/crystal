@@ -207,8 +207,109 @@ private def live_command_specs(protocol : Int32)
   end
 end
 
+private def live_slice2_specs(protocol : Int32)
+  describe "Redis live pub/sub, transactions, scripts (RESP#{protocol})" do
+    pending_redis "publishes to a subscriber on a channel and a pattern" do
+      with_redis(protocol) do |r|
+        sub = r.subscriber
+        begin
+          sub.protocol.should eq(protocol)
+          sub.subscribe("news")
+          sub.psubscribe("log.*")
+          r.publish("news", "hello").should eq(1_i64)
+          r.publish("log.app", "line").should eq(1_i64)
+          sub.receive.should eq(Redis::Subscriber::Message.new("news", "hello"))
+          sub.receive.should eq(Redis::Subscriber::Message.new("log.app", "line", "log.*"))
+          sub.ping
+          sub.unsubscribe("news")
+          r.publish("news", "nobody").should eq(0_i64)
+          sub.punsubscribe
+          r.publish("log.app", "nobody").should eq(0_i64)
+        ensure
+          sub.close
+        end
+      end
+    end
+
+    pending_redis "multi runs atomically and resolves typed futures" do
+      with_redis(protocol) do |r|
+        r.set("hits", "41")
+        hits = nil
+        got = nil
+        replies = r.multi do |tx|
+          tx.set("a", "1")
+          hits = tx.incr("hits")
+          got = tx.get("a")
+          tx.lpush("l", "x")
+        end
+        replies.should eq(["OK", 42_i64, "1", 1_i64] of Redis::Value)
+        hits.not_nil!.value.should eq(42_i64)
+        got.not_nil!.value.should eq("1")
+        f = nil
+        r.multi { |tx| tx.set("l", "y"); f = tx.incr("l") }
+        expect_raises(Redis::CommandError, /WRONGTYPE|ERR/) { f.not_nil!.value }
+        r.get("l").should eq("y")
+      end
+    end
+
+    pending_redis "watch aborts when another client changes the key, and a retry converges" do
+      with_redis(protocol) do |r|
+        r.set("balance", "100")
+        expect_raises(Redis::AbortedError) do
+          r.watch("balance") do |conn|
+            balance = conn.get("balance").not_nil!.to_i
+            r.set("balance", "50")
+            conn.multi { |tx| tx.set("balance", (balance - 10).to_s) }
+          end
+        end
+        r.get("balance").should eq("50")
+
+        attempts = 0
+        loop do
+          begin
+            r.watch("balance") do |conn|
+              attempts += 1
+              balance = conn.get("balance").not_nil!.to_i
+              r.set("balance", "70") if attempts == 1
+              conn.multi { |tx| tx.set("balance", (balance - 10).to_s) }
+            end
+            break
+          rescue Redis::AbortedError
+          end
+        end
+        attempts.should eq(2)
+        r.get("balance").should eq("60")
+      end
+    end
+
+    pending_redis "run caches scripts and heals after SCRIPT FLUSH" do
+      with_redis(protocol) do |r|
+        script = Redis::Script.new("return redis.call('INCRBY', KEYS[1], ARGV[1])")
+        r.script_flush
+        r.script_load(script.source).should eq(script.sha)
+        r.script_flush
+        r.run(script, keys: ["n"], args: [5]).should eq(5_i64)
+        r.run(script, keys: ["n"], args: [5]).should eq(10_i64)
+        r.script_exists(script.sha).should eq([true])
+        f = nil
+        r.pipelined { |p| f = p.run(script, keys: ["n"], args: [1]) }
+        f.not_nil!.value.should eq(11_i64)
+        r.script_flush
+        r.pipelined { |p| f = p.run(script, keys: ["n"], args: [1]) }
+        ex = expect_raises(Redis::CommandError) { f.not_nil!.value }
+        ex.code.should eq("NOSCRIPT")
+        r.pipelined { |p| f = p.run(script, keys: ["n"], args: [1]) }
+        f.not_nil!.value.should eq(12_i64)
+        r.run(script, keys: ["n"], args: [1]).should eq(13_i64)
+      end
+    end
+  end
+end
+
 live_command_specs(3)
 live_command_specs(2)
+live_slice2_specs(3)
+live_slice2_specs(2)
 
 describe "Redis live concurrency" do
   pending_redis "64 fibers × 100 incr on one multiplexed client" do

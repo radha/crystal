@@ -271,6 +271,17 @@ module Redis
       end
     end
 
+    # Opens a `Subscriber` on its own connection with this client's URL,
+    # credentials, client name, protocol, timeouts and TLS context. The
+    # client's database is not applied: pub/sub is database-independent.
+    # The subscriber is independent of the client afterwards and must be
+    # closed on its own.
+    def subscriber(*, capacity : Int32 = 64, reconnect : Bool = true) : Subscriber
+      Subscriber.new(@url, username: @username, password: @password, client_name: @client_name,
+        protocol: @protocol_option, connect_timeout: @connect_timeout, read_timeout: @read_timeout,
+        tls_context: @tls_context, max_bulk_size: @max_bulk_size, capacity: capacity, reconnect: reconnect)
+    end
+
     # Closes the connection; pending commands raise `ConnectionError`, and
     # every later call raises too.
     def close : Nil

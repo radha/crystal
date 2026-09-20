@@ -185,7 +185,9 @@ module Redis
     end
 
     # Sends `PING` and returns once the server answered. A cheap liveness
-    # check for an idle subscription. Errors as `subscribe`.
+    # check for an idle subscription. Errors as `subscribe`. While the
+    # subscriber is reconnecting the call records nothing and returns
+    # immediately, like the other control commands.
     def ping : Nil
       control("PING", [] of String) { 1 }
     end
@@ -295,6 +297,7 @@ module Redis
           return
         end
         conn = reconnect_loop || return
+        return if @closed
         on_reconnect.try &.call
       end
     rescue ex
