@@ -43,4 +43,13 @@ module Redis
       word
     end
   end
+
+  # Raised by `multi` when `EXEC` replies nil: a key marked with `WATCH`
+  # changed before the transaction ran, so none of its commands executed.
+  # Retry the whole read-then-`multi` sequence.
+  class AbortedError < Error
+    def initialize(message : String = "transaction aborted: a watched key changed", cause : Exception? = nil)
+      super(message, cause)
+    end
+  end
 end

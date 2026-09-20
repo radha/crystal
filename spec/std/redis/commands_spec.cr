@@ -374,3 +374,9 @@ describe "scripting commands" do
     expect_call("OK", ["SCRIPT", "FLUSH"], &.script_flush).should be_nil
   end
 end
+
+describe "pubsub commands" do
+  it "publish" do
+    expect_call(2_i64, ["PUBLISH", "news", "hi"], &.publish("news", "hi")).should eq(2_i64)
+  end
+end
