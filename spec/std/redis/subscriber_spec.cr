@@ -33,6 +33,12 @@ private class PubSubServer
       mine = [] of Array(String)
       @seen << mine
       @sockets << io
+      # Per-connection subscription state, tracked like a real server so
+      # that a bare UNSUBSCRIBE/PUNSUBSCRIBE can answer with one frame per
+      # channel or pattern actually subscribed (counting down to 0), and a
+      # single null-channel frame only when nothing is subscribed.
+      channels = [] of String
+      patterns = [] of String
       while cmd = RedisSpec::FakeServer.read_command(io)
         mine << cmd unless cmd[0] == "HELLO"
         case cmd[0]
@@ -45,10 +51,27 @@ private class PubSubServer
           end
           kind = cmd[0].downcase
           names = cmd[1..]
-          if names.empty?
-            io << RedisSpec.pubsub_frame(@protocol, kind, nil, 0)
+          set = (kind == "subscribe" || kind == "unsubscribe") ? channels : patterns
+          case kind
+          when "subscribe", "psubscribe"
+            names.each do |name|
+              set << name unless set.includes?(name)
+              io << RedisSpec.pubsub_frame(@protocol, kind, name, set.size)
+            end
           else
-            names.each_with_index { |name, i| io << RedisSpec.pubsub_frame(@protocol, kind, name, i + 1) }
+            # Bare form: unsubscribe from everything currently tracked, in
+            # insertion order, one frame per channel/pattern; a single
+            # null-channel frame if nothing was subscribed. Named form:
+            # only the given names.
+            targets = names.empty? ? set.dup : names
+            if targets.empty?
+              io << RedisSpec.pubsub_frame(@protocol, kind, nil, 0)
+            else
+              targets.each do |name|
+                set.delete(name)
+                io << RedisSpec.pubsub_frame(@protocol, kind, name, set.size)
+              end
+            end
           end
         when "PING"
           io << (@protocol == 3 ? "+PONG\r\n" : RedisSpec.pubsub_frame(2, "pong", ""))

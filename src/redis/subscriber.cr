@@ -160,15 +160,9 @@ module Redis
     # `unsubscribe(*channels)`.
     def unsubscribe : Nil
       control("UNSUBSCRIBE", [] of String) do
+        count = @channels.size
         @channels.clear
-        # A real server answers a bare UNSUBSCRIBE with one frame per
-        # channel actually unsubscribed (or a single null-channel frame
-        # when none was subscribed); only the first is awaited here, which
-        # is enough to know the command was accepted. A caller with more
-        # than one channel subscribed who calls the bare form against a
-        # real server may see the later, now-unpending frames raise
-        # "unsolicited confirmation" and drop the connection.
-        1
+        count == 0 ? 1 : count
       end
     end
 
@@ -182,12 +176,12 @@ module Redis
     end
 
     # Unsubscribes from every pattern currently subscribed; see
-    # `punsubscribe(*patterns)`. Awaits only the first confirmation frame,
-    # as `unsubscribe` does; the same caveat applies.
+    # `punsubscribe(*patterns)`.
     def punsubscribe : Nil
       control("PUNSUBSCRIBE", [] of String) do
+        count = @patterns.size
         @patterns.clear
-        1
+        count == 0 ? 1 : count
       end
     end
 
