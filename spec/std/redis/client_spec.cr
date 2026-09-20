@@ -256,4 +256,51 @@ describe Redis::Client do
   it "rejects a non-positive pool size" do
     expect_raises(ArgumentError, /pool_size/) { Redis::Client.new(pool_size: 0) }
   end
+
+  it "sends pre-encoded bytes through call_raw, with ASKING when asked" do
+    script = Script.new
+    server = script.server
+    client = Redis::Client.new(server.url)
+    ping_x = "*2\r\n$4\r\nPING\r\n$1\r\nx\r\n".to_slice
+    client.call_raw(ping_x).should eq("x")
+    client.call_raw(ping_x, asking: true).should eq("x")
+    script.chunks.last.should eq(2) # ASKING and PING left in one write
+    expect_raises(Redis::CommandError, /bad/) { client.call_raw("*1\r\n$3\r\nBAD\r\n".to_slice) }
+    client.close
+    server.close
+  end
+
+  it "yields every reply of pipeline_raw in order and the failure afterwards" do
+    # Collected as parallel arrays, not an Array({Int32, Redis::Value,
+    # Exception?}): the compiler cannot pretty-print (needed for a failed
+    # `should eq`'s message) an Array of a Tuple that mixes `Redis::Value`
+    # (a self-referential alias with a `CommandError` member) with a plain
+    # `Exception?` slot -- a Tuple#each block-type inference bug, verified
+    # with a minimal non-Redis reproduction.
+    script = Script.new
+    server = script.server
+    client = Redis::Client.new(server.url)
+    two = "*2\r\n$4\r\nPING\r\n$1\r\na\r\n*2\r\n$4\r\nPING\r\n$1\r\nb\r\n".to_slice
+    indices = [] of Int32
+    values = [] of Redis::Value
+    errors = [] of Exception?
+    client.pipeline_raw(two, 2) { |i, value, error| indices << i; values << value; errors << error }
+    indices.should eq([0, 1])
+    values.should eq(["a", "b"])
+    errors.should eq([nil, nil])
+    three = "*2\r\n$4\r\nPING\r\n$1\r\na\r\n*1\r\n$3\r\nDIE\r\n*2\r\n$4\r\nPING\r\n$1\r\nb\r\n".to_slice
+    indices.clear
+    values.clear
+    errors.clear
+    expect_raises(Redis::ConnectionError) do
+      client.pipeline_raw(three, 3) { |i, value, error| indices << i; values << value; errors << error }
+    end
+    indices.should eq([0, 1, 2])
+    values[0].should eq("a")
+    errors[0].should be_nil
+    errors[1].should be_a(Redis::ConnectionError)
+    errors[2].should be_a(Redis::ConnectionError)
+    client.close
+    server.close
+  end
 end

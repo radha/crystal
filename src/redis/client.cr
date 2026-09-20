@@ -53,6 +53,9 @@ module Redis
     # fails every command in flight.
     property push_handler : (Array(Value) ->)?
 
+    # :nodoc:
+    ASKING = "*1\r\n$6\r\nASKING\r\n".to_slice
+
     @mutex = Mutex.new
     @connection : Connection?
     @wakeup : Channel(Nil) = Channel(Nil).new(1)
@@ -177,12 +180,33 @@ module Redis
       # A closed client raises even when the block queued nothing.
       @mutex.synchronize { check_open }
       return [] of Value if pipeline.size == 0
-      waiters = Array(Waiter).new(pipeline.size)
+      results = Array(Value).new(pipeline.size)
+      pipeline_raw(pipeline.buffer.to_slice, pipeline.size) do |i, value, error|
+        if error
+          pipeline.fail(i, error)
+        else
+          pipeline.resolve(i, value)
+          results << value
+        end
+      end
+      results
+    end
+
+    # :nodoc:
+    #
+    # Appends *bytes*, already RESP-encoded commands, to the outbound
+    # buffer and registers *count* replies, in one critical section so no
+    # other fiber's command lands between them. Yields each reply with its
+    # index in order, then yields the failure (with a nil value) for every
+    # reply that will not arrive, and finally raises that failure.
+    # `pipelined` and `Cluster` are built on it.
+    def pipeline_raw(bytes : Bytes, count : Int32, & : Int32, Value, Exception? ->) : Nil
+      waiters = Array(Waiter).new(count)
       wakeup, conn = @mutex.synchronize do
         check_open
         c = ensure_connected
-        @out.write(pipeline.buffer.to_slice)
-        pipeline.size.times do
+        @out.write(bytes)
+        count.times do
           w = take_waiter
           @pending.push(w)
           waiters << w
@@ -190,31 +214,44 @@ module Redis
         {@wakeup, c}
       end
       signal(wakeup)
-      results = Array(Value).new(waiters.size)
       failure = nil
-      resolved = 0
+      delivered = 0
       begin
         waiters.each_with_index do |waiter, i|
           value, error = wait(waiter, conn)
-          if error
-            pipeline.fail(i, error)
-            failure ||= error
-          else
-            pipeline.resolve(i, value)
-            results << value
-          end
-          resolved = i + 1
+          failure ||= error
+          yield i, value, error
+          delivered = i + 1
         end
       rescue ex : IO::TimeoutError
-        # The timeout already tore the connection down. Every future that
-        # has not been given a reply is resolved with it, so that
-        # `Future#value` raises the timeout instead of reporting a
-        # pipeline that never executed.
-        (resolved...waiters.size).each { |j| pipeline.fail(j, ex) }
+        # The timeout already tore the connection down; the replies not
+        # yet delivered are failed with it before it propagates.
+        (delivered...count).each { |j| yield j, nil, ex }
         raise ex
       end
       raise failure if failure
-      results
+    end
+
+    # :nodoc:
+    #
+    # Sends one pre-encoded command and returns its reply, raising an error
+    # reply as `CommandError` exactly like `call`. With *asking* an
+    # `ASKING` goes out contiguously ahead of it (a cluster `ASK`
+    # redirect); its `OK` is discarded.
+    def call_raw(bytes : Bytes, asking : Bool = false) : Value
+      count = 1
+      if asking
+        joined = Bytes.new(ASKING.size + bytes.size)
+        ASKING.copy_to(joined)
+        bytes.copy_to(joined + ASKING.size)
+        bytes = joined
+        count = 2
+      end
+      replies = Array(Value).new(count)
+      pipeline_raw(bytes, count) { |_, value, error| replies << value unless error }
+      value = replies.last
+      raise value if value.is_a?(CommandError)
+      value
     end
 
     # Runs the block's commands as one `MULTI`..`EXEC` transaction, sent in

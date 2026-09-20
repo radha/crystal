@@ -61,4 +61,53 @@ describe Redis::Pipeline do
     expect_raises(IO::TimeoutError, /slow/) { f.value }
     expect_raises(Redis::ConnectionError, /lost/) { g.value }
   end
+
+  it "records routes and byte offsets in routing mode" do
+    p = Redis::Pipeline.new(routing: true)
+    p.routing?.should be_true
+    p.set("a", "1")
+    p.command("PING")
+    p.get("{tag}b")
+    p.routes.map(&.key).should eq(["a", nil, "{tag}b"])
+    p.routes.all?(&.retry).should be_true
+    # "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n" is 27 bytes, "*1\r\n$4\r\nPING\r\n" is 14.
+    p.offsets.should eq([0, 27, 41])
+    p.buffer.bytesize.should eq(41 + "*2\r\n$3\r\nGET\r\n$6\r\n{tag}b\r\n".bytesize)
+  end
+
+  it "routes a multi block by its first key and marks it non-retryable" do
+    p = Redis::Pipeline.new(routing: true)
+    p.get("x")
+    p.multi do |tx|
+      tx.command("PING")
+      tx.incr("{t}a")
+      tx.incr("{t}b")
+    end
+    p.get("y")
+    p.size.should eq(7)
+    p.routes.map(&.key).should eq(["x", "{t}a", "{t}a", "{t}a", "{t}a", "{t}a", "y"])
+    p.routes.map(&.retry).should eq([true, false, false, false, false, false, true])
+    p.offsets.size.should eq(7)
+    p.offsets.should eq(p.offsets.sort)
+    bytes = p.buffer.to_slice
+    p.offsets.each { |offset| bytes[offset].should eq('*'.ord.to_u8) }
+    bytes[p.offsets[1], 15].should eq("*1\r\n$5\r\nMULTI\r\n".to_slice)
+    bytes[p.offsets[5], 14].should eq("*1\r\n$4\r\nEXEC\r\n".to_slice)
+  end
+
+  it "records a pipelined script run by its first key" do
+    p = Redis::Pipeline.new(routing: true)
+    p.run(Redis::Script.new("return 1"), keys: ["k"])
+    p.run(Redis::Script.new("return 2"))
+    p.routes.map(&.key).should eq(["k", nil])
+  end
+
+  it "records nothing outside routing mode" do
+    p = Redis::Pipeline.new
+    p.get("a")
+    p.multi { |tx| tx.get("b") }
+    p.routing?.should be_false
+    p.routes.should be_empty
+    p.offsets.should be_empty
+  end
 end

@@ -114,16 +114,42 @@ module Redis
     # The encoded commands, appended to the client's outbound buffer.
     # Internal to `Client#pipelined`.
     getter buffer = IO::Memory.new
+    # :nodoc:
+    #
+    # Whether routes and offsets are recorded (`Cluster#pipelined`).
+    getter? routing : Bool
+    # :nodoc:
+    #
+    # In routing mode, one entry per wire command: the key it is routed by
+    # and whether a redirect reply may be retried on its own.
+    getter routes = [] of Route
+    # :nodoc:
+    #
+    # In routing mode, the byte offset of every wire command in `buffer`.
+    getter offsets = [] of Int32
     @futures = [] of AbstractFuture
 
     @script_cache : ScriptCache
 
     # :nodoc:
     #
+    # One wire command's routing information. A `multi` block's commands
+    # share the transaction's first key and are never retried one by one.
+    record Route, key : String?, retry : Bool = true
+
+    # :nodoc:
+    #
     # *script_cache* is the owning client's; `Client#pipelined` and
     # `Connection#pipelined` pass theirs. The default is for a pipeline
-    # built by hand, which then always sends `EVAL`.
-    def initialize(@script_cache : ScriptCache = ScriptCache.new)
+    # built by hand, which then always sends `EVAL`. With *routing* the
+    # pipeline also records `routes` and `offsets` for `Cluster`.
+    def initialize(@script_cache : ScriptCache = ScriptCache.new, @routing : Bool = false)
+    end
+
+    # Appends one route and the offset the next write starts at.
+    private def record(args : Indexable) : Nil
+      @routes << Route.new(Cluster.route_key(args))
+      @offsets << @buffer.bytesize
     end
 
     # :nodoc:
@@ -133,6 +159,7 @@ module Redis
              else
                script_args("EVAL", script.source, keys, args)
              end
+      record(wire) if @routing
       RESP.write_command(@buffer, wire)
       future = ScriptFuture.new(@script_cache, script.sha)
       @futures << future
@@ -152,6 +179,7 @@ module Redis
 
     # :nodoc:
     def typed_call(args : Indexable, &block : Value -> T) : Future(T) forall T
+      record(args) if @routing
       RESP.write_command(@buffer, args)
       future = Future(T).new(block)
       @futures << future
@@ -182,7 +210,7 @@ module Redis
     # `"QUEUED"` per command, and the `EXEC` array. An empty block queues
     # nothing and returns a future already resolved to an empty array.
     def multi(& : Transaction ->) : Future(Array(Value))
-      tx = Transaction.new(@script_cache)
+      tx = Transaction.new(@script_cache, @routing)
       yield tx
       targets = tx.futures
       exec = ExecFuture.new(targets)
@@ -190,9 +218,23 @@ module Redis
         exec.resolve([] of Value)
         return exec
       end
+      route = Route.new(tx.routes.find(&.key).try(&.key), false)
+      if @routing
+        @routes << route
+        @offsets << @buffer.bytesize
+      end
       RESP.write_command(@buffer, {"MULTI"})
       @futures << Future(Nil).new(->(v : Value) { nil })
+      base = @buffer.bytesize
       @buffer.write(tx.buffer.to_slice)
+      if @routing
+        tx.offsets.each do |offset|
+          @routes << route
+          @offsets << base + offset
+        end
+        @routes << route
+        @offsets << @buffer.bytesize
+      end
       targets.each { |target| @futures << QueuedFuture.new(target) }
       RESP.write_command(@buffer, {"EXEC"})
       @futures << exec
