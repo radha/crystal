@@ -291,16 +291,16 @@ module Redis
         end
       rescue ex : IO::TimeoutError
         close
-        (results.size...pipeline.size).each { |i| pipeline.resolve(i, ex) }
+        fail_futures(pipeline, results.size, ex)
         raise ex
       rescue ex : ProtocolError
         close
-        (results.size...pipeline.size).each { |i| pipeline.resolve(i, ex) }
+        fail_futures(pipeline, results.size, ex)
         raise ex
       rescue ex : IO::Error
         close
-        error = ConnectionError.new("connection lost: #{ex.message}", cause: ex)
-        (results.size...pipeline.size).each { |i| pipeline.resolve(i, error) }
+        error = connection_error(ex)
+        fail_futures(pipeline, results.size, error)
         raise error
       end
       results
@@ -366,7 +366,21 @@ module Redis
 
     private def fail(ex : IO::Error) : NoReturn
       close
-      raise ConnectionError.new("connection lost: #{ex.message}", cause: ex)
+      raise connection_error(ex)
+    end
+
+    private def connection_error(ex : IO::Error) : ConnectionError
+      ConnectionError.new("connection lost: #{ex.message}", cause: ex)
+    end
+
+    # Resolves every future from *from* to *pipeline*'s end with *error*.
+    # `T` is left free rather than typed `Exception` so that each call site
+    # monomorphizes on its own concrete leaf exception type: a broader
+    # `Exception`-typed parameter cannot be matched against `ScriptFuture`'s
+    # `resolve` overload once a pipeline holds one (a `Value | Exception`
+    # restriction check against a non-leaf argument type fails to compile).
+    private def fail_futures(pipeline : Pipeline, from : Int32, error : T) : Nil forall T
+      (from...pipeline.size).each { |i| pipeline.resolve(i, error) }
     end
   end
 end

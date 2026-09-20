@@ -209,10 +209,12 @@ module Redis
     # Runs the block's commands as one `MULTI`..`EXEC` transaction, sent in
     # a single write so that no other fiber's command can land between
     # `MULTI` and `EXEC`, and returns the `EXEC` array. Typed methods on the
-    # transaction return futures resolved from that array. Raises the
-    # `EXECABORT` `CommandError` if a command was rejected at queue time,
-    # `ConnectionError` if the socket drops. Error replies inside the array
-    # stay values; only the matching command's future raises them.
+    # transaction return futures resolved from that array. Raises
+    # `AbortedError` if a key marked with `watch` changed (`EXEC` replied
+    # nil), the `EXECABORT` `CommandError` if a command was rejected at
+    # queue time, `ConnectionError` if the socket drops. Error replies
+    # inside the array stay values; only the matching command's future
+    # raises them.
     #
     # `WATCH` is not available here (it is per-connection state that
     # concurrent fibers would clobber); use `watch` for optimistic locking.
@@ -229,6 +231,11 @@ module Redis
       exec = nil
       pipelined { |p| exec = p.multi(&block) }
       exec.not_nil!.value
+    end
+
+    # Raises `ArgumentError`: `watch` needs at least one key.
+    def watch(&block : Connection -> T) : T forall T
+      raise ArgumentError.new("WATCH needs at least one key")
     end
 
     # Opens a dedicated `Connection` with this client's options, sends
@@ -251,13 +258,7 @@ module Redis
     # end
     # ```
     #
-    # Raises `ArgumentError` without keys, `ConnectionError` if the
-    # dedicated connection cannot be opened.
-    def watch(&block : Connection -> T) : T forall T
-      raise ArgumentError.new("WATCH needs at least one key")
-    end
-
-    # :ditto:
+    # Raises `ConnectionError` if the dedicated connection cannot be opened.
     def watch(*keys : String, &block : Connection -> T) : T forall T
       conn = Connection.new(@url, db: @db, username: @username, password: @password, client_name: @client_name,
         protocol: @protocol_option, connect_timeout: @connect_timeout, read_timeout: @read_timeout,
