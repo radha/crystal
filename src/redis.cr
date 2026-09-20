@@ -60,6 +60,7 @@ require "set"
 require "digest/sha1"
 require "./redis/error"
 require "./redis/value"
+require "./redis/crc16"
 require "./redis/script"
 require "./redis/resp"
 require "./redis/commands"
@@ -68,6 +69,7 @@ require "./redis/pipeline"
 require "./redis/transaction"
 require "./redis/client"
 require "./redis/subscriber"
+require "./redis/cluster"
 
 module Redis
 end

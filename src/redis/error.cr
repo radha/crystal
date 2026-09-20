@@ -52,4 +52,16 @@ module Redis
       super(message, cause)
     end
   end
+
+  # Raised by `Cluster` when no seed or known node answers `CLUSTER SLOTS`,
+  # when the cluster reports no masters, or when a command was redirected
+  # more than `max_redirects` times (the last `MOVED`/`ASK`/`TRYAGAIN`
+  # reply is the `cause`).
+  class ClusterError < Error
+  end
+
+  # Raised by `Pool#checkout` when no connection became available within
+  # `checkout_timeout`.
+  class PoolTimeoutError < Error
+  end
 end
