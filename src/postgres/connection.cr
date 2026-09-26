@@ -36,6 +36,19 @@ module Postgres
     end
   end
 
+  # A `NOTIFY` delivered to a session that `LISTEN`s on its channel.
+  struct Notification
+    # The server process that sent it.
+    getter pid : Int32
+    # The channel name.
+    getter channel : String
+    # The payload (empty when none was given).
+    getter payload : String
+
+    def initialize(@pid : Int32, @channel : String, @payload : String)
+    end
+  end
+
   # One PostgreSQL session. Not fiber-safe: use `Client` (or a `Pool`) to
   # share connections between fibers.
   #
@@ -87,6 +100,10 @@ module Postgres
     getter config : Config
     # Called for each `NoticeResponse`; notices are dropped when nil.
     property on_notice : Proc(Notice, Nil)? = nil
+    # Called for each notification this session receives while it runs a
+    # query (after a `LISTEN` on it); dropped when nil. A `Listener`
+    # receives them while idle too.
+    property on_notification : Proc(Notification, Nil)? = nil
 
     @io : IO
     @socket : IO
@@ -288,6 +305,45 @@ module Postgres
         end
         row.read(0, T)
       {% end %}
+    end
+
+    # Sends `NOTIFY` on *channel* with *payload* (through `pg_notify`, so
+    # any channel name and payload are safe to pass).
+    def notify(channel : String, payload : String = "") : Nil
+      exec("select pg_notify($1, $2)", channel, payload)
+    end
+
+    # :nodoc:
+    #
+    # For `Listener`, which owns this connection's reads: writes a `Query`
+    # without reading the reply.
+    def unsafe_send_query(sql : String) : Nil
+      raise ConnectionError.new("connection is closed") if @closed
+      Messages::Query.new(query: sql).write(@out)
+      flush
+    end
+
+    # :nodoc:
+    #
+    # For `Listener`: the next message other than `ParameterStatus` and
+    # notices (which are handled). The body is valid until the next read.
+    def unsafe_read_message : {Char, Bytes}
+      loop do
+        type, body = read_message
+        next if (type == 'S' || type == 'N') && handle_async(type, body)
+        return {type, body}
+      end
+    end
+
+    # :nodoc:
+    def unsafe_notification(body : Bytes) : Notification
+      n = parse { Messages::NotificationResponse.from_slice(body) }
+      Notification.new(n.pid, n.channel, n.payload)
+    end
+
+    # :nodoc:
+    def unsafe_query_error(body : Bytes) : QueryError
+      parse { query_error(body) }
     end
 
     # --- connecting -------------------------------------------------------
@@ -702,7 +758,10 @@ module Postgres
       when 'N'
         @on_notice.try &.call(Notice.new(error_fields(body)))
       when 'A'
-        # NotificationResponse: LISTEN is not supported yet; dropped.
+        if handler = @on_notification
+          n = parse { Messages::NotificationResponse.from_slice(body) }
+          handler.call(Notification.new(n.pid, n.channel, n.payload))
+        end
       else
         return false
       end

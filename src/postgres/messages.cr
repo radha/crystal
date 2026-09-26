@@ -130,6 +130,13 @@ module Postgres
       field columns : Array(ColumnDescription), count: :count, max: 1664
     end
 
+    struct NotificationResponse
+      include Binary::Format
+      field pid : Int32
+      field channel : String, cstring: true
+      field payload : String, cstring: true
+    end
+
     struct CommandComplete
       include Binary::Format
       field tag : String, cstring: true

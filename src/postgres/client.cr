@@ -47,8 +47,9 @@ module Postgres
 
     # Creates a client for *config*.
     def initialize(*, @config : Config, pool_size : Int32 = 10, checkout_timeout : Time::Span = 5.seconds,
-                   read_timeout : Time::Span? = nil, tls_context : OpenSSL::SSL::Context::Client? = nil)
+                   read_timeout : Time::Span? = nil, @tls_context : OpenSSL::SSL::Context::Client? = nil)
       config = @config
+      tls_context = @tls_context
       @pool = Pool(Connection).new(size: pool_size, checkout_timeout: checkout_timeout,
         health_check: ->(conn : Connection) { conn.ping; true }) do
         Connection.new(config: config, read_timeout: read_timeout, tls_context: tls_context)
@@ -95,6 +96,17 @@ module Postgres
     # temporary tables, advisory locks) that must stay on one session.
     def with_connection(& : Connection -> T) : T forall T
       @pool.checkout { |conn| yield conn }
+    end
+
+    # Sends `NOTIFY` on *channel* with *payload*; see `Connection#notify`.
+    def notify(channel : String, payload : String = "") : Nil
+      @pool.checkout(&.notify(channel, payload))
+    end
+
+    # Opens a `Listener` on a connection of its own (not from the pool)
+    # with this client's settings.
+    def listener(*, capacity : Int32 = 256, reconnect : Bool = true) : Listener
+      Listener.new(config: @config, capacity: capacity, reconnect: reconnect, tls_context: @tls_context)
     end
 
     # Open connections waiting in the pool.
