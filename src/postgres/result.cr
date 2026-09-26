@@ -118,9 +118,10 @@ module Postgres
       size = @sizes[index]
       {% if T.nilable? %}
         return nil if size < 0
-        {% inner = T.union_types.reject(&.==(Nil)) %}
-        {% raise "Postgres: #{T} must be a single type or a single type plus Nil" unless inner.size == 1 %}
-        Codec.decode(@data[@starts[index], size], column, {{ inner[0] }})
+        {% raise "Postgres: #{T} must be a single type or a single type plus Nil" unless T.union_types.size == 2 %}
+        # `typeof` strips Nil without spelling the type, which a
+        # file-private type (in the caller's file) would not allow.
+        Codec.decode(@data[@starts[index], size], column, typeof(Pointer(T).null.value.not_nil!))
       {% else %}
         raise DecodeError.new("column #{column.name.inspect} is NULL but #{T} is not nilable") if size < 0
         Codec.decode(@data[@starts[index], size], column, T)
@@ -134,5 +135,39 @@ module Postgres
     def mapping(& : -> Array(Int32)) : Array(Int32)
       @mapping ||= yield
     end
+  end
+end
+
+module Postgres
+  # :nodoc:
+  #
+  # `{Int64, String}` (a tuple of types) → `Tuple(Int64, String)`.
+  def self.tuple_type(types : Tuple(*T)) forall T
+    # Built with `typeof` rather than by spelling the types, which
+    # file-private types in the caller's file would not allow.
+    {% begin %}
+      typeof({ {% for i in 0...T.size %} ::Postgres.instance_of(types[{{ i }}]), {% end %} })
+    {% end %}
+  end
+
+  # :nodoc:
+  #
+  # Only ever used inside `typeof`: the instance type of *type*.
+  def self.instance_of(type : X.class) : X forall X
+    Pointer(X).null.value # never evaluated: `typeof` only
+  end
+
+  # :nodoc:
+  #
+  # Adds `as: {Type, ...}` overloads of the given query methods, each
+  # returning tuples. `query_each` is handled separately (it yields).
+  macro def_tuple_queries(*names)
+    {% for name in names %}
+      # Like the `as type : T.class` form, with rows read as a tuple of
+      # *types* by column position: `as: {Int64, String?}`.
+      def {{ name.id }}(sql : String, *args, as types : Tuple)
+        {{ name.id }}(sql, *args, as: ::Postgres.tuple_type(types))
+      end
+    {% end %}
   end
 end

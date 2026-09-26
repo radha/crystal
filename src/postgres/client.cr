@@ -76,6 +76,13 @@ module Postgres
       @pool.checkout(&.query_one?(sql, *args, as: T))
     end
 
+    ::Postgres.def_tuple_queries(query_all, query_one, query_one?)
+
+    # :ditto:
+    def query_each(sql : String, *args, as types : Tuple, &) : Nil
+      query_each(sql, *args, as: ::Postgres.tuple_type(types)) { |row| yield row }
+    end
+
     # See `Connection#query_each`. One connection is held until the
     # iteration ends.
     def query_each(sql : String, *args, as type : T.class, & : T ->) : Nil forall T

@@ -160,6 +160,8 @@ module Postgres
     # :nodoc:
     getter ops = [] of Op
 
+    ::Postgres.def_tuple_queries(query_all, query_one, query_one?)
+
     # Queues `Connection#exec` with arguments (extended protocol).
     def exec(sql : String, *args) : Future(ExecResult)
       op = ExecOp.new(sql, args)

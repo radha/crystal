@@ -210,6 +210,28 @@ module Postgres
       TEXT
     end
 
+    # An enum: its value for an integer parameter, otherwise its name in
+    # `snake_case` (`Status::OnHold` → `"on_hold"`), matching the usual
+    # spelling of PostgreSQL enum labels.
+    def self.encode(io : IO, oid : UInt32, value : Enum) : Int16
+      case oid
+      when OID::INT2, OID::INT4, OID::INT8
+        encode(io, oid, value.value.to_i64)
+      else
+        encode(io, oid, value.to_s.underscore)
+      end
+    end
+
+    # Any other value: encoded as whatever its `to_pg` method returns
+    # (a user type's hook), or `EncodeError`.
+    def self.encode(io : IO, oid : UInt32, value) : Int16
+      if value.responds_to?(:to_pg)
+        encode(io, oid, value.to_pg)
+      else
+        mismatch(oid, value)
+      end
+    end
+
     private def self.checked(type : T.class, value, oid : UInt32) : T forall T
       unless T::MIN <= value <= T::MAX
         raise EncodeError.new("#{value} is out of range for #{OID.name(oid)}")
@@ -428,14 +450,31 @@ module Postgres
           item = b[pos, size]
           pos += size
           {% if T.nilable? %}
-            {% inner = T.union_types.reject(&.==(Nil)) %}
-            {% raise "Postgres: array element #{T} must be a single type or a single type plus Nil" unless inner.size == 1 %}
-            decode(item, element_column, {{ inner[0] }})
+            {% raise "Postgres: array element #{T} must be a single type or a single type plus Nil" unless T.union_types.size == 2 %}
+            decode(item, element_column, typeof(Pointer(T).null.value.not_nil!))
           {% else %}
             decode(item, element_column, T)
           {% end %}
         end
       end
+    end
+
+    # An enum, by label from a text column (or a PostgreSQL enum, which
+    # arrives in text format; `Enum.parse?` ignores case and underscores)
+    # or by value from an integer column. Any other type without a decoder
+    # is a compile-time error.
+    def self.decode(b : Bytes, c : Column, type : T.class) : T forall T
+      {% if T < Enum %}
+        if c.binary? && (c.type_oid == OID::INT2 || c.type_oid == OID::INT4 || c.type_oid == OID::INT8)
+          number = decode(b, c, Int64)
+          T.from_value?(number) || raise DecodeError.new("column #{c.name.inspect}: #{number} is not a value of #{T}")
+        else
+          label = decode(b, c, String)
+          T.parse?(label) || raise DecodeError.new("column #{c.name.inspect}: #{label.inspect} is not a member of #{T}")
+        end
+      {% else %}
+        {% raise "Postgres cannot decode a column as #{T}: use a supported type, a Postgres::Serializable, or a converter (@[Postgres::Field(converter: ...)])" %}
+      {% end %}
     end
 
     private def self.int(b : Bytes, c : Column, type : T.class) : T forall T

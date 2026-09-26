@@ -200,6 +200,14 @@ module Postgres
       rows
     end
 
+    ::Postgres.def_tuple_queries(query_all, query_one, query_one?)
+
+    # Like the `as type : T.class` form, with rows read as a tuple of
+    # *types* by column position.
+    def query_each(sql : String, *args, as types : Tuple, &) : Nil
+      query_each(sql, *args, as: ::Postgres.tuple_type(types)) { |row| yield row }
+    end
+
     # Runs *sql* and yields each row decoded as *type* as it arrives,
     # without buffering the result. The connection is busy until the
     # iteration ends; if the block raises, the rest of the result is read
@@ -306,6 +314,11 @@ module Postgres
     def self.decode_row(row : RowReader, type : T.class) : T forall T
       {% if T.class.has_method?(:from_pg_row) %}
         T.from_pg_row(row)
+      {% elsif T < Tuple %}
+        unless row.size == {{ T.type_vars.size }}
+          raise DecodeError.new("#{T} reads {{ T.type_vars.size }} columns, but the result has #{row.size}")
+        end
+        { {% for i in 0...T.type_vars.size %} row.read({{ i }}, typeof(Pointer(T).null.value[{{ i }}])), {% end %} }
       {% else %}
         unless row.size == 1
           raise DecodeError.new("#{T} reads a single column, but the result has #{row.size}")

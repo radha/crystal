@@ -1,7 +1,26 @@
 module Postgres
-  # Customizes how `Serializable` maps an instance variable:
-  # `key:` names the column (default: the variable name), `ignore: true`
-  # skips it (it must have a default value).
+  # Customizes how `Serializable` maps an instance variable: `key:` names
+  # the column (default: the variable name), `ignore: true` skips it (it
+  # must have a default value), and `converter:` names a module or class
+  # whose `from_pg(row : Postgres::RowReader, index : Int32)` decodes the
+  # column (it sees SQL NULL through `row.null?(index)`):
+  #
+  # ```
+  # module CentsConverter
+  #   def self.from_pg(row : Postgres::RowReader, index : Int32) : Money
+  #     Money.new(cents: row.read(index, Int64))
+  #   end
+  # end
+  #
+  # struct Order
+  #   include Postgres::Serializable
+  #   @[Postgres::Field(converter: CentsConverter)]
+  #   getter total : Money
+  # end
+  # ```
+  #
+  # For parameters, give the type a `to_pg` method returning a supported
+  # value (`def to_pg; cents; end`).
   annotation Field
   end
 
@@ -52,7 +71,11 @@ module Postgres
         {% for iv, i in ivars %}
           {% ann = iv.annotation(::Postgres::Field) %}
           if (%col{i} = %map[{{ i }}]) >= 0
-            @{{ iv.name }} = row.read(%col{i}, {{ iv.type }})
+            {% if ann && ann[:converter] %}
+              @{{ iv.name }} = {{ ann[:converter] }}.from_pg(row, %col{i})
+            {% else %}
+              @{{ iv.name }} = row.read(%col{i}, typeof(@{{ iv.name }}))
+            {% end %}
           else
             {% if iv.has_default_value? %}
               @{{ iv.name }} = {{ iv.default_value }}
