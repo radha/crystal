@@ -1,0 +1,6 @@
+# build outputs
+/bench_cr
+/bench_cr_mt
+/go/bench_go
+/rs/target/
+/results/
