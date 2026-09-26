@@ -246,11 +246,25 @@ describe "Postgres live" do
     end
   end
 
-  pending_postgres "times out a slow query and closes the connection" do
-    PostgresSpec.connect(read_timeout: 100.milliseconds) do |conn|
-      expect_raises(IO::TimeoutError) { conn.exec("select pg_sleep(1)") }
-      conn.closed?.should be_true
-      expect_raises(Postgres::ConnectionError, /closed/) { conn.exec("select 1") }
+  pending_postgres "cancels a query that exceeds read_timeout and keeps the session" do
+    PostgresSpec.connect(read_timeout: 200.milliseconds) do |conn|
+      started = Time.instant
+      expect_raises(IO::TimeoutError, /cancelled/) { conn.exec("select pg_sleep(5)") }
+      (Time.instant - started).should be < 2.seconds # cancelled, not waited out
+      conn.closed?.should be_false
+      conn.query_one("select 1", as: Int32).should eq(1)
+      # Extended protocol and inside a transaction: the transaction is
+      # aborted by the cancel, like any error.
+      conn.exec("begin")
+      expect_raises(IO::TimeoutError) { conn.query_one("select pg_sleep($1)", 5, as: String) }
+      conn.transaction_status.should eq('E')
+      conn.exec("rollback")
+      conn.query_one("select 2", as: Int32).should eq(2)
+      # A streaming COPY TO is cancelled the same way.
+      expect_raises(IO::TimeoutError) do
+        conn.copy_to("copy (select pg_sleep(5)) to stdout") { |io| io.gets_to_end }
+      end
+      conn.query_one("select 3", as: Int32).should eq(3)
     end
   end
 

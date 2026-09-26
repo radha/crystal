@@ -674,7 +674,7 @@ describe Postgres::Connection do
   end
 
   describe "I/O failures" do
-    it "raises IO::TimeoutError after read_timeout and closes the connection" do
+    it "cancels after read_timeout and closes when the server ignores the cancel" do
       server = fake do |peer|
         peer.handshake
         peer.expect('Q')
@@ -683,8 +683,32 @@ describe Postgres::Connection do
       using(server) do
         conn = connect(server.url, read_timeout: 100.milliseconds)
         expect_raises(IO::TimeoutError) { conn.exec("select pg_sleep(10)") }
+        # One CancelRequest with the BackendKeyData the handshake sent.
+        server.cancel_requests.should eq([{4242, 99}])
         conn.closed?.should be_true
         expect_raises(Postgres::ConnectionError, /closed/) { conn.exec("select 1") }
+      end
+    end
+
+    it "cancels after read_timeout and keeps the session when the server honours it" do
+      cancelled = Channel(Nil).new(1)
+      server = fake do |peer|
+        peer.handshake
+        peer.expect('Q')
+        cancelled.receive
+        peer.error({'S' => "ERROR", 'V' => "ERROR", 'C' => "57014", 'M' => "canceling statement due to user request"})
+        peer.ready('I')
+        peer.expect('Q')
+        peer.command_complete("SELECT 1")
+        peer.ready('I')
+        peer.read_message
+      end
+      server.on_cancel = -> { cancelled.send(nil); nil }
+      using(server) do
+        conn = connect(server.url, read_timeout: 100.milliseconds)
+        ex = expect_raises(IO::TimeoutError, /query cancelled after read_timeout/) { conn.exec("select pg_sleep(10)") }
+        conn.closed?.should be_false
+        conn.exec("select 1").rows_affected.should eq(1)
       end
     end
 

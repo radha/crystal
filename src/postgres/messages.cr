@@ -9,8 +9,9 @@ module Postgres
   # dispatches on the type byte first. `Bind` and `DataRow`, the hot path,
   # are handled by hand in `Connection` and `RowReader`.
   module Messages
-    PROTOCOL_VERSION =    196_608 # 3.0
-    SSL_REQUEST_CODE = 80_877_103
+    PROTOCOL_VERSION    =    196_608 # 3.0
+    SSL_REQUEST_CODE    = 80_877_103
+    CANCEL_REQUEST_CODE = 80_877_102
 
     struct Startup
       include Binary::Format
@@ -94,6 +95,14 @@ module Postgres
     # Body-less frontend messages: `Sync` (`S`), `Flush` (`H`), `Terminate` (`X`).
     SYNC      = Bytes['S'.ord, 0, 0, 0, 4]
     TERMINATE = Bytes['X'.ord, 0, 0, 0, 4]
+
+    struct CancelRequest
+      include Binary::Format
+      field length : Int32 = 16
+      field code : Int32 = CANCEL_REQUEST_CODE
+      field pid : Int32
+      field secret : Int32
+    end
 
     struct BackendKeyData
       include Binary::Format

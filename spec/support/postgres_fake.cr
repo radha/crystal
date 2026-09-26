@@ -22,6 +22,11 @@ module PostgresSpec
     getter errors = [] of Exception
     # The answer to an `SSLRequest`: a byte, or nil to close the socket.
     property ssl_answer : Char? = 'N'
+    # Every `CancelRequest` received, as `{pid, secret}`.
+    getter cancel_requests = [] of {Int32, Int32}
+    # Called when a `CancelRequest` arrives (on the cancelling socket's
+    # fiber), after it is recorded.
+    property on_cancel : Proc(Nil)? = nil
 
     @closed = false
     @peers = [] of TCPSocket
@@ -111,6 +116,14 @@ module PostgresSpec
               @socket.close
               return false
             end
+          end
+          if length == 16 && code == Postgres::Messages::CANCEL_REQUEST_CODE
+            pid = @socket.read_bytes(Int32, IO::ByteFormat::BigEndian)
+            secret = @socket.read_bytes(Int32, IO::ByteFormat::BigEndian)
+            @server.cancel_requests << {pid, secret}
+            @server.on_cancel.try &.call
+            @socket.close # a real server closes the cancel connection
+            return false
           end
           raise "bad protocol version #{code}" unless code == Postgres::Messages::PROTOCOL_VERSION
           body = Bytes.new(length - 8)

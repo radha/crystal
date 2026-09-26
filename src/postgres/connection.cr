@@ -67,9 +67,13 @@ module Postgres
   # travel in binary. `exec` without arguments uses the simple protocol,
   # which accepts several statements separated by `;`.
   #
-  # An error reply raises `QueryError` and leaves the connection usable. An
-  # I/O failure raises `ConnectionError`, malformed input `ProtocolError`,
-  # and a `read_timeout` `IO::TimeoutError`; all three close the connection.
+  # An error reply raises `QueryError` and leaves the connection usable. When
+  # a query exceeds `read_timeout` it is cancelled (a `CancelRequest` on a
+  # side connection) and `IO::TimeoutError` is raised with the session
+  # still usable; if the server does not answer the cancel within another
+  # `read_timeout`, the connection is closed. An I/O failure raises
+  # `ConnectionError` and malformed input `ProtocolError`; both close the
+  # connection.
   class Connection
     # Isolation levels for `transaction`.
     enum Isolation
@@ -113,17 +117,20 @@ module Postgres
     @busy = false
     @secret : Int32 = 0
     @transaction_depth = 0
+    # The `read_timeout` that triggered a cancel still being answered.
+    @timed_out : IO::TimeoutError?
+    @tls_context : OpenSSL::SSL::Context::Client?
     @cache : StatementCache
     @reader : RowReader?
 
     # Opens a session with *config* (see `Config.parse`).
     def initialize(*, @config : Config, @read_timeout : Time::Span? = nil,
-                   tls_context : OpenSSL::SSL::Context::Client? = nil)
+                   @tls_context : OpenSSL::SSL::Context::Client? = nil)
       @cache = StatementCache.new(@config.statement_cache_size)
       @socket = open_socket
       @io = @socket
       begin
-        @io = negotiate_tls(@socket, tls_context) unless @config.socket_path || @config.sslmode.disable?
+        @io = negotiate_tls(@socket, @tls_context) unless @config.socket_path || @config.sslmode.disable?
         startup
       rescue ex
         @closed = true
@@ -524,7 +531,12 @@ module Postgres
       end
       # Queued closes go after `Bind`, so an argument that fails to encode
       # (which discards the half-written `Bind`) cannot drop them.
-      write_bind(statement, args)
+      begin
+        Connection.write_bind(@out, statement, args)
+      rescue ex : EncodeError
+        @out.clear
+        raise ex
+      end
       flush_closes
       Messages::Execute.new(portal: "").write(@out)
       @out.write(Messages::SYNC)
@@ -624,8 +636,11 @@ module Postgres
 
     # `Bind`: portal and statement names, parameter formats, values (each
     # length back-patched after encoding), result formats.
-    private def write_bind(statement : PreparedStatement, args : Tuple) : Nil
-      buf = @out
+    #
+    # Writes into *buf* (the connection's buffer or a pipeline's scratch
+    # buffer). Raises `EncodeError` naming the parameter; the caller
+    # discards the half-written message.
+    protected def self.write_bind(buf : IO::Memory, statement : PreparedStatement, args : Tuple) : Nil
       buf.write_byte('B'.ord.to_u8)
       start = buf.pos
       buf.write_bytes(0_i32, IO::ByteFormat::BigEndian)
@@ -646,24 +661,19 @@ module Postgres
           format = begin
             Codec.encode(buf, oids[i], arg)
           rescue ex : EncodeError
-            @out.clear
             raise EncodeError.new("parameter $#{i + 1}: #{ex.message}")
           end
-          patch(length_at, (buf.pos - length_at - 4).to_i32)
-          patch16(formats_at + i * 2, format) if format != 0
+          IO::ByteFormat::BigEndian.encode((buf.pos - length_at - 4).to_i32, buf.to_slice + length_at)
+          IO::ByteFormat::BigEndian.encode(format, buf.to_slice + formats_at + i * 2) if format != 0
         end
       end
       formats = statement.result_formats
       buf.write_bytes(formats.size.to_i16, IO::ByteFormat::BigEndian)
       formats.each { |f| buf.write_bytes(f, IO::ByteFormat::BigEndian) }
-      patch(start, (buf.pos - start).to_i32)
+      IO::ByteFormat::BigEndian.encode((buf.pos - start).to_i32, buf.to_slice + start)
     end
 
     private def patch(at : Int, value : Int32) : Nil
-      IO::ByteFormat::BigEndian.encode(value, @out.to_slice + at)
-    end
-
-    private def patch16(at : Int, value : Int16) : Nil
       IO::ByteFormat::BigEndian.encode(value, @out.to_slice + at)
     end
 
@@ -702,6 +712,7 @@ module Postgres
     # Reads one backend message into the receive buffer and returns its
     # type and body; the body is valid until the next read.
     private def read_message : {Char, Bytes}
+      wait_readable
       header = uninitialized UInt8[5]
       @io.read_fully(header.to_slice)
       type = header[0].unsafe_chr
@@ -723,6 +734,43 @@ module Postgres
       lost(ex)
     end
 
+    # Blocks until the next message starts arriving. A `read_timeout`
+    # here, between messages, is recoverable: nothing was consumed, so
+    # the running query is cancelled and reading goes on; the server
+    # answers with an error and `ReadyForQuery`, where `ready_status`
+    # raises `IO::TimeoutError` with the session in step. A second timeout
+    # (the server ignored the cancel), one during startup, or one inside a
+    # message closes the connection instead.
+    private def wait_readable : Nil
+      loop do
+        begin
+          @io.peek
+          return
+        rescue ex : IO::TimeoutError
+          raise ex if @timed_out || @backend_pid == 0
+          @timed_out = ex
+          cancel_running_query
+        end
+      end
+    end
+
+    # Sends a `CancelRequest` for this session on a new connection and
+    # waits for the server to close it (it does so once the cancel is
+    # delivered), which narrows the race with a query that ends on its own
+    # meanwhile. Failures are ignored: the next timeout closes the session.
+    private def cancel_running_query : Nil
+      socket = open_socket
+      begin
+        io = @config.socket_path || @config.sslmode.disable? ? socket : negotiate_tls(socket, @tls_context)
+        Messages::CancelRequest.new(pid: @backend_pid, secret: @secret).write(io)
+        io.flush
+        io.read_byte
+      ensure
+        socket.close
+      end
+    rescue Error | IO::Error | OpenSSL::Error
+    end
+
     # Runs a decoder over a message body. A malformed body closes the
     # connection (it is out of step with the server) and raises
     # `ProtocolError`.
@@ -742,7 +790,15 @@ module Postgres
         close_quietly
         raise ProtocolError.new("ReadyForQuery with a #{body.size}-byte body")
       end
-      body[0].unsafe_chr
+      status = body[0].unsafe_chr
+      if timed_out = @timed_out
+        # The query was cancelled after `read_timeout` (see `wait_readable`);
+        # the session is in step again.
+        @timed_out = nil
+        @transaction_status = status
+        raise IO::TimeoutError.new("#{timed_out.message}: query cancelled after read_timeout (#{@read_timeout})")
+      end
+      status
     end
 
     # The server's own limit on a message.

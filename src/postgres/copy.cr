@@ -65,10 +65,10 @@ module Postgres
         ensure
           reader.skip_to_end unless @closed
         end
-        # A server error ended the stream and the block swallowed it: the
-        # session is past `ReadyForQuery` already.
-        if error = reader.error
-          raise error
+        # A failure ended the stream and the block swallowed it: the
+        # session is past `ReadyForQuery` already (or closed).
+        if failure = reader.failure
+          raise failure
         end
         finish_copy
       ensure
@@ -263,9 +263,10 @@ module Postgres
   class CopyReader < IO
     @chunk = Bytes.empty
     @done = false
-    # The server error that ended the stream (the session is already at
-    # `ReadyForQuery` then).
-    getter error : QueryError?
+    # The failure that ended the stream: a server error, or the
+    # `IO::TimeoutError` of a cancelled copy (the session is already at
+    # `ReadyForQuery` then), or a connection failure.
+    getter failure : Exception?
 
     def initialize(@connection : Connection)
     end
@@ -298,12 +299,9 @@ module Postgres
 
     private def next_data : Bytes?
       @connection.unsafe_read_copy_data
-    rescue ex : QueryError
-      @done = true
-      @error = ex
-      raise ex
     rescue ex
       @done = true
+      @failure = ex
       raise ex
     end
   end
