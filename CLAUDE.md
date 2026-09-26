@@ -75,4 +75,6 @@ This is a personal fork working toward a batteries-included stdlib. Agent memory
 research reports and benchmark-harness sources are committed under `.agent-context/`. Read
 `.agent-context/README.md` first, then `.agent-context/memory/MEMORY.md`. When a note cites
 `.remember/<file>`, look under `.agent-context/notes/` or `.agent-context/harnesses/`
-instead. `.remember/` is local-only and gitignored.
+instead. `.remember/` is local-only and gitignored. Test services (PostgreSQL with every auth mode and a
+standby, Redis) come from `.agent-context/setup/`: cloud sessions provision them automatically
+through the SessionStart hook in `.claude/`; on a workstation run the matching script there.
