@@ -50,13 +50,21 @@ require "./postgres/pipeline"
 # | `UInt32` | oid |
 # | `Float32`, `Float64` | float4; float4, float8 |
 # | `BigDecimal` | numeric, int2/4/8 |
-# | `String` | text, varchar, bpchar, name, char, json, jsonb, and any type without a binary decoder (as its text form) |
+# | `String` | text, varchar, bpchar, name, char, json, jsonb, xml, the canonical text of inet/cidr/macaddr/timetz/bit/ranges, and any type without a binary decoder (as the server's text form) |
 # | `Bytes` | bytea |
 # | `UUID` | uuid |
 # | `Time` | timestamptz, timestamp (as UTC), date (UTC midnight) |
 # | `Time::Span` | time, interval without months |
 # | `Postgres::Interval` | interval |
 # | `JSON::Any` | json, jsonb |
+# | `Postgres::Inet`, `Socket::IPAddress` | inet, cidr |
+# | `Postgres::MacAddress` | macaddr, macaddr8 |
+# | `Postgres::TimeTz` | timetz |
+# | `BitArray` | bit, varbit |
+# | `Int64` | money (minor units, e.g. cents) |
+# | `Postgres::Range(T)` | int4range, int8range, numrange, tsrange, tstzrange, daterange (a Crystal `Range` works as a parameter) |
+# | `Hash(String, String?)` | hstore |
+# | an `enum` | a PostgreSQL enum or text column (by label), an integer column (by value) |
 # | `Array(T)`, `Array(T?)` | one-dimensional arrays of the types above (`int4[]`, `text[]`, ...) |
 #
 # A nilable type reads SQL NULL as `nil`. Parameters are encoded for the

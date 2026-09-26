@@ -147,8 +147,8 @@ describe "Postgres::Codec arrays" do
     # Strings for int4[]: the server parses each element.
     literal = "{\"1\",NULL,\"a\\\"b\\\\c\"}" # {"1",NULL,"a\"b\\c"}
     encode(1007_u32, ["1", nil, "a\"b\\c"]).should eq({literal.to_slice.hexstring, 0_i16})
-    # inet[] is unknown to the codec.
-    encode(1041_u32, ["10.0.0.1"]).should eq({"{\"10.0.0.1\"}".to_slice.hexstring, 0_i16})
+    # point[] is unknown to the codec.
+    encode(1017_u32, ["(1,2)"]).should eq({"{\"(1,2)\"}".to_slice.hexstring, 0_i16})
   end
 end
 
@@ -185,7 +185,7 @@ describe Postgres::StatementCache do
   it "asks for binary results only for types it decodes" do
     all_binary = Postgres::PreparedStatement.new("", [] of UInt32, [Postgres::Column.new("a", Postgres::OID::INT4, format: 0_i16)])
     all_binary.result_formats.should eq([1_i16])
-    mixed = Postgres::PreparedStatement.new("", [] of UInt32, [Postgres::Column.new("a", Postgres::OID::INT4), Postgres::Column.new("b", 869_u32)])
+    mixed = Postgres::PreparedStatement.new("", [] of UInt32, [Postgres::Column.new("a", Postgres::OID::INT4), Postgres::Column.new("b", 600_u32)])
     mixed.result_formats.should eq([1_i16, 0_i16])
     mixed.columns.map(&.binary?).should eq([true, false])
   end

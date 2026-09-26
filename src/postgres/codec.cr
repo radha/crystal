@@ -4,6 +4,7 @@ require "json"
 require "./error"
 require "./oid"
 require "./interval"
+require "./types"
 require "./result"
 
 module Postgres
@@ -45,6 +46,8 @@ module Postgres
         io.write_bytes(value.to_f64, IO::ByteFormat::BigEndian)
       when OID::NUMERIC
         write_numeric(io, BigDecimal.new(value))
+      when OID::MONEY
+        io.write_bytes(value.to_i64, IO::ByteFormat::BigEndian)
       else
         mismatch(oid, value)
       end
@@ -76,7 +79,7 @@ module Postgres
 
     def self.encode(io : IO, oid : UInt32, value : String) : Int16
       case oid
-      when OID::TEXT, OID::VARCHAR, OID::BPCHAR, OID::NAME, OID::CHAR, OID::UNKNOWN, OID::JSON
+      when OID::TEXT, OID::VARCHAR, OID::BPCHAR, OID::NAME, OID::CHAR, OID::UNKNOWN, OID::JSON, OID::XML
         io << value
         BINARY
       when OID::JSONB
@@ -210,6 +213,107 @@ module Postgres
       TEXT
     end
 
+    def self.encode(io : IO, oid : UInt32, value : Inet) : Int16
+      case oid
+      when OID::INET, OID::CIDR
+        io.write_byte(value.ipv6? ? 3_u8 : 2_u8) # PGSQL_AF_INET(6)
+        io.write_byte(value.prefix.to_u8)
+        io.write_byte(oid == OID::CIDR ? 1_u8 : 0_u8)
+        io.write_byte(value.bytes.size.to_u8)
+        io.write(value.bytes)
+        BINARY
+      else
+        return encode(io, oid, value.to_s) if OID.text?(oid)
+        mismatch(oid, value)
+      end
+    end
+
+    def self.encode(io : IO, oid : UInt32, value : Socket::IPAddress) : Int16
+      encode(io, oid, Inet.new(value))
+    end
+
+    def self.encode(io : IO, oid : UInt32, value : MacAddress) : Int16
+      unless (oid == OID::MACADDR && value.bytes.size == 6) || (oid == OID::MACADDR8 && value.bytes.size == 8)
+        return encode(io, oid, value.to_s) if OID.text?(oid)
+        mismatch(oid, value)
+      end
+      io.write(value.bytes)
+      BINARY
+    end
+
+    def self.encode(io : IO, oid : UInt32, value : TimeTz) : Int16
+      mismatch(oid, value) unless oid == OID::TIMETZ
+      io.write_bytes(value.time.total_nanoseconds.to_i64 // 1000, IO::ByteFormat::BigEndian)
+      io.write_bytes(-value.offset, IO::ByteFormat::BigEndian) # the wire counts seconds west
+      BINARY
+    end
+
+    def self.encode(io : IO, oid : UInt32, value : BitArray) : Int16
+      mismatch(oid, value) unless oid == OID::BIT || oid == OID::VARBIT
+      io.write_bytes(value.size.to_i32, IO::ByteFormat::BigEndian)
+      bytes = Bytes.new((value.size + 7) // 8)
+      value.each_with_index { |bit, i| bytes[i // 8] |= (0x80_u8 >> (i % 8)) if bit }
+      io.write(bytes)
+      BINARY
+    end
+
+    def self.encode(io : IO, oid : UInt32, value : Range) : Int16
+      write_range(io, oid, value, value.lower, value.upper, value.lower_inclusive?, value.upper_inclusive?, value.empty?)
+    end
+
+    # A Crystal range: `a..b` is `[a,b]`, `a...b` is `[a,b)`, a nil end is
+    # unbounded.
+    def self.encode(io : IO, oid : UInt32, value : ::Range) : Int16
+      write_range(io, oid, value, value.begin, value.end, true, !value.excludes_end?, false)
+    end
+
+    private def self.write_range(io : IO, oid : UInt32, value, lower, upper, lower_inclusive : Bool,
+                                 upper_inclusive : Bool, empty : Bool) : Int16
+      element = OID.range_element(oid) || mismatch(oid, value)
+      if empty
+        io.write_byte(0x01_u8)
+        return BINARY
+      end
+      flags = 0_u8
+      flags |= 0x02_u8 if lower_inclusive && !lower.nil?
+      flags |= 0x04_u8 if upper_inclusive && !upper.nil?
+      flags |= 0x08_u8 if lower.nil?
+      flags |= 0x10_u8 if upper.nil?
+      io.write_byte(flags)
+      {lower, upper}.each do |bound|
+        next if bound.nil?
+        scratch = IO::Memory.new
+        unless encode(scratch, element, bound) == BINARY
+          raise EncodeError.new("cannot encode #{bound.class} as a #{OID.name(oid)} bound")
+        end
+        io.write_bytes(scratch.pos.to_i32, IO::ByteFormat::BigEndian)
+        io.write(scratch.to_slice)
+      end
+      BINARY
+    end
+
+    # A `Hash(String, String?)` as an `hstore` (an extension type, sent in
+    # its text form: `"k"=>"v", "n"=>NULL`).
+    def self.encode(io : IO, oid : UInt32, value : Hash) : Int16
+      mismatch(oid, value) if OID.binary?(oid)
+      value.each_with_index do |(key, item), i|
+        io << ", " if i > 0
+        hstore_quote(io, key.to_s)
+        io << "=>"
+        item.nil? ? (io << "NULL") : hstore_quote(io, item.to_s)
+      end
+      TEXT
+    end
+
+    private def self.hstore_quote(io : IO, text : String) : Nil
+      io << '"'
+      text.each_char do |char|
+        io << '\\' if char == '"' || char == '\\'
+        io << char
+      end
+      io << '"'
+    end
+
     # An enum: its value for an integer parameter, otherwise its name in
     # `snake_case` (`Status::OnHold` → `"on_hold"`), matching the usual
     # spelling of PostgreSQL enum labels.
@@ -307,10 +411,11 @@ module Postgres
     def self.decode(b : Bytes, c : Column, type : Int64.class) : Int64
       mismatch(c, type) unless c.binary?
       case c.type_oid
-      when OID::INT8 then int(b, c, Int64)
-      when OID::INT4 then int(b, c, Int32).to_i64
-      when OID::INT2 then int(b, c, Int16).to_i64
-      else                mismatch(c, type)
+      when OID::INT8  then int(b, c, Int64)
+      when OID::INT4  then int(b, c, Int32).to_i64
+      when OID::INT2  then int(b, c, Int16).to_i64
+      when OID::MONEY then int(b, c, Int64) # minor units (cents)
+      else                 mismatch(c, type)
       end
     end
 
@@ -347,12 +452,20 @@ module Postgres
     def self.decode(b : Bytes, c : Column, type : String.class) : String
       return String.new(b) unless c.binary?
       case c.type_oid
-      when OID::TEXT, OID::VARCHAR, OID::BPCHAR, OID::NAME, OID::CHAR, OID::UNKNOWN, OID::JSON
+      when OID::TEXT, OID::VARCHAR, OID::BPCHAR, OID::NAME, OID::CHAR, OID::UNKNOWN, OID::JSON, OID::XML
         String.new(b)
       when OID::JSONB
         jsonb(b, c)
+      when OID::INET, OID::CIDR        then decode(b, c, Inet).to_s
+      when OID::MACADDR, OID::MACADDR8 then decode(b, c, MacAddress).to_s
+      when OID::TIMETZ                 then decode(b, c, TimeTz).to_s
+      when OID::BIT, OID::VARBIT       then String.build { |s| decode(b, c, BitArray).each { |bit| s << (bit ? '1' : '0') } }
       else
-        mismatch(c, type)
+        if OID.range_element(c.type_oid)
+          range_text(b, c)
+        else
+          mismatch(c, type)
+        end
       end
     end
 
@@ -456,6 +569,170 @@ module Postgres
             decode(item, element_column, T)
           {% end %}
         end
+      end
+    end
+
+    def self.decode(b : Bytes, c : Column, type : Inet.class) : Inet
+      mismatch(c, type) unless c.binary? && (c.type_oid == OID::INET || c.type_oid == OID::CIDR)
+      unless b.size >= 4 && b.size == 4 + b[3]
+        raise DecodeError.new("column #{c.name.inspect}: malformed #{OID.name(c.type_oid)}")
+      end
+      Inet.new(b[4, b[3]].dup, b[1].to_i, cidr: b[2] == 1)
+    rescue ex : ArgumentError
+      raise DecodeError.new("column #{c.name.inspect}: #{ex.message}")
+    end
+
+    # The address of an `inet` (its prefix is dropped), port 0.
+    def self.decode(b : Bytes, c : Column, type : Socket::IPAddress.class) : Socket::IPAddress
+      decode(b, c, Inet).ip_address
+    end
+
+    def self.decode(b : Bytes, c : Column, type : MacAddress.class) : MacAddress
+      mismatch(c, type) unless c.binary? && (c.type_oid == OID::MACADDR || c.type_oid == OID::MACADDR8)
+      MacAddress.new(b.dup)
+    rescue ex : ArgumentError
+      raise DecodeError.new("column #{c.name.inspect}: #{ex.message}")
+    end
+
+    def self.decode(b : Bytes, c : Column, type : TimeTz.class) : TimeTz
+      mismatch(c, type) unless c.binary? && c.type_oid == OID::TIMETZ
+      raise DecodeError.new("column #{c.name.inspect}: expected 12 bytes for timetz, got #{b.size}") unless b.size == 12
+      TimeTz.new(Time::Span.new(nanoseconds: IO::ByteFormat::BigEndian.decode(Int64, b) * 1000),
+        -IO::ByteFormat::BigEndian.decode(Int32, b + 8))
+    end
+
+    def self.decode(b : Bytes, c : Column, type : BitArray.class) : BitArray
+      mismatch(c, type) unless c.binary? && (c.type_oid == OID::BIT || c.type_oid == OID::VARBIT)
+      raise DecodeError.new("column #{c.name.inspect}: truncated bit string") if b.size < 4
+      size = IO::ByteFormat::BigEndian.decode(Int32, b)
+      raise DecodeError.new("column #{c.name.inspect}: truncated bit string") if size < 0 || b.size < 4 + (size + 7) // 8
+      bits = BitArray.new(size)
+      size.times { |i| bits[i] = b[4 + i // 8].bit(7 - i % 8) == 1 }
+      bits
+    end
+
+    # An `hstore` (in its text form; NULL values are nil).
+    def self.decode(b : Bytes, c : Column, type : Hash(String, String?).class) : Hash(String, String?)
+      mismatch(c, type) if c.binary?
+      HstoreParser.new(String.new(b), c).parse
+    end
+
+    # :nodoc:
+    private struct HstoreParser
+      def initialize(@text : String, @column : Column)
+        @reader = Char::Reader.new(@text)
+      end
+
+      def parse : Hash(String, String?)
+        hash = {} of String => String?
+        skip_spaces
+        until @reader.current_char == '\0' && !@reader.has_next?
+          key = token || fail("expected a key")
+          skip_spaces
+          expect('=')
+          expect('>')
+          skip_spaces
+          quoted = @reader.current_char == '"'
+          value = token || fail("expected a value")
+          hash[key] = (!quoted && value.compare("NULL", case_insensitive: true) == 0) ? nil : value
+          skip_spaces
+          break unless @reader.current_char == ','
+          @reader.next_char
+          skip_spaces
+        end
+        hash
+      end
+
+      # A quoted string with backslash escapes, or a bare word.
+      private def token : String?
+        quoted = @reader.current_char == '"'
+        text = String.build do |s|
+          if quoted
+            loop do
+              char = @reader.next_char
+              fail("unterminated string") if char == '\0' && !@reader.has_next?
+              break if char == '"'
+              char = @reader.next_char if char == '\\'
+              s << char
+            end
+            @reader.next_char
+          else
+            while (char = @reader.current_char) != '\0' && !char.whitespace? && char != '=' && char != ','
+              s << char
+              @reader.next_char
+            end
+          end
+        end
+        # "" is a valid (empty) quoted string; a bare word must not be empty.
+        quoted || !text.empty? ? text : nil
+      end
+
+      private def skip_spaces : Nil
+        while @reader.current_char.whitespace?
+          @reader.next_char
+        end
+      end
+
+      private def expect(char : Char) : Nil
+        fail("expected #{char.inspect}") unless @reader.current_char == char
+        @reader.next_char
+      end
+
+      private def fail(message : String) : NoReturn
+        raise DecodeError.new("column #{@column.name.inspect}: malformed hstore (#{message}) at #{@reader.pos}")
+      end
+    end
+
+    # A range of `T` (`Postgres::Range(Int32)` for `int4range`, ...).
+    def self.decode(b : Bytes, c : Column, type : Range(T).class) : Range(T) forall T
+      element = c.binary? ? OID.range_element(c.type_oid) : nil
+      mismatch(c, type) unless element
+      lower, upper, flags = range_bounds(b, c)
+      return Range(T).empty if flags.bits_set?(0x01)
+      element_column = Column.new(c.name, element)
+      Range(T).new(lower.try { |l| decode(l, element_column, T) }, upper.try { |u| decode(u, element_column, T) },
+        lower_inclusive: flags.bits_set?(0x02), upper_inclusive: flags.bits_set?(0x04))
+    end
+
+    # `{lower bytes, upper bytes, flags}` of a binary range.
+    private def self.range_bounds(b : Bytes, c : Column) : {Bytes?, Bytes?, UInt8}
+      raise DecodeError.new("column #{c.name.inspect}: truncated range") if b.empty?
+      flags = b[0]
+      pos = 1
+      bounds = {0x08_u8, 0x10_u8}.map do |infinite|
+        next nil if flags.bits_set?(0x01) || flags.bits_set?(infinite)
+        raise DecodeError.new("column #{c.name.inspect}: truncated range") if pos + 4 > b.size
+        size = IO::ByteFormat::BigEndian.decode(Int32, b + pos)
+        pos += 4
+        raise DecodeError.new("column #{c.name.inspect}: truncated range") if size < 0 || pos + size > b.size
+        bound = b[pos, size]
+        pos += size
+        bound
+      end
+      {bounds[0], bounds[1], flags}
+    end
+
+    # PostgreSQL's text form of a binary range (timestamps in UTC).
+    private def self.range_text(b : Bytes, c : Column) : String
+      lower, upper, flags = range_bounds(b, c)
+      return "empty" if flags.bits_set?(0x01)
+      element = Column.new(c.name, OID.range_element(c.type_oid).not_nil!)
+      String.build do |s|
+        s << (flags.bits_set?(0x02) ? '[' : '(')
+        lower.try { |l| s << bound_text(l, element) }
+        s << ','
+        upper.try { |u| s << bound_text(u, element) }
+        s << (flags.bits_set?(0x04) ? ']' : ')')
+      end
+    end
+
+    private def self.bound_text(b : Bytes, c : Column) : String
+      case c.type_oid
+      when OID::INT4, OID::INT8 then decode(b, c, Int64).to_s
+      when OID::NUMERIC         then decode(b, c, BigDecimal).to_s
+      when OID::DATE            then decode(b, c, Time).to_s("%F")
+      when OID::TIMESTAMP       then %("#{decode(b, c, Time).to_s("%F %T.%6N").rchop(".000000")}")
+      else                           %("#{decode(b, c, Time).to_s("%F %T.%6N").rchop(".000000")}+00")
       end
     end
 
