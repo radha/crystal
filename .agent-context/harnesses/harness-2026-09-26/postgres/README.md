@@ -186,3 +186,17 @@ With the multi-threaded runtime Crystal now leads bench 3 too (1.18× pgx,
 1.15× tokio-postgres). The single-threaded default stays ~1.35× behind:
 it is one core against Go's and tokio's four, spending most of it in the
 kernel on `write`/`read` (one of each per query, the minimum).
+
+## COPY 1M rows (2026-09-26)
+
+`bench_copy.cr` vs `go_copy/main.go` (pgx v5 `CopyFrom`), 1M rows of
+`(int8, text, float8, timestamptz)` into an unlogged table, binary COPY,
+3 runs each:
+
+| | rows/s |
+|---|---:|
+| Crystal `copy_rows` | **2.16M / 2.26M / 2.33M** |
+| Go pgx `CopyFrom` | 1.57M / 1.58M / 1.50M |
+| Crystal `copy_to` (binary, to /dev/null) | 2.39M |
+
+Build: `bin/crystal run --release bench_copy.cr`; `cd go_copy && go build && ./gocopy`.

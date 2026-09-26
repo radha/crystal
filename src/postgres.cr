@@ -4,6 +4,7 @@ require "./postgres/interval"
 require "./postgres/connection"
 require "./postgres/client"
 require "./postgres/listener"
+require "./postgres/copy"
 
 # A pure-Crystal PostgreSQL client speaking the frontend/backend protocol
 # 3.0 over TCP, Unix sockets or TLS.
@@ -68,7 +69,10 @@ require "./postgres/listener"
 # `Client#listener` (or `Listener.new`) opens a `Listener` for
 # `LISTEN`/`NOTIFY` on a connection of its own; `Client#notify` sends one.
 #
-# Not supported yet: multi-dimensional arrays, COPY, pipelining several
-# queries, query cancellation.
+# `Connection#copy_from` and `#copy_to` stream `COPY` in any format;
+# `Connection#copy_rows` bulk-inserts typed rows with binary `COPY`.
+#
+# Not supported yet: multi-dimensional arrays, pipelining several queries,
+# query cancellation.
 module Postgres
 end
