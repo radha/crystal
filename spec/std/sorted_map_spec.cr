@@ -224,6 +224,47 @@ describe SortedMap do
       map.delete_range(7..).should eq(2)
       map.empty?.should be_true
     end
+
+    it "cuts large ranges out of large trees" do
+      map = squares(20_000) # keys 0, 2, ..., 39998
+      map.delete_range(1000..30_000).should eq(14_501)
+      map.check_invariants
+      map.keys.should eq((0...500).map { |i| i * 2 } + (15_001...20_000).map { |i| i * 2 })
+      map.delete_range(...900).should eq(450)
+      map.check_invariants
+      map.delete_range(35_000..).should eq(2_500)
+      map.check_invariants
+      map.first_key.should eq(900)
+      map.last_key.should eq(34_998)
+      map.delete_range(nil..nil).should eq(2_549)
+      map.empty?.should be_true
+      map.check_invariants
+    end
+
+    it "matches a Hash for random ranges, and the tree stays usable" do
+      rng = Random.new(21)
+      30.times do |round|
+        span = 20_000
+        keys = (0...span).to_a.sample(rng.rand(1..8_000), rng)
+        map = round.even? ? SortedMap.new(keys.map { |k| {k, k} }) : SortedMap(Int32, Int32).new.tap { |m| keys.each { |k| m[k] = k } }
+        ref = keys.to_set
+        8.times do
+          low = rng.rand(span)
+          high = low + rng.rand(span // 2)
+          range = rng.rand(2) == 0 ? (low..high) : (low...high)
+          map.delete_range(range).should eq(ref.count { |k| range.includes?(k) })
+          ref.reject! { |k| range.includes?(k) }
+          map.check_invariants
+          50.times do
+            k = rng.rand(span)
+            map[k] = k
+            ref << k
+          end
+          map.check_invariants
+          map.keys.should eq(ref.to_a.sort)
+        end
+      end
+    end
   end
 
   describe "ends" do

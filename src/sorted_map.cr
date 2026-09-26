@@ -361,10 +361,16 @@ class SortedMap(K, V)
     parent = internal(node)
     split = insert(parent.edges[i], height - 1, key, value)
     return nil unless split
-    child_key, child_value, child_right = split
+    insert_edge_or_split(parent, i, *split)
+  end
 
+  # Inserts *key* at index *i* of *parent* with *edge* as the child right
+  # after it (or, with *edge_first*, right before it). When *parent* is
+  # full it splits, and this returns the key and value that move up and
+  # the new right sibling.
+  private def insert_edge_or_split(parent : Internal(K, V), i : Int32, key : K, value : V, edge : Node(K, V), *, edge_first : Bool = false) : {K, V, Node(K, V)}?
     if parent.len < CAPACITY
-      insert_edge_at(parent, i, child_key, child_value, child_right)
+      insert_edge_at(parent, i, key, value, edge, edge_first)
       return nil
     end
     right = Internal(K, V).new
@@ -372,9 +378,9 @@ class SortedMap(K, V)
     right.edges.copy_from(parent.edges + MIDDLE + 1, CAPACITY - MIDDLE)
     (parent.edges + MIDDLE + 1).clear(CAPACITY - MIDDLE)
     if i <= MIDDLE
-      insert_edge_at(parent, i, child_key, child_value, child_right)
+      insert_edge_at(parent, i, key, value, edge, edge_first)
     else
-      insert_edge_at(right, i - MIDDLE - 1, child_key, child_value, child_right)
+      insert_edge_at(right, i - MIDDLE - 1, key, value, edge, edge_first)
     end
     {up_key, up_value, right}
   end
@@ -404,11 +410,16 @@ class SortedMap(K, V)
   end
 
   # Inserts *key* at index *i* of *node* and *edge* as the child right
-  # after it.
-  private def insert_edge_at(node : Internal(K, V), i : Int32, key : K, value : V, edge : Node(K, V)) : Nil
+  # after it, or right before it if *edge_first*.
+  private def insert_edge_at(node : Internal(K, V), i : Int32, key : K, value : V, edge : Node(K, V), edge_first : Bool = false) : Nil
     edges = node.edges
     (edges + i + 2).move_from(edges + i + 1, node.len - i)
-    edges[i + 1] = edge
+    if edge_first
+      edges[i + 1] = edges[i]
+      edges[i] = edge
+    else
+      edges[i + 1] = edge
+    end
     insert_at(node, i, key, value)
   end
 
@@ -444,11 +455,226 @@ class SortedMap(K, V)
   # map.delete_range(3..8) # => 6
   # map.keys               # => [1, 2, 9, 10]
   # ```
+  #
+  # A range of more than a few keys is removed by cutting the tree at both
+  # ends of the range and joining the outer parts, in O(log n) plus a count
+  # of the removed nodes, rather than deleting keys one by one.
   def delete_range(range : Range) : Int32
-    doomed = [] of K
-    each(range) { |key, _| doomed << key }
-    doomed.each { |key| delete(key) }
-    doomed.size
+    return 0 if @size == 0
+
+    doomed = Array(K).new(SMALL_RANGE + 1)
+    each(range) do |key, _|
+      doomed << key
+      break if doomed.size > SMALL_RANGE
+    end
+    if doomed.size <= SMALL_RANGE
+      doomed.each { |key| delete(key) }
+      return doomed.size
+    end
+
+    height = @height
+    if (start = range.begin).nil?
+      left_root, left_height = Node(K, V).new, 0
+      rest = @root
+    else
+      left_root, rest = split_node(@root, height, start, inclusive: false)
+      left_root, left_height = fix_right_border(left_root, height)
+    end
+
+    if (stop = range.end).nil?
+      middle = rest
+      right_root, right_height = Node(K, V).new, 0
+    else
+      middle, right_root = split_node(rest, height, stop, inclusive: !range.excludes_end?)
+      right_root, right_height = fix_left_border(right_root, height)
+    end
+
+    removed = count_keys(middle, height)
+    size = @size - removed
+    join(left_root, left_height, right_root, right_height)
+    @size = size
+    removed
+  end
+
+  # Ranges this small are deleted key by key.
+  private SMALL_RANGE = 32
+
+  # Cuts the subtree under *node* in two: keys below *key* (or at or below
+  # it, if *inclusive*) stay in *node*, and the rest move to a new node of
+  # the same height. Nodes along the cut may be left short, or even empty;
+  # `fix_right_border` and `fix_left_border` repair them.
+  private def split_node(node : Node(K, V), height : Int32, key : K, *, inclusive : Bool) : {Node(K, V), Node(K, V)}
+    i = inclusive ? SortedMap(K, V).upper_bound(node, key) : search(node, key)[0]
+    moved = node.len - i
+    right = height == 0 ? Node(K, V).new : Internal(K, V).new
+    right.keys.copy_from(node.keys + i, moved)
+    right.vals.copy_from(node.vals + i, moved)
+    right.len = moved
+    (node.keys + i).clear(moved)
+    (node.vals + i).clear(moved)
+    node.len = i
+    if height > 0
+      edges = internal(node).edges
+      right_edges = internal(right).edges
+      left_part, right_part = split_node(edges[i], height - 1, key, inclusive: inclusive)
+      edges[i] = left_part
+      right_edges[0] = right_part
+      (right_edges + 1).copy_from(edges + i + 1, moved)
+      (edges + i + 1).clear(moved)
+    end
+    {node, right}
+  end
+
+  # Repairs the right border of a tree left short by `split_node` and
+  # returns its root and height. Going down the border, each short node is
+  # topped up from its left sibling or merged with it. An internal node is
+  # topped up to one above the minimum, because merging its own children
+  # next may take one key away.
+  private def fix_right_border(root : Node(K, V), height : Int32) : {Node(K, V), Int32}
+    root, height = collapse_root(root, height)
+    node = root
+    level = height
+    while level > 0
+      parent = internal(node)
+      last = parent.len
+      child = parent.edges[last]
+      target = level > 1 ? MIN_LEN + 1 : MIN_LEN
+      if child.len < target
+        if parent.edges[last - 1].len + child.len >= target + MIN_LEN
+          steal_left(parent, last, target - child.len, level - 1)
+        else
+          merge(parent, last - 1, level - 1)
+        end
+      end
+      node = parent.edges[parent.len]
+      level -= 1
+    end
+    collapse_root(root, height)
+  end
+
+  # Mirror of `fix_right_border` for the left border.
+  private def fix_left_border(root : Node(K, V), height : Int32) : {Node(K, V), Int32}
+    root, height = collapse_root(root, height)
+    node = root
+    level = height
+    while level > 0
+      parent = internal(node)
+      child = parent.edges[0]
+      target = level > 1 ? MIN_LEN + 1 : MIN_LEN
+      if child.len < target
+        if parent.edges[1].len + child.len >= target + MIN_LEN
+          steal_right(parent, 0, target - child.len, level - 1)
+        else
+          merge(parent, 0, level - 1)
+        end
+      end
+      node = parent.edges[0]
+      level -= 1
+    end
+    collapse_root(root, height)
+  end
+
+  # Drops empty internal roots.
+  private def collapse_root(root : Node(K, V), height : Int32) : {Node(K, V), Int32}
+    while height > 0 && root.len == 0
+      root = internal(root).edges[0]
+      height -= 1
+    end
+    {root, height}
+  end
+
+  private def count_keys(node : Node(K, V), height : Int32) : Int32
+    count = node.len
+    if height > 0
+      edges = internal(node).edges
+      (0..node.len).each { |i| count += count_keys(edges[i], height - 1) }
+    end
+    count
+  end
+
+  # Makes this map the concatenation of two valid trees whose keys are all
+  # smaller in the first. The size is left for the caller to set.
+  private def join(left : Node(K, V), left_height : Int32, right : Node(K, V), right_height : Int32) : Nil
+    @root, @height = left, left_height
+    return if right.len == 0
+    if left.len == 0
+      @root, @height = right, right_height
+      return
+    end
+
+    # The largest key on the left becomes the separator between the two.
+    sep_key, sep_value = remove_edge(@root, @height, last: true)
+    shrink_root
+    if @root.len == 0
+      @root, @height = right, right_height
+      self[sep_key] = sep_value
+      return
+    end
+    left, left_height = @root, @height
+
+    if left_height == right_height
+      if left.len + 1 + right.len <= CAPACITY
+        SortedMap(K, V).concat(left, sep_key, sep_value, right, left_height)
+        return
+      end
+      if left.len < MIN_LEN
+        sep_key, sep_value = SortedMap(K, V).shift_left(left, right, MIN_LEN - left.len, left_height, sep_key, sep_value)
+      elsif right.len < MIN_LEN
+        sep_key, sep_value = SortedMap(K, V).shift_right(left, right, MIN_LEN - right.len, left_height, sep_key, sep_value)
+      end
+      grow_root(sep_key, sep_value, right)
+    elsif left_height > right_height
+      if split = append_right(left, left_height, right, right_height, sep_key, sep_value)
+        grow_root(*split)
+      end
+    else
+      @root, @height = right, right_height
+      if split = append_left(right, right_height, left, left_height, sep_key, sep_value)
+        grow_root(*split)
+      end
+    end
+  end
+
+  # Hangs the shorter tree *right* off the right spine of the subtree under
+  # *node*, with the separator between them. Returns a split like `insert`.
+  private def append_right(node : Node(K, V), height : Int32, right : Node(K, V), right_height : Int32, sep_key : K, sep_value : V) : {K, V, Node(K, V)}?
+    parent = internal(node)
+    last = parent.len
+    if height - 1 > right_height
+      split = append_right(parent.edges[last], height - 1, right, right_height, sep_key, sep_value)
+      return split && insert_edge_or_split(parent, last, *split)
+    end
+
+    sibling = parent.edges[last]
+    if sibling.len + 1 + right.len <= CAPACITY
+      SortedMap(K, V).concat(sibling, sep_key, sep_value, right, right_height)
+      return nil
+    end
+    if right.len < MIN_LEN
+      sep_key, sep_value = SortedMap(K, V).shift_right(sibling, right, MIN_LEN - right.len, right_height, sep_key, sep_value)
+    end
+    insert_edge_or_split(parent, last, sep_key, sep_value, right)
+  end
+
+  # Mirror of `append_right`: hangs the shorter tree *left* off the left
+  # spine of the subtree under *node*.
+  private def append_left(node : Node(K, V), height : Int32, left : Node(K, V), left_height : Int32, sep_key : K, sep_value : V) : {K, V, Node(K, V)}?
+    parent = internal(node)
+    if height - 1 > left_height
+      split = append_left(parent.edges[0], height - 1, left, left_height, sep_key, sep_value)
+      return split && insert_edge_or_split(parent, 0, *split)
+    end
+
+    sibling = parent.edges[0]
+    if left.len + 1 + sibling.len <= CAPACITY
+      SortedMap(K, V).concat(left, sep_key, sep_value, sibling, left_height)
+      parent.edges[0] = left
+      return nil
+    end
+    if left.len < MIN_LEN
+      sep_key, sep_value = SortedMap(K, V).shift_left(left, sibling, MIN_LEN - left.len, left_height, sep_key, sep_value)
+    end
+    insert_edge_or_split(parent, 0, sep_key, sep_value, left, edge_first: true)
   end
 
   private def shrink_root : Nil
@@ -513,7 +739,7 @@ class SortedMap(K, V)
     if i > 0 && parent.edges[i - 1].len > MIN_LEN
       steal_left(parent, i, 1, child_height)
     elsif i < parent.len && parent.edges[i + 1].len > MIN_LEN
-      steal_right(parent, i, child_height)
+      steal_right(parent, i, 1, child_height)
     elsif i > 0
       merge(parent, i - 1, child_height)
     else
@@ -523,88 +749,111 @@ class SortedMap(K, V)
 
   # :nodoc:
   #
-  # Moves *count* keys from the end of `parent.edges[i - 1]` into the front
-  # of `parent.edges[i]`, rotating through the parent's separating key.
-  def self.steal_left(parent : Internal(K, V), i : Int32, count : Int32, child_height : Int32) : Nil
-    left = parent.edges[i - 1]
-    child = parent.edges[i]
+  # Moves *count* keys from the end of *left* into the front of *right*,
+  # rotating through the separator *sep_key* between them, and returns the
+  # new separator. The two nodes sit *height* levels above the leaves.
+  def self.shift_right(left : Node(K, V), right : Node(K, V), count : Int32, height : Int32, sep_key : K, sep_value : V) : {K, V}
     left_len = left.len
-    child_len = child.len
+    right_len = right.len
     keep = left_len - count
 
-    (child.keys + count).move_from(child.keys, child_len)
-    (child.vals + count).move_from(child.vals, child_len)
-    child.keys.copy_from(left.keys + keep + 1, count - 1)
-    child.vals.copy_from(left.vals + keep + 1, count - 1)
-    child.keys[count - 1] = parent.keys[i - 1]
-    child.vals[count - 1] = parent.vals[i - 1]
-    parent.keys[i - 1] = left.keys[keep]
-    parent.vals[i - 1] = left.vals[keep]
+    (right.keys + count).move_from(right.keys, right_len)
+    (right.vals + count).move_from(right.vals, right_len)
+    right.keys.copy_from(left.keys + keep + 1, count - 1)
+    right.vals.copy_from(left.vals + keep + 1, count - 1)
+    right.keys[count - 1] = sep_key
+    right.vals[count - 1] = sep_value
+    separator = {left.keys[keep], left.vals[keep]}
     (left.keys + keep).clear(count)
     (left.vals + keep).clear(count)
 
-    if child_height > 0
+    if height > 0
       left_edges = left.unsafe_as(Internal(K, V)).edges
-      child_edges = child.unsafe_as(Internal(K, V)).edges
-      (child_edges + count).move_from(child_edges, child_len + 1)
-      child_edges.copy_from(left_edges + keep + 1, count)
+      right_edges = right.unsafe_as(Internal(K, V)).edges
+      (right_edges + count).move_from(right_edges, right_len + 1)
+      right_edges.copy_from(left_edges + keep + 1, count)
       (left_edges + keep + 1).clear(count)
     end
 
     left.len = keep
-    child.len = child_len + count
+    right.len = right_len + count
+    separator
   end
 
-  private def steal_left(parent : Internal(K, V), i : Int32, count : Int32, child_height : Int32) : Nil
-    SortedMap(K, V).steal_left(parent, i, count, child_height)
-  end
-
-  # Moves the first key of `parent.edges[i + 1]` to the end of
-  # `parent.edges[i]`, rotating through the parent's separating key.
-  private def steal_right(parent : Internal(K, V), i : Int32, child_height : Int32) : Nil
-    child = parent.edges[i]
-    right = parent.edges[i + 1]
-    child_len = child.len
-    right_len = right.len
-
-    child.keys[child_len] = parent.keys[i]
-    child.vals[child_len] = parent.vals[i]
-    parent.keys[i] = right.keys[0]
-    parent.vals[i] = right.vals[0]
-    right.keys.move_from(right.keys + 1, right_len - 1)
-    right.vals.move_from(right.vals + 1, right_len - 1)
-    (right.keys + right_len - 1).clear
-    (right.vals + right_len - 1).clear
-
-    if child_height > 0
-      child_edges = internal(child).edges
-      right_edges = internal(right).edges
-      child_edges[child_len + 1] = right_edges[0]
-      right_edges.move_from(right_edges + 1, right_len)
-      (right_edges + right_len).clear
-    end
-
-    child.len = child_len + 1
-    right.len = right_len - 1
-  end
-
-  # Merges `parent.edges[i + 1]` and the separating key `parent.keys[i]`
-  # into `parent.edges[i]`.
-  private def merge(parent : Internal(K, V), i : Int32, child_height : Int32) : Nil
-    left = parent.edges[i]
-    right = parent.edges[i + 1]
+  # :nodoc:
+  #
+  # Moves *count* keys from the front of *right* to the end of *left*,
+  # rotating through the separator between them, and returns the new
+  # separator.
+  def self.shift_left(left : Node(K, V), right : Node(K, V), count : Int32, height : Int32, sep_key : K, sep_value : V) : {K, V}
     left_len = left.len
     right_len = right.len
+    rest = right_len - count
 
-    left.keys[left_len] = parent.keys[i]
-    left.vals[left_len] = parent.vals[i]
+    left.keys[left_len] = sep_key
+    left.vals[left_len] = sep_value
+    (left.keys + left_len + 1).copy_from(right.keys, count - 1)
+    (left.vals + left_len + 1).copy_from(right.vals, count - 1)
+    separator = {right.keys[count - 1], right.vals[count - 1]}
+    right.keys.move_from(right.keys + count, rest)
+    right.vals.move_from(right.vals + count, rest)
+    (right.keys + rest).clear(count)
+    (right.vals + rest).clear(count)
+
+    if height > 0
+      left_edges = left.unsafe_as(Internal(K, V)).edges
+      right_edges = right.unsafe_as(Internal(K, V)).edges
+      (left_edges + left_len + 1).copy_from(right_edges, count)
+      right_edges.move_from(right_edges + count, rest + 1)
+      (right_edges + rest + 1).clear(count)
+    end
+
+    left.len = left_len + count
+    right.len = rest
+    separator
+  end
+
+  # :nodoc:
+  #
+  # Appends the separator and every key (and edge) of *right* to *left*.
+  # The caller makes sure they fit.
+  def self.concat(left : Node(K, V), sep_key : K, sep_value : V, right : Node(K, V), height : Int32) : Nil
+    left_len = left.len
+    right_len = right.len
+    left.keys[left_len] = sep_key
+    left.vals[left_len] = sep_value
     (left.keys + left_len + 1).copy_from(right.keys, right_len)
     (left.vals + left_len + 1).copy_from(right.vals, right_len)
-    if child_height > 0
-      (internal(left).edges + left_len + 1).copy_from(internal(right).edges, right_len + 1)
+    if height > 0
+      (left.unsafe_as(Internal(K, V)).edges + left_len + 1).copy_from(right.unsafe_as(Internal(K, V)).edges, right_len + 1)
     end
     left.len = left_len + 1 + right_len
+  end
 
+  # :nodoc:
+  #
+  # Moves *count* keys from `parent.edges[i - 1]` into `parent.edges[i]`
+  # through the parent's separating key.
+  def self.steal_left(parent : Internal(K, V), i : Int32, count : Int32, child_height : Int32) : Nil
+    sep = shift_right(parent.edges[i - 1], parent.edges[i], count, child_height, parent.keys[i - 1], parent.vals[i - 1])
+    parent.keys[i - 1], parent.vals[i - 1] = sep
+  end
+
+  # :nodoc:
+  #
+  # Moves *count* keys from `parent.edges[i + 1]` into `parent.edges[i]`
+  # through the parent's separating key.
+  def self.steal_right(parent : Internal(K, V), i : Int32, count : Int32, child_height : Int32) : Nil
+    sep = shift_left(parent.edges[i], parent.edges[i + 1], count, child_height, parent.keys[i], parent.vals[i])
+    parent.keys[i], parent.vals[i] = sep
+  end
+
+  # :nodoc:
+  #
+  # Merges `parent.edges[i + 1]` and the separating key `parent.keys[i]`
+  # into `parent.edges[i]`.
+  def self.merge(parent : Internal(K, V), i : Int32, child_height : Int32) : Nil
+    concat(parent.edges[i], parent.keys[i], parent.vals[i], parent.edges[i + 1], child_height)
     parent_len = parent.len - 1
     (parent.keys + i).move_from(parent.keys + i + 1, parent_len - i)
     (parent.vals + i).move_from(parent.vals + i + 1, parent_len - i)
@@ -613,6 +862,18 @@ class SortedMap(K, V)
     (parent.vals + parent_len).clear
     (parent.edges + parent_len + 1).clear
     parent.len = parent_len
+  end
+
+  private def steal_left(parent : Internal(K, V), i : Int32, count : Int32, child_height : Int32) : Nil
+    SortedMap(K, V).steal_left(parent, i, count, child_height)
+  end
+
+  private def steal_right(parent : Internal(K, V), i : Int32, count : Int32, child_height : Int32) : Nil
+    SortedMap(K, V).steal_right(parent, i, count, child_height)
+  end
+
+  private def merge(parent : Internal(K, V), i : Int32, child_height : Int32) : Nil
+    SortedMap(K, V).merge(parent, i, child_height)
   end
 
   # Returns the entry with the smallest key. Raises `Enumerable::EmptyError`
