@@ -330,3 +330,18 @@ describe "Postgres live" do
     conn.close
   end
 end
+
+describe "Postgres live multi-dimensional arrays" do
+  pending_postgres "round-trips 2-D and 3-D arrays" do
+    PostgresSpec.connect do |conn|
+      conn.query_one("select '{{1,2},{3,4}}'::int4[]", as: Array(Array(Int32))).should eq([[1, 2], [3, 4]])
+      conn.query_one("select $1::int8[]", [[1_i64, nil], [nil, 4_i64]], as: Array(Array(Int64?))).should eq([[1, nil], [nil, 4]])
+      cube = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]
+      conn.query_one("select $1::int4[]", cube, as: Array(Array(Array(Int32)))).should eq(cube)
+      conn.query_one("select array_ndims($1::text[])", [["a", "b"], ["c", "d"]], as: Int32).should eq(2)
+      conn.query_one("select $1::int4[]", [["1", "2"], ["3", "4"]], as: Array(Array(Int32))).should eq([[1, 2], [3, 4]])
+      conn.query_one("select $1::int4[]", [[] of Int32], as: Array(Array(Int32))).should eq([] of Array(Int32))
+      expect_raises(Postgres::EncodeError, /rectangular/) { conn.query_one("select $1::int4[]", [[1], [2, 3]], as: Array(Array(Int32))) }
+    end
+  end
+end

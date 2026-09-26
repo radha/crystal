@@ -170,28 +170,62 @@ module Postgres
         mismatch(oid, value) if OID.binary?(oid)
         return encode_array_text(io, value)
       end
+      dimensions = array_shape(value)
       body = IO::Memory.new
+      has_null = write_array_elements(body, element, value, dimensions, 0)
+      return encode_array_text(io, value) if has_null.nil?
+      empty = dimensions.any?(0)
+      io.write_bytes(empty ? 0_i32 : dimensions.size.to_i32, IO::ByteFormat::BigEndian)
+      io.write_bytes(has_null ? 1_i32 : 0_i32, IO::ByteFormat::BigEndian)
+      io.write_bytes(element, IO::ByteFormat::BigEndian)
+      unless empty
+        dimensions.each do |size|
+          io.write_bytes(size.to_i32, IO::ByteFormat::BigEndian)
+          io.write_bytes(1_i32, IO::ByteFormat::BigEndian) # lower bound
+        end
+        io.write(body.to_slice)
+      end
+      BINARY
+    end
+
+    # The dimensions of a (nested) array, measured along its first elements.
+    private def self.array_shape(value : Array) : Array(Int32)
+      dimensions = [value.size]
+      first = value.first?
+      dimensions.concat(array_shape(first)) if first.is_a?(Array)
+      dimensions
+    end
+
+    # Writes the elements of *value* at *depth* in row-major order, checking
+    # that the array is rectangular. Returns whether a NULL was written, or
+    # nil when an element cannot go binary (the caller falls back to text).
+    private def self.write_array_elements(body : IO::Memory, element : UInt32, value : Array,
+                                          dimensions : Array(Int32), depth : Int32) : Bool?
+      unless value.size == dimensions[depth]
+        raise EncodeError.new("arrays must be rectangular: expected #{dimensions[depth]} elements at depth #{depth + 1}, got #{value.size}")
+      end
       has_null = false
       value.each do |item|
-        if item.nil?
+        if depth < dimensions.size - 1
+          unless item.is_a?(Array)
+            raise EncodeError.new("arrays must be rectangular: #{item.class} where an array was expected at depth #{depth + 2}")
+          end
+          nested = write_array_elements(body, element, item, dimensions, depth + 1)
+          return nil if nested.nil?
+          has_null ||= nested
+        elsif item.nil?
           has_null = true
           body.write_bytes(-1_i32, IO::ByteFormat::BigEndian)
+        elsif item.is_a?(Array)
+          raise EncodeError.new("arrays must be rectangular: an array nested deeper than the first element")
         else
           length_at = body.pos
           body.write_bytes(0_i32, IO::ByteFormat::BigEndian)
-          return encode_array_text(io, value) unless encode(body, element, item) == BINARY
+          return nil unless encode(body, element, item) == BINARY
           IO::ByteFormat::BigEndian.encode((body.pos - length_at - 4).to_i32, body.to_slice + length_at)
         end
       end
-      io.write_bytes(value.empty? ? 0_i32 : 1_i32, IO::ByteFormat::BigEndian)
-      io.write_bytes(has_null ? 1_i32 : 0_i32, IO::ByteFormat::BigEndian)
-      io.write_bytes(element, IO::ByteFormat::BigEndian)
-      unless value.empty?
-        io.write_bytes(value.size.to_i32, IO::ByteFormat::BigEndian)
-        io.write_bytes(1_i32, IO::ByteFormat::BigEndian) # lower bound
-      end
-      io.write(body.to_slice)
-      BINARY
+      has_null
     end
 
     private def self.encode_array_text(io : IO, value : Array) : Int16
@@ -200,6 +234,8 @@ module Postgres
         io << ',' if i > 0
         if item.nil?
           io << "NULL"
+        elsif item.is_a?(Array)
+          encode_array_text(io, item)
         else
           io << '"'
           item.to_s.each_char do |char|
@@ -561,35 +597,71 @@ module Postgres
       raise DecodeError.new("column #{c.name.inspect}: truncated array") if b.size < 12
       dimensions = IO::ByteFormat::BigEndian.decode(Int32, b)
       return [] of T if dimensions == 0
-      unless dimensions == 1
+      unless 0 < dimensions <= 6 && b.size >= 12 + 8 * dimensions
+        raise DecodeError.new("column #{c.name.inspect}: malformed array header")
+      end
+      unless dimensions == array_depth(type)
         raise DecodeError.new("column #{c.name.inspect}: a #{dimensions}-dimensional array cannot be decoded as #{type}")
       end
-      raise DecodeError.new("column #{c.name.inspect}: truncated array") if b.size < 20
-      count = IO::ByteFormat::BigEndian.decode(Int32, b + 12)
-      raise DecodeError.new("column #{c.name.inspect}: negative array size") if count < 0
+      sizes = Array(Int32).new(dimensions) do |d|
+        size = IO::ByteFormat::BigEndian.decode(Int32, b + 12 + d * 8)
+        raise DecodeError.new("column #{c.name.inspect}: negative array size") if size < 0
+        size
+      end
       element_column = Column.new(c.name, IO::ByteFormat::BigEndian.decode(UInt32, b + 8), types: c.types)
-      pos = 20
-      Array(T).new(count) do
-        raise DecodeError.new("column #{c.name.inspect}: truncated array") if pos + 4 > b.size
-        size = IO::ByteFormat::BigEndian.decode(Int32, b + pos)
-        pos += 4
+      build_array(type, sizes, 0, ArrayCursor.new(b, 12 + 8 * dimensions, element_column))
+    end
+
+    # The nesting depth of an `Array` type: 1 for `Array(Int32)`, 2 for
+    # `Array(Array(Int32))`.
+    def self.array_depth(type : Array(T).class) : Int32 forall T
+      {% if T < Array %}
+        1 + array_depth(T)
+      {% else %}
+        1
+      {% end %}
+    end
+
+    # One dimension of a (possibly nested) array, in row-major order.
+    private def self.build_array(type : Array(T).class, sizes : Array(Int32), depth : Int32, cursor : ArrayCursor) : Array(T) forall T
+      Array(T).new(sizes[depth]) do
+        {% if T < Array %}
+          build_array(T, sizes, depth + 1, cursor)
+        {% else %}
+          cursor.next(T)
+        {% end %}
+      end
+    end
+
+    # :nodoc:
+    #
+    # Walks the elements of a binary array.
+    class ArrayCursor
+      def initialize(@bytes : Bytes, @pos : Int32, @column : Column)
+      end
+
+      def next(type : T.class) : T forall T
+        b = @bytes
+        c = @column
+        raise DecodeError.new("column #{c.name.inspect}: truncated array") if @pos + 4 > b.size
+        size = IO::ByteFormat::BigEndian.decode(Int32, b + @pos)
+        @pos += 4
         if size < 0
           {% if T.nilable? %}
-            nil
+            return nil
           {% else %}
             raise DecodeError.new("column #{c.name.inspect}: NULL element but #{T} is not nilable")
           {% end %}
-        else
-          raise DecodeError.new("column #{c.name.inspect}: truncated array") if pos + size > b.size
-          item = b[pos, size]
-          pos += size
-          {% if T.nilable? %}
-            {% raise "Postgres: array element #{T} must be a single type or a single type plus Nil" unless T.union_types.size == 2 %}
-            decode(item, element_column, typeof(Pointer(T).null.value.not_nil!))
-          {% else %}
-            decode(item, element_column, T)
-          {% end %}
         end
+        raise DecodeError.new("column #{c.name.inspect}: truncated array") if @pos + size > b.size
+        item = b[@pos, size]
+        @pos += size
+        {% if T.nilable? %}
+          {% raise "Postgres: array element #{T} must be a single type or a single type plus Nil" unless T.union_types.size == 2 %}
+          Codec.decode(item, c, typeof(Pointer(T).null.value.not_nil!))
+        {% else %}
+          Codec.decode(item, c, T)
+        {% end %}
       end
     end
 

@@ -65,7 +65,8 @@ require "./postgres/pipeline"
 # | `Postgres::Range(T)` | int4range, int8range, numrange, tsrange, tstzrange, daterange (a Crystal `Range` works as a parameter) |
 # | `Hash(String, String?)` | hstore |
 # | an `enum` | a PostgreSQL enum or text column (by label), an integer column (by value) |
-# | `Array(T)`, `Array(T?)` | one-dimensional arrays of the types above (`int4[]`, `text[]`, ...) |
+# | `Array(T)`, `Array(T?)` | arrays of the types above (`int4[]`, `text[]`, ...); nest for more dimensions: `Array(Array(Int32))` |
+# | `Tuple(...)` | composite types and `row(...)` values, fields by position |
 #
 # A nilable type reads SQL NULL as `nil`. Parameters are encoded for the
 # type the server inferred for them; a `String` works for any type (it is
@@ -86,6 +87,7 @@ require "./postgres/pipeline"
 # or fails on its own. A query that exceeds `read_timeout` is cancelled
 # server-side and raises `IO::TimeoutError`, leaving the session usable.
 #
-# Not supported yet: multi-dimensional arrays, SCRAM channel binding.
+# Domains behave as their base type; user-defined types are looked up in
+# `pg_type` once per connection.
 module Postgres
 end

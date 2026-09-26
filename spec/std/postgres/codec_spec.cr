@@ -198,3 +198,26 @@ describe Postgres::ExecResult do
     Postgres::ExecResult.from_tag("CREATE TABLE").should eq(Postgres::ExecResult.new("CREATE TABLE", 0))
   end
 end
+
+describe "Postgres::Codec multi-dimensional arrays" do
+  # array_send('{{1,2,3},{4,5,6}}'::int4[])
+  it "matches the server's two-dimensional arrays" do
+    hex = "00000002000000000000001700000002000000010000000300000001000000040000000100000004000000020000000400000003000000040000000400000004000000050000000400000006"
+    Postgres::Codec.decode(hex.hexbytes, Postgres::Column.new("c", 1007_u32), Array(Array(Int32))).should eq([[1, 2, 3], [4, 5, 6]])
+    io = IO::Memory.new
+    Postgres::Codec.encode(io, 1007_u32, [[1, 2, 3], [4, 5, 6]]).should eq(1)
+    io.to_slice.hexstring.should eq(hex)
+    expect_raises(Postgres::DecodeError, /2-dimensional array cannot be decoded as Array\(Int32\)/) do
+      Postgres::Codec.decode(hex.hexbytes, Postgres::Column.new("c", 1007_u32), Array(Int32))
+    end
+    expect_raises(Postgres::DecodeError, /2-dimensional array cannot be decoded as Array\(Array\(Array\(Int32\)\)\)/) do
+      Postgres::Codec.decode(hex.hexbytes, Postgres::Column.new("c", 1007_u32), Array(Array(Array(Int32))))
+    end
+  end
+
+  it "rejects ragged arrays" do
+    expect_raises(Postgres::EncodeError, /rectangular: expected 2 elements at depth 2, got 1/) do
+      Postgres::Codec.encode(IO::Memory.new, 1007_u32, [[1, 2], [3]])
+    end
+  end
+end
