@@ -37,10 +37,15 @@ module Postgres
                  host : String? = nil, port : Int32? = nil, user : String? = nil, password : String? = nil,
                  database : String? = nil, sslmode : SSLMode? = nil, sslrootcert : String? = nil,
                  application_name : String? = nil, connect_timeout : Time::Span? = nil,
-                 statement_cache_size : Int32? = nil) : self
+                 statement_cache_size : Int32? = nil, service : String? = nil, options : String? = nil,
+                 search_path : String? = nil, target_session_attrs : TargetSessionAttrs? = nil,
+                 load_balance_hosts : LoadBalanceHosts? = nil, passfile : String? = nil,
+                 channel_binding : Auth::ChannelBinding? = nil) : self
       config = Config.parse(url, host: host, port: port, user: user, password: password, database: database,
         sslmode: sslmode, sslrootcert: sslrootcert, application_name: application_name,
-        connect_timeout: connect_timeout, statement_cache_size: statement_cache_size)
+        connect_timeout: connect_timeout, statement_cache_size: statement_cache_size, service: service,
+        options: options, search_path: search_path, target_session_attrs: target_session_attrs,
+        load_balance_hosts: load_balance_hosts, passfile: passfile, channel_binding: channel_binding)
       new(config: config, pool_size: pool_size, checkout_timeout: checkout_timeout,
         read_timeout: read_timeout, tls_context: tls_context)
     end

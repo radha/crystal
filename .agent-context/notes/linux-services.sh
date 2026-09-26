@@ -13,6 +13,12 @@ if [ -d /opt/pgdata ]; then
   chown -R postgres /opt/pgdata /opt/pgsock
   su postgres -s /bin/sh -c "/usr/lib/postgresql/16/bin/pg_ctl -D /opt/pgdata -l /opt/pgdata/log.txt start" >/dev/null
 fi
+# Streaming standby on 5433 (for target_session_attrs specs), if created:
+#   pg_basebackup -h 127.0.0.1 -U postgres -D /opt/pgstandby -R -X stream; port = 5433 in its conf
+if [ -d /opt/pgstandby ]; then
+  chown -R postgres /opt/pgstandby
+  su postgres -s /bin/sh -c "/usr/lib/postgresql/16/bin/pg_ctl -D /opt/pgstandby -l /opt/pgstandby/log.txt start" >/dev/null
+fi
 redis-cli ping >/dev/null 2>&1 || redis-server --port 6379 --save "" --appendonly no --daemonize yes >/dev/null
 sleep 2
 redis-cli ping
@@ -24,4 +30,5 @@ export POSTGRES_MD5_URL="postgres://crystal_md5:md5pass@127.0.0.1/crystal_test?s
 export POSTGRES_CLEARTEXT_URL="postgres://crystal_clear:clearpass@127.0.0.1/crystal_test?sslmode=disable"
 export POSTGRES_SCRAM_URL="postgres://crystal_scram:scrampass@127.0.0.1/crystal_test?sslmode=disable"
 export POSTGRES_SSL_URL="postgres://crystal_ssl:sslpass@127.0.0.1/crystal_test"
+export POSTGRES_STANDBY_URL="postgres://postgres@127.0.0.1:5433/crystal_test?sslmode=disable"
 ENV

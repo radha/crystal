@@ -109,8 +109,10 @@ module Postgres
     # receives them while idle too.
     property on_notification : Proc(Notification, Nil)? = nil
 
-    @io : IO
-    @socket : IO
+    # Placeholders until `connect_to` opens the real socket.
+    @io : IO = IO::Memory.new
+    @socket : IO = IO::Memory.new
+    @host : Config::Host?
     @out = IO::Memory.new
     @buffer = Bytes.new(8192)
     @closed = false
@@ -124,19 +126,83 @@ module Postgres
     @reader : RowReader?
 
     # Opens a session with *config* (see `Config.parse`).
+    #
+    # With several hosts they are tried in order (shuffled with
+    # `load_balance_hosts=random`) until one accepts the login and matches
+    # `target_session_attrs`; `prefer-standby` makes a first pass for
+    # standbys only. With one host its own error is raised; with several a
+    # `ConnectionError` lists what each one answered.
     def initialize(*, @config : Config, @read_timeout : Time::Span? = nil,
                    @tls_context : OpenSSL::SSL::Context::Client? = nil)
       @cache = StatementCache.new(@config.statement_cache_size)
-      @socket = open_socket
+      wanted = @config.target_session_attrs
+      passes = wanted.prefer_standby? ? [TargetSessionAttrs::Standby, TargetSessionAttrs::Any] : [wanted]
+      hosts = @config.ordered_hosts
+      failures = [] of {Config::Host, Exception}
+      passes.each do |pass|
+        hosts.each do |host|
+          begin
+            connect_to(host)
+            return if session_matches?(pass)
+            raise ConnectionError.new("server is not #{pass.to_param} (target_session_attrs)")
+          rescue ex
+            close_quietly
+            failures << {host, ex}
+          end
+        end
+      end
+      @closed = true
+      raise failures[0][1] if failures.size == 1
+      summary = failures.join("; ") { |host, ex| "#{host}: #{ex.message}" }
+      if failures.all? { |_, ex| ex.is_a?(AuthenticationError) }
+        raise AuthenticationError.new(summary, cause: failures.last[1])
+      end
+      raise ConnectionError.new("no host accepted the connection: #{summary}", cause: failures.last[1])
+    end
+
+    # The host this session is connected to.
+    def host : Config::Host
+      @host.not_nil!
+    end
+
+    private def connect_to(host : Config::Host) : Nil
+      @closed = false
+      @host = host
+      @parameters.clear
+      @backend_pid = 0
+      @socket = open_socket(host)
       @io = @socket
-      begin
-        @io = negotiate_tls(@socket, @tls_context) unless @config.socket_path || @config.sslmode.disable?
-        startup
-      rescue ex
-        @closed = true
-        @io.close rescue nil
-        @socket.close rescue nil
-        raise ex
+      if host.unix_socket? || @config.sslmode.disable?
+        if @config.channel_binding.require?
+          raise AuthenticationError.new("channel_binding=require needs a TLS connection")
+        end
+      else
+        @io = negotiate_tls(@socket, @tls_context, host)
+      end
+      startup
+    end
+
+    # Whether the server is acceptable for *wanted*: PostgreSQL 14+ reports
+    # `in_hot_standby` and `default_transaction_read_only`; older servers
+    # are asked.
+    private def session_matches?(wanted : TargetSessionAttrs) : Bool
+      return true if wanted.any?
+      standby = if (value = @parameters["in_hot_standby"]?)
+                  value == "on"
+                else
+                  query_one("select pg_is_in_recovery()", as: Bool)
+                end
+      read_only = standby || if (value = @parameters["default_transaction_read_only"]?)
+        value == "on"
+      else
+        query_one("show transaction_read_only", as: String) == "on"
+      end
+      case wanted
+      when .read_write? then !read_only
+      when .read_only?  then read_only
+      when .primary?    then !standby
+      when .standby?    then standby
+      else                   true
       end
     end
 
@@ -149,10 +215,12 @@ module Postgres
                  tls_context : OpenSSL::SSL::Context::Client? = nil, host : String? = nil, port : Int32? = nil,
                  user : String? = nil, password : String? = nil, database : String? = nil,
                  sslmode : SSLMode? = nil, sslrootcert : String? = nil, application_name : String? = nil,
-                 connect_timeout : Time::Span? = nil, statement_cache_size : Int32? = nil) : self
+                 connect_timeout : Time::Span? = nil, statement_cache_size : Int32? = nil, service : String? = nil, options : String? = nil, search_path : String? = nil, target_session_attrs : TargetSessionAttrs? = nil, load_balance_hosts : LoadBalanceHosts? = nil, passfile : String? = nil, channel_binding : Auth::ChannelBinding? = nil) : self
       config = Config.parse(url, host: host, port: port, user: user, password: password, database: database,
         sslmode: sslmode, sslrootcert: sslrootcert, application_name: application_name,
-        connect_timeout: connect_timeout, statement_cache_size: statement_cache_size)
+        connect_timeout: connect_timeout, statement_cache_size: statement_cache_size, service: service,
+        options: options, search_path: search_path, target_session_attrs: target_session_attrs,
+        load_balance_hosts: load_balance_hosts, passfile: passfile, channel_binding: channel_binding)
       new(config: config, read_timeout: read_timeout, tls_context: tls_context)
     end
 
@@ -368,28 +436,27 @@ module Postgres
 
     # --- connecting -------------------------------------------------------
 
-    private def open_socket : IO
-      socket = if path = @config.socket_path
+    private def open_socket(host : Config::Host) : IO
+      socket = if path = host.socket_path
                  UNIXSocket.new(path)
                else
-                 TCPSocket.new(@config.host, @config.port, connect_timeout: @config.connect_timeout).tap(&.tcp_nodelay = true)
+                 TCPSocket.new(host.host, host.port, connect_timeout: @config.connect_timeout).tap(&.tcp_nodelay = true)
                end
       socket.read_timeout = @read_timeout
       socket.sync = false
       socket
     rescue ex : Socket::Error | IO::Error
-      target = @config.socket_path || "#{@config.host}:#{@config.port}"
-      raise ConnectionError.new("cannot connect to #{target}: #{ex.message}", cause: ex)
+      raise ConnectionError.new("cannot connect to #{host}: #{ex.message}", cause: ex)
     end
 
-    private def negotiate_tls(socket : IO, context : OpenSSL::SSL::Context::Client?) : IO
+    private def negotiate_tls(socket : IO, context : OpenSSL::SSL::Context::Client?, host : Config::Host) : IO
       Messages::SSLRequest.new.write(socket)
       socket.flush
       answer = socket.read_byte || raise ConnectionError.new("server closed the connection during SSLRequest")
       case answer.chr
       when 'S'
         context ||= tls_context
-        hostname = @config.sslmode.verify_full? ? @config.host : nil
+        hostname = @config.sslmode.verify_full? ? host.host : nil
         begin
           OpenSSL::SSL::Socket::Client.new(socket, context: context, sync_close: true, hostname: hostname).tap(&.sync = false)
         rescue ex : OpenSSL::Error | IO::Error
@@ -416,8 +483,10 @@ module Postgres
     end
 
     private def startup : Nil
+      scram_verified = false
       params = ["user", @config.user, "database", @config.database, "client_encoding", "UTF8"]
       @config.application_name.try { |name| params << "application_name" << name }
+      @config.options.try { |options| params << "options" << options }
       Messages::Startup.new(params: params).write(@out)
       flush
       scram = nil
@@ -428,20 +497,26 @@ module Postgres
           code = be(Int32, body, 0)
           case code
           when 0 # AuthenticationOk
+            # With channel_binding=require only a verified SCRAM-PLUS
+            # exchange may end here; otherwise a server using trust (or
+            # a man in the middle) could skip the binding.
+            if @config.channel_binding.require? && !(scram_verified && scram.try(&.mechanism) == Auth::Scram::MECHANISM_PLUS)
+              raise AuthenticationError.new("channel_binding=require, but the server authenticated without SCRAM-SHA-256-PLUS")
+            end
           when 3 # CleartextPassword
+            refuse_without_binding("cleartext")
             Messages::Password.new(password: password!("cleartext")).write(@out)
             flush
           when 5 # MD5Password
+            refuse_without_binding("md5")
             Messages::Password.new(password: Auth.md5_password(@config.user, password!("md5"), body[4, 4])).write(@out)
             flush
           when 10 # SASL
             mechanisms = cstrings(body + 4)
-            unless mechanisms.includes?(Auth::Scram::MECHANISM)
-              raise AuthenticationError.new("server offers only unsupported SASL mechanisms #{mechanisms.join(", ")}")
-            end
-            scram = Auth::Scram.new(password!("SCRAM-SHA-256"))
-            first = scram.client_first_message
-            Messages::SASLInitialResponse.new(mechanism: Auth::Scram::MECHANISM, data: first).write(@out)
+            certificate_hash = @io.as?(OpenSSL::SSL::Socket).try { |tls| Auth.certificate_hash(tls) }
+            scram = Auth::Scram.negotiate(mechanisms, password!("SCRAM-SHA-256"),
+              certificate_hash: certificate_hash, channel_binding: @config.channel_binding)
+            Messages::SASLInitialResponse.new(mechanism: scram.mechanism, data: scram.client_first_message).write(@out)
             flush
           when 11 # SASLContinue
             s = scram || raise ProtocolError.new("SASLContinue without SASL")
@@ -450,6 +525,7 @@ module Postgres
           when 12 # SASLFinal
             s = scram || raise ProtocolError.new("SASLFinal without SASL")
             s.verify_server_final(String.new(body + 4))
+            scram_verified = true
           else
             raise AuthenticationError.new("unsupported authentication method #{code}")
           end
@@ -474,8 +550,13 @@ module Postgres
       end
     end
 
+    private def refuse_without_binding(method : String) : Nil
+      return unless @config.channel_binding.require?
+      raise AuthenticationError.new("channel_binding=require, but the server asked for #{method} authentication")
+    end
+
     private def password!(method : String) : String
-      @config.password || raise AuthenticationError.new("server requested #{method} authentication but no password was given")
+      @config.password_for(host) || raise AuthenticationError.new("server requested #{method} authentication but no password was given")
     end
 
     # --- query paths ------------------------------------------------------
@@ -772,9 +853,9 @@ module Postgres
     # delivered), which narrows the race with a query that ends on its own
     # meanwhile. Failures are ignored: the next timeout closes the session.
     private def cancel_running_query : Nil
-      socket = open_socket
+      socket = open_socket(host)
       begin
-        io = @config.socket_path || @config.sslmode.disable? ? socket : negotiate_tls(socket, @tls_context)
+        io = tls? ? negotiate_tls(socket, @tls_context, host) : socket
         Messages::CancelRequest.new(pid: @backend_pid, secret: @secret).write(io)
         io.flush
         io.read_byte

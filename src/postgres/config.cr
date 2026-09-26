@@ -1,5 +1,6 @@
 require "./error"
 require "uri"
+require "./auth"
 
 module Postgres
   # How TLS is negotiated with the server, as libpq's `sslmode`.
@@ -203,6 +204,10 @@ module Postgres
     # server, such as `"-c search_path=app"`), if any.
     getter options : String?
 
+    # Whether SCRAM channel binding is used (`channel_binding`, libpq's
+    # `disable`, `prefer`, `require`). Defaults to `prefer`.
+    getter channel_binding : Auth::ChannelBinding = Auth::ChannelBinding::Prefer
+
     # Which kind of server is acceptable. Defaults to `TargetSessionAttrs::Any`.
     getter target_session_attrs : TargetSessionAttrs
 
@@ -222,6 +227,17 @@ module Postgres
     DEFAULT_HOST = "localhost"
     # :nodoc:
     DEFAULT_PORT = 5432
+
+    # :nodoc:
+    def self.parse_channel_binding(value : String) : Auth::ChannelBinding
+      case value
+      when "disable" then Auth::ChannelBinding::Disable
+      when "prefer"  then Auth::ChannelBinding::Prefer
+      when "require" then Auth::ChannelBinding::Require
+      else                raise ArgumentError.new("Invalid channel_binding: #{value.inspect} (expected disable, prefer or require)")
+      end
+    end
+
     # :nodoc:
     DEFAULT_CONNECT_TIMEOUT = 10.seconds
     # :nodoc:
@@ -232,7 +248,7 @@ module Postgres
                    @sslmode : SSLMode, @sslrootcert : String?, @application_name : String?,
                    @connect_timeout : Time::Span, @statement_cache_size : Int32, @options : String?,
                    @target_session_attrs : TargetSessionAttrs, @load_balance_hosts : LoadBalanceHosts,
-                   @passfile : String?)
+                   @passfile : String?, @channel_binding : Auth::ChannelBinding = Auth::ChannelBinding::Prefer)
       @file_passwords = if @explicit_password.presence
                           [] of String?
                         else
@@ -330,6 +346,7 @@ module Postgres
                    database : String? = nil, sslmode : SSLMode? = nil, sslrootcert : String? = nil,
                    application_name : String? = nil, connect_timeout : Time::Span? = nil,
                    statement_cache_size : Int32? = nil, service : String? = nil, options : String? = nil,
+                   channel_binding : Auth::ChannelBinding? = nil,
                    search_path : String? = nil, target_session_attrs : TargetSessionAttrs? = nil,
                    load_balance_hosts : LoadBalanceHosts? = nil, passfile : String? = nil) : Config
       from_url = url ? Params.parse_url(url) : Params.new
@@ -382,8 +399,11 @@ module Postgres
       r_passfile = passfile.presence || from_url.passfile || from_service.passfile ||
                    getenv.call("PGPASSFILE") || default_passfile(getenv)
 
+      r_binding = channel_binding || from_url.channel_binding || from_service.channel_binding ||
+                  getenv.call("PGCHANNELBINDING").try { |v| Config.parse_channel_binding(v) } || Auth::ChannelBinding::Prefer
+
       new(hosts, r_user, r_password, r_database, r_sslmode, r_sslrootcert, r_app, r_timeout, r_cache,
-        r_options, r_attrs, r_balance, r_passfile)
+        r_options, r_attrs, r_balance, r_passfile, r_binding)
     end
 
     # Writes a representation of this configuration with the password
@@ -515,6 +535,7 @@ module Postgres
       property target_session_attrs : TargetSessionAttrs?
       property load_balance_hosts : LoadBalanceHosts?
       property passfile : String?
+      property channel_binding : Auth::ChannelBinding?
 
       def initialize
       end
@@ -536,6 +557,7 @@ module Postgres
         when "target_session_attrs" then @target_session_attrs = TargetSessionAttrs.from_param(value)
         when "load_balance_hosts"   then @load_balance_hosts = LoadBalanceHosts.from_param(value)
         when "passfile"             then @passfile = value.presence
+        when "channel_binding"      then @channel_binding = Config.parse_channel_binding(value)
         else                             return false
         end
         true
