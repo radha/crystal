@@ -322,13 +322,24 @@ module RedisSpec
         end
         ports[1..].each { |port| conns[0].call("CLUSTER", "MEET", "127.0.0.1", port) }
         started = Time.instant
-        until conns.all? { |conn| conn.call("CLUSTER", "INFO").as(String).includes?("cluster_state:ok") }
+        until conns.all? { |conn| converged?(conn, ports.size) }
           raise "cluster did not converge within 15 s" if Time.instant - started > 15.seconds
           sleep 100.milliseconds
         end
       ensure
         conns.each(&.close)
       end
+    end
+
+    # Whether *conn*'s node serves its slots and knows all *count* nodes
+    # over a connected cluster bus link. `cluster_state:ok` alone comes
+    # first: gossip can still be meeting the last node then, and a
+    # `PUBLISH` only reaches the nodes its own node already links to.
+    private def converged?(conn : Redis::Connection, count : Int32) : Bool
+      info = conn.call("CLUSTER", "INFO").as(String)
+      return false unless info.includes?("cluster_state:ok") && info.includes?("cluster_known_nodes:#{count}")
+      lines = conn.call("CLUSTER", "NODES").as(String).lines.reject(&.blank?)
+      lines.size == count && lines.all? { |line| line.split(' ')[7]? == "connected" }
     end
 
     private def wait_for(port : Int32) : Redis::Connection
