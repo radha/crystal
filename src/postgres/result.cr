@@ -61,6 +61,13 @@ module Postgres
 
     # :nodoc:
     #
+    # Reuses this reader (and its offset arrays) for another result.
+    def reset(@columns : Array(Column)) : Nil
+      @mapping = nil
+    end
+
+    # :nodoc:
+    #
     # Parses a `DataRow` body: `Int16` count, then per column an `Int32`
     # length (-1 for NULL) and the bytes.
     def load(data : Bytes) : Nil

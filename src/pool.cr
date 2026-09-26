@@ -102,10 +102,16 @@ class Pool(T)
     # Unlocked pre-check to fail fast; the check under the mutex below is
     # the one that counts.
     raise ClosedError.new("pool is closed") if @closed
+    # A free permit is taken without arming a timer: `timeout` costs a
+    # timer syscall and allocations on every checkout.
     select
     when @permits.receive
-    when timeout(@checkout_timeout)
-      raise TimeoutError.new("no connection available after #{@checkout_timeout}")
+    else
+      select
+      when @permits.receive
+      when timeout(@checkout_timeout)
+        raise TimeoutError.new("no connection available after #{@checkout_timeout}")
+      end
     end
     @mutex.synchronize do
       if @closed

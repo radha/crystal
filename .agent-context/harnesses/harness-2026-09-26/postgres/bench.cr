@@ -1,7 +1,7 @@
 # Crystal side of the PostgreSQL client benchmarks (design doc section 13).
 #
 #   bin/crystal build --release -o bench_cr bench.cr
-#   ./bench_cr [seq|fetch|pool|all]
+#   ./bench_cr [seq|fetch|pool|pool_chan|all]
 #
 # PG_URL overrides the connection URL. Output lines are machine-readable:
 #   RESULT <bench> key=value ...
@@ -85,6 +85,37 @@ def bench_pool
   db.close
 end
 
+# Diagnostic only (not one of the three spec'd benchmarks): the same load
+# as bench_pool, but 8 raw Connections handed out through a plain
+# Channel(Connection) instead of Postgres::Client's Pool (no checkout
+# timeout, no idle timestamps, no health check). Isolates Pool overhead.
+def bench_pool_chan
+  sql = "select $1::int4"
+  conns = Channel(Postgres::Connection).new(8)
+  8.times { conns.send(Postgres::Connection.new(URL).tap(&.query_one(sql, 0, as: Int32))) }
+  tasks = 64
+  per = 2000
+  done = Channel(Nil).new
+  start = Time.instant
+  tasks.times do
+    spawn do
+      per.times do |i|
+        c = conns.receive
+        begin
+          c.query_one(sql, i, as: Int32)
+        ensure
+          conns.send(c)
+        end
+      end
+      done.send(nil)
+    end
+  end
+  tasks.times { done.receive }
+  elapsed = (Time.instant - start).total_seconds
+  printf("RESULT pool_chan ops_per_s=%.0f\n", (tasks * per) / elapsed)
+  8.times { conns.receive.close }
+end
+
 {% if flag?(:execution_context) %}
   def run_pool_mt
     workers = (ENV["CRYSTAL_WORKERS"]? || "4").to_i
@@ -105,10 +136,11 @@ when "pool"
   {% else %}
     bench_pool
   {% end %}
+when "pool_chan" then bench_pool_chan
 when "all"
   bench_seq
   bench_fetch
   bench_pool
 else
-  abort "usage: bench_cr [seq|fetch|pool|all]"
+  abort "usage: bench_cr [seq|fetch|pool|pool_chan|all]"
 end

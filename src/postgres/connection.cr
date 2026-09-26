@@ -97,6 +97,7 @@ module Postgres
     @secret : Int32 = 0
     @transaction_depth = 0
     @cache : StatementCache
+    @reader : RowReader?
 
     # Opens a session with *config* (see `Config.parse`).
     def initialize(*, @config : Config, @read_timeout : Time::Span? = nil,
@@ -164,7 +165,7 @@ module Postgres
 
     # :ditto:
     def exec(sql : String, *args) : ExecResult
-      extended(sql, args) { }
+      extended(sql, args, want_result: true) { }
     end
 
     # Runs *sql* and decodes every row as *type*: a `Serializable` struct or
@@ -436,15 +437,15 @@ module Postgres
     # Prepares (or finds) *sql*, binds *args*, executes and yields each
     # `DataRow` through a `RowReader`. Retries once after the server
     # dropped a cached statement, when that is safe (outside a transaction).
-    private def extended(sql : String, args : Tuple, & : RowReader ->) : ExecResult
+    private def extended(sql : String, args : Tuple, want_result : Bool = false, & : RowReader ->) : ExecResult
       enter
       begin
         idle = @transaction_status == 'I'
         begin
-          run_extended(sql, args) { |row| yield row }
+          run_extended(sql, args, want_result) { |row| yield row }
         rescue ex : StaleStatement
           raise ex.error unless idle
-          run_extended(sql, args) { |row| yield row }
+          run_extended(sql, args, want_result) { |row| yield row }
         end
       ensure
         leave
@@ -460,7 +461,7 @@ module Postgres
       end
     end
 
-    private def run_extended(sql : String, args : Tuple, & : RowReader ->) : ExecResult
+    private def run_extended(sql : String, args : Tuple, want_result : Bool, & : RowReader ->) : ExecResult
       statement = prepare(sql)
       unless args.size == statement.param_oids.size
         raise ArgumentError.new("query expects #{statement.param_oids.size} parameters, got #{args.size}")
@@ -472,7 +473,8 @@ module Postgres
       Messages::Execute.new(portal: "").write(@out)
       @out.write(Messages::SYNC)
       flush
-      reader = RowReader.new(statement.columns)
+      reader = @reader ||= RowReader.new(statement.columns)
+      reader.reset(statement.columns)
       result = ExecResult.new("", 0_i64)
       error = nil
       failure = nil
@@ -489,7 +491,9 @@ module Postgres
             # step, then raise.
             failure = ex
           end
-        when 'C' then result = ExecResult.from_tag(parse { Messages::CommandComplete.from_slice(body) }.tag)
+        when 'C'
+          # Only `exec` reports the tag; `query_*` skip building it.
+          result = ExecResult.from_tag(parse { Messages::CommandComplete.from_slice(body) }.tag) if want_result
         when '2', '3', 'I', 'n', 's'
         when 'E' then error ||= parse { query_error(body) }
         when 'Z'
