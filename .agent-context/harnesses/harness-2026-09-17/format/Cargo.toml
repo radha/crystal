@@ -1,0 +1,15 @@
+[package]
+name = "bench_format"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+binrw = "0.14"
+
+[[bin]]
+name = "bench_format"
+path = "bench_format.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
