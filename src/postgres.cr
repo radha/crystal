@@ -5,6 +5,7 @@ require "./postgres/connection"
 require "./postgres/client"
 require "./postgres/listener"
 require "./postgres/copy"
+require "./postgres/pipeline"
 
 # A pure-Crystal PostgreSQL client speaking the frontend/backend protocol
 # 3.0 over TCP, Unix sockets or TLS.
@@ -72,7 +73,11 @@ require "./postgres/copy"
 # `Connection#copy_from` and `#copy_to` stream `COPY` in any format;
 # `Connection#copy_rows` bulk-inserts typed rows with binary `COPY`.
 #
-# Not supported yet: multi-dimensional arrays, pipelining several queries,
-# query cancellation.
+# `Connection#pipeline` (and `Client#pipeline`) sends many queries in two
+# round trips and returns a typed `Future` per query; each query succeeds
+# or fails on its own. A query that exceeds `read_timeout` is cancelled
+# server-side and raises `IO::TimeoutError`, leaving the session usable.
+#
+# Not supported yet: multi-dimensional arrays, SCRAM channel binding.
 module Postgres
 end

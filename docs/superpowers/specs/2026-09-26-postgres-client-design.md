@@ -434,3 +434,33 @@ Deviations settled while building slice 1:
 - Queued statement `Close`s are written after `Bind`, so an argument that
   fails to encode (which discards the half-written `Bind`) cannot drop
   them.
+
+## 16. Slice 2 (2026-09-26, same session)
+
+User decisions: order arrays → LISTEN/NOTIFY → COPY → pipelining +
+cancel; pipeline queries are **independent** (a Sync after each; wrap in
+`transaction` for atomicity); pipeline API is **futures**; on
+`read_timeout` **cancel and keep the connection**.
+
+- Arrays: 1-D `Array(T)`/`Array(T?)` both ways for every scalar type of
+  §7; array columns travel in binary (reading one as `String` now raises);
+  arrays for unknown element types, or strings for typed elements, go as
+  a quoted text literal.
+- `Listener` (LISTEN/NOTIFY), modelled on `Redis::Subscriber`: dedicated
+  connection, reader fiber, bounded channel, acked `listen`/`unlisten`,
+  reconnect with backoff and re-LISTEN, hooks guarded against
+  re-entrance. `notify` via `pg_notify`. `Connection#on_notification`.
+- COPY: `copy_from`/`copy_to` stream any format (64 KiB CopyData chunks,
+  CopyFail on a raising block, drained on early exit); `copy_rows` writes
+  binary COPY with values encoded by the real column types.
+- Cancel: a timeout between messages (`IO#peek`) sends a CancelRequest,
+  waits for the server to close that socket, and raises
+  `IO::TimeoutError` at the following `ReadyForQuery`; a second timeout
+  closes.
+- Pipeline: round 1 prepares every uncached statement (Sync each), round
+  2 sends Bind/Execute/Sync per query; queued Closes (evictions caused by
+  round 1, temporary statements when the cache is off) go after every
+  query. Stale statements fail their future (no retry inside a pipeline).
+
+Benchmarks (harness README): COPY 1M rows 2.25M rows/s vs pgx 1.55M;
+100 queries pipelined 3.1x faster than sequential on loopback.
