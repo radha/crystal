@@ -56,7 +56,15 @@ class Pool(T)
   @idle = Deque({T, Time::Instant}).new
   @in_use = 0
   @closed = false
-  @permits : Channel(Nil)
+  # Permits not held by anyone. A checkout takes one under the mutex; only
+  # when none is free does it wait on `@handoff`, so an uncontended
+  # checkout neither touches a channel nor allocates.
+  @available : Int32
+  # Fibers waiting on `@handoff` that no permit has been sent for yet.
+  @waiting = 0
+  # Permits handed from `checkin` to waiting fibers. Its capacity is `size`,
+  # so sending under the mutex never blocks.
+  @handoff : Channel(Nil)
 
   # Creates an empty pool whose connections are opened by the block. *T*
   # must respond to `#close` and `#closed?`.
@@ -70,8 +78,8 @@ class Pool(T)
                  @health_check : Proc(T, Bool)? = nil, @health_check_after : Time::Span = 1.second,
                  &@factory : -> T)
     raise ArgumentError.new("pool size must be positive, got #{@size}") unless @size > 0
-    @permits = Channel(Nil).new(@size)
-    @size.times { @permits.send(nil) }
+    @available = @size
+    @handoff = Channel(Nil).new(@size)
   end
 
   # Returns the number of open connections waiting in the pool.
@@ -99,33 +107,76 @@ class Pool(T)
   # unchanged. Hand the connection back with `checkin`; the block form
   # does that for you.
   def checkout : T
-    # Unlocked pre-check to fail fast; the check under the mutex below is
-    # the one that counts.
+    # Unlocked pre-check to fail fast; the checks under the mutex count.
     raise ClosedError.new("pool is closed") if @closed
-    # A free permit is taken without arming a timer: `timeout` costs a
-    # timer syscall and allocations on every checkout.
-    select
-    when @permits.receive
-    else
-      select
-      when @permits.receive
-      when timeout(@checkout_timeout)
-        raise TimeoutError.new("no connection available after #{@checkout_timeout}")
+    entry = @mutex.synchronize do
+      raise ClosedError.new("pool is closed") if @closed
+      if @available > 0
+        @available -= 1
+        @in_use += 1
+        {true, next_idle_unlocked}
+      else
+        @waiting += 1
+        {false, nil}
       end
     end
-    @mutex.synchronize do
-      if @closed
-        @permits.send(nil)
-        raise ClosedError.new("pool is closed")
+    got, idle = entry
+    unless got
+      wait_for_permit
+      idle = @mutex.synchronize do
+        if @closed
+          release_permit_unlocked
+          raise ClosedError.new("pool is closed")
+        end
+        @in_use += 1
+        next_idle_unlocked
       end
-      @in_use += 1
     end
     begin
-      acquire
+      acquire(idle)
     rescue ex
-      @mutex.synchronize { @in_use -= 1 }
-      @permits.send(nil)
+      @mutex.synchronize do
+        @in_use -= 1
+        release_permit_unlocked
+      end
       raise ex
+    end
+  end
+
+  # Waits for `checkin` to hand this fiber a permit. On timeout the fiber
+  # stops being counted as waiting, unless a permit was already sent for
+  # it, in which case it takes that one instead of leaking it.
+  private def wait_for_permit : Nil
+    select
+    when @handoff.receive
+      return
+    when timeout(@checkout_timeout)
+    end
+    served = @mutex.synchronize do
+      if @waiting > 0
+        @waiting -= 1
+        false
+      else
+        true
+      end
+    end
+    # Every waiter still counted in `@waiting` has no permit in flight, so
+    # when the count is zero one of the permits in `@handoff` is ours (and
+    # it is already there: they are sent under the mutex).
+    if served
+      @handoff.receive
+      return
+    end
+    raise TimeoutError.new("no connection available after #{@checkout_timeout}")
+  end
+
+  # Under `@mutex`: hands the permit to a waiting fiber, or puts it back.
+  private def release_permit_unlocked : Nil
+    if @waiting > 0
+      @waiting -= 1
+      @handoff.send(nil)
+    else
+      @available += 1
     end
   end
 
@@ -135,15 +186,12 @@ class Pool(T)
   def checkin(connection : T) : Nil
     close_it = @mutex.synchronize do
       @in_use -= 1
-      if @closed || connection.closed?
-        true
-      else
-        @idle.push({connection, Time.instant})
-        false
-      end
+      discard = @closed || connection.closed?
+      @idle.push({connection, Time.instant}) unless discard
+      release_permit_unlocked
+      discard
     end
     connection.close if close_it
-    @permits.send(nil)
   end
 
   # Checks a connection out, yields it and checks it in again, whatever
@@ -173,10 +221,11 @@ class Pool(T)
     idle.each(&.close)
   end
 
-  # Finds a usable idle connection or opens a new one. The caller holds a
+  # Hands out *entry* (taken under the mutex together with the permit) or
+  # the next healthy idle connection, or opens one. The caller holds a
   # permit and has counted the connection in `@in_use`.
-  private def acquire : T
-    while entry = next_idle
+  private def acquire(entry : {T, Time::Instant}?) : T
+    while entry
       connection, since = entry
       return connection unless health_check = @health_check
       return connection if Time.instant - since < @health_check_after
@@ -186,6 +235,7 @@ class Pool(T)
         connection.close
       rescue
       end
+      entry = next_idle
     end
     @factory.call
   end
@@ -193,10 +243,13 @@ class Pool(T)
   # Pops the longest-idle connection, skipping any that were closed while
   # idle (they are useless).
   private def next_idle : {T, Time::Instant}?
-    @mutex.synchronize do
-      while entry = @idle.shift?
-        break entry unless entry[0].closed?
-      end
+    @mutex.synchronize { next_idle_unlocked }
+  end
+
+  # Under `@mutex`: the oldest idle connection that is not closed.
+  private def next_idle_unlocked : {T, Time::Instant}?
+    while entry = @idle.shift?
+      return entry unless entry[0].closed?
     end
   end
 

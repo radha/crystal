@@ -217,6 +217,40 @@ describe Pool do
     end
   end
 
+  it "keeps permits exact when waiters time out while connections come back" do
+    pool = new_pool(Factory.new, size: 3, checkout_timeout: 2.milliseconds)
+    rng = Random.new(7)
+    delays = Array.new(400) { rng.rand(0..3).milliseconds }
+    timeouts = Atomic(Int32).new(0)
+    wg = WaitGroup.new
+    delays.each do |delay|
+      wg.spawn do
+        conn = pool.checkout
+        sleep delay
+        pool.checkin(conn)
+      rescue Pool::TimeoutError
+        timeouts.add(1)
+      end
+    end
+    wg.wait
+    timeouts.get.should be > 0 # the race was exercised
+    pool.in_use.should eq(0)
+    # No permit leaked or duplicated: exactly `size` checkouts succeed at once.
+    held = Array.new(3) { pool.checkout }
+    expect_raises(Pool::TimeoutError) { pool.checkout }
+    held.each { |c| pool.checkin(c) }
+    pool.checkout.should be_a(FakeConnection)
+  end
+
+  it "allocates nothing for an uncontended checkout and checkin" do
+    pool = new_pool(Factory.new, size: 2)
+    pool.checkin(pool.checkout)
+    GC.collect
+    before = GC.stats.total_bytes
+    1000.times { pool.checkin(pool.checkout) }
+    (GC.stats.total_bytes - before).should be < 1000
+  end
+
   it "rejects a non-positive size" do
     expect_raises(ArgumentError, /size/) { Pool(FakeConnection).new(size: 0) { FakeConnection.new(1) } }
     expect_raises(ArgumentError, /size/) { Pool(FakeConnection).new(size: -1) { FakeConnection.new(1) } }
