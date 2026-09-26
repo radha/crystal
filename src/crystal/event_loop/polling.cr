@@ -107,6 +107,11 @@ abstract class Crystal::EventLoop::Polling < Crystal::EventLoop
 
   @timers_lock = SpinLock.new
   @timers = Timers(Event).new
+  # When the system timer is armed (nil: disarmed). It is only ever armed at
+  # or before the earliest pending timer: deleting timers leaves it armed
+  # early (a spurious wakeup re-arms it in `process_timers`) instead of
+  # paying a syscall per cancelled timeout.
+  @timer_armed_at : Time::Instant? = nil
 
   # thread unsafe
   def run(blocking : Bool) : Bool
@@ -569,15 +574,21 @@ abstract class Crystal::EventLoop::Polling < Crystal::EventLoop
   protected def add_timer(event : Event*)
     @timers_lock.sync do
       is_next_ready = @timers.add(event)
-      system_set_timer(event.value.wake_at) if is_next_ready
+      if is_next_ready
+        wake_at = event.value.wake_at
+        armed_at = @timer_armed_at
+        arm_timer(wake_at) if armed_at.nil? || wake_at < armed_at
+      end
     end
   end
 
   protected def delete_timer(event : Event*) : Bool
     @timers_lock.sync do
-      dequeued, was_next_ready = @timers.delete(event)
-      # update system timer if we deleted the next timer
-      system_set_timer(@timers.next_ready?) if was_next_ready
+      dequeued, _ = @timers.delete(event)
+      # The system timer is deliberately left armed at the deleted timer's
+      # time: it fires early at worst, and `process_timers` re-arms it then.
+      # Re-arming here cost a syscall for every timeout that did not expire
+      # (`select ... when timeout` that got its value first).
       dequeued
     end
   end
@@ -623,7 +634,7 @@ abstract class Crystal::EventLoop::Polling < Crystal::EventLoop
       end
 
       if size > 0 || timer_triggered
-        system_set_timer(@timers.next_ready?)
+        arm_timer(@timers.next_ready?)
       end
     end
 
@@ -689,6 +700,13 @@ abstract class Crystal::EventLoop::Polling < Crystal::EventLoop
 
   # Identical to `#system_del` but yields on error.
   protected abstract def system_del(fd : Int32, closing = true, &) : Nil
+
+  # Arms the system timer and remembers when (see `@timer_armed_at`).
+  # Under `@timers_lock`.
+  private def arm_timer(time : Time::Instant?) : Nil
+    @timer_armed_at = time
+    system_set_timer(time)
+  end
 
   # Arm a timer to interrupt a run at *time*. Set to `nil` to disarm the timer.
   private abstract def system_set_timer(time : Time::Instant?) : Nil
