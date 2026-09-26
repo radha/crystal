@@ -57,11 +57,19 @@ class SortedMap(K, V)
   # A leaf node. Slots at or past `len` are cleared so that removed keys and
   # values are not kept alive by the GC.
   class Node(K, V)
-    @len = 0
-    @keys = uninitialized StaticArray(K, 11)
-    @vals = uninitialized StaticArray(V, 11)
+    # Declared with explicit types so that `@len` sits right after the type
+    # id, on the same cache line as the first keys.
+    @len : Int32
+    @keys : StaticArray(K, 11)
+    @vals : StaticArray(V, 11)
 
     property len : Int32
+
+    def initialize
+      @len = 0
+      @keys = uninitialized StaticArray(K, 11)
+      @vals = uninitialized StaticArray(V, 11)
+    end
 
     @[AlwaysInline]
     def keys : Pointer(K)
@@ -79,7 +87,12 @@ class SortedMap(K, V)
   # An internal node: `edges[i]` holds the keys ordered before `keys[i]`,
   # and `edges[len]` the keys after the last one.
   class Internal(K, V) < Node(K, V)
-    @edges = uninitialized StaticArray(Node(K, V), 12)
+    @edges : StaticArray(Node(K, V), 12)
+
+    def initialize
+      super
+      @edges = uninitialized StaticArray(Node(K, V), 12)
+    end
 
     @[AlwaysInline]
     def edges : Pointer(Node(K, V))
@@ -700,9 +713,7 @@ class SortedMap(K, V)
   # map.floor(5)  # => nil
   # ```
   def floor(key : K) : {K, V}?
-    cursor = Cursor(K, V).new(@height)
-    cursor.seek_le(@root, key, strict: false)
-    cursor.entry?
+    closest(key, below: true, strict: false)
   end
 
   # Returns the entry with the smallest key at or above *key*, or `nil` if
@@ -715,9 +726,7 @@ class SortedMap(K, V)
   # map.ceiling(25) # => nil
   # ```
   def ceiling(key : K) : {K, V}?
-    cursor = Cursor(K, V).new(@height)
-    cursor.seek_ge(@root, key, strict: false)
-    cursor.entry?
+    closest(key, below: false, strict: false)
   end
 
   # Returns the entry with the largest key strictly below *key*, or `nil`
@@ -729,9 +738,7 @@ class SortedMap(K, V)
   # map.lower(10) # => nil
   # ```
   def lower(key : K) : {K, V}?
-    cursor = Cursor(K, V).new(@height)
-    cursor.seek_le(@root, key, strict: true)
-    cursor.entry?
+    closest(key, below: true, strict: true)
   end
 
   # Returns the entry with the smallest key strictly above *key*, or `nil`
@@ -743,9 +750,39 @@ class SortedMap(K, V)
   # map.higher(20) # => nil
   # ```
   def higher(key : K) : {K, V}?
-    cursor = Cursor(K, V).new(@height)
-    cursor.seek_ge(@root, key, strict: true)
-    cursor.entry?
+    closest(key, below: false, strict: true)
+  end
+
+  # Finds the closest key below (or above) *key* in one descent, keeping the
+  # best candidate seen on the way down. An equal key is the answer unless
+  # *strict*.
+  private def closest(key : K, *, below : Bool, strict : Bool) : {K, V}?
+    node = @root
+    height = @height
+    best = nil
+    best_index = 0
+    while true
+      i, found = search(node, key)
+      if found
+        return {node.keys[i], node.vals[i]} unless strict
+        # Everything under edges[i] is below key and everything under
+        # edges[i + 1] above it.
+        i += 1 unless below
+      end
+      if below
+        if i > 0
+          best = node
+          best_index = i - 1
+        end
+      elsif i < node.len
+        best = node
+        best_index = i
+      end
+      break if height == 0
+      node = internal(node).edges[i]
+      height -= 1
+    end
+    {best.keys[best_index], best.vals[best_index]} if best
   end
 
   # Like `floor`, but returns only the key.
@@ -784,10 +821,7 @@ class SortedMap(K, V)
   def each(& : {K, V} ->) : Nil
     cursor = Cursor(K, V).new(@height)
     cursor.first(@root)
-    while cursor.valid?
-      yield cursor.entry
-      cursor.next
-    end
+    cursor.each_forward { |entry| yield entry }
   end
 
   # Returns an iterator over the entries in ascending key order.
@@ -816,14 +850,15 @@ class SortedMap(K, V)
       cursor.first(@root)
     end
     stop = range.end
-    while cursor.valid?
-      entry = cursor.entry
-      unless stop.nil?
+    if stop.nil?
+      cursor.each_forward { |entry| yield entry }
+    else
+      exclusive = range.excludes_end?
+      cursor.each_forward do |entry|
         c = cmp(entry[0], stop)
-        break if c > 0 || (c == 0 && range.excludes_end?)
+        break if c > 0 || (c == 0 && exclusive)
+        yield entry
       end
-      yield entry
-      cursor.next
     end
   end
 
@@ -837,10 +872,7 @@ class SortedMap(K, V)
   def reverse_each(& : {K, V} ->) : Nil
     cursor = Cursor(K, V).new(@height)
     cursor.last(@root)
-    while cursor.valid?
-      yield cursor.entry
-      cursor.prev
-    end
+    cursor.each_backward { |entry| yield entry }
   end
 
   # Returns an iterator over the entries in descending key order.
@@ -865,11 +897,13 @@ class SortedMap(K, V)
       cursor.last(@root)
     end
     start = range.begin
-    while cursor.valid?
-      entry = cursor.entry
-      break if !start.nil? && cmp(entry[0], start) < 0
-      yield entry
-      cursor.prev
+    if start.nil?
+      cursor.each_backward { |entry| yield entry }
+    else
+      cursor.each_backward do |entry|
+        break if cmp(entry[0], start) < 0
+        yield entry
+      end
     end
   end
 
@@ -1079,6 +1113,48 @@ class SortedMap(K, V)
     @[AlwaysInline]
     private def internal(node : Node(K, V)) : Internal(K, V)
       node.unsafe_as(Internal(K, V))
+    end
+
+    # Yields every entry from the current position onward. Within a leaf it
+    # loops over the keys directly, re-reading the length each time in case
+    # the block changes the map.
+    def each_forward(&) : Nil
+      while @level >= 0
+        node = @nodes.to_unsafe[@level]
+        i = @index.to_unsafe[@level]
+        if @level == @height
+          while i < node.len
+            yield({node.keys[i], node.vals[i]})
+            i += 1
+          end
+          @index.to_unsafe[@level] = i
+          ascend_forward
+        else
+          yield({node.keys[i], node.vals[i]})
+          self.next
+        end
+      end
+    end
+
+    # Yields every entry from the current position backward.
+    def each_backward(&) : Nil
+      while @level >= 0
+        node = @nodes.to_unsafe[@level]
+        i = @index.to_unsafe[@level]
+        if @level == @height
+          while i >= 0
+            i = node.len - 1 if i >= node.len
+            break if i < 0
+            yield({node.keys[i], node.vals[i]})
+            i -= 1
+          end
+          @index.to_unsafe[@level] = -1
+          ascend_backward
+        else
+          yield({node.keys[i], node.vals[i]})
+          prev
+        end
+      end
     end
 
     def first(root : Node(K, V)) : Nil
