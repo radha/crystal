@@ -273,16 +273,26 @@ module Postgres
 
     # Like the `as type : T.class` form, with rows read as a tuple of
     # *types* by column position.
-    def query_each(sql : String, *args, as types : Tuple, &) : Nil
-      query_each(sql, *args, as: ::Postgres.tuple_type(types)) { |row| yield row }
+    def query_each(sql : String, *args, as types : Tuple, fetch_size : Int32? = nil, &) : Nil
+      query_each(sql, *args, as: ::Postgres.tuple_type(types), fetch_size: fetch_size) { |row| yield row }
     end
 
     # Runs *sql* and yields each row decoded as *type* as it arrives,
     # without buffering the result. The connection is busy until the
     # iteration ends; if the block raises, the rest of the result is read
     # and discarded before the exception propagates.
-    def query_each(sql : String, *args, as type : T.class, & : T ->) : Nil forall T
-      extended(sql, args) { |row| yield Connection.decode_row(row, T) }
+    #
+    # With *fetch_size* the server sends that many rows at a time and the
+    # next batch is requested only after the block consumed the current
+    # one (a portal), so a huge result takes constant memory even when
+    # the block is slower than the network; if the block raises, the rest
+    # is never fetched. Without it the server streams the whole result and
+    # TCP flow control is the only brake.
+    def query_each(sql : String, *args, as type : T.class, fetch_size : Int32? = nil, & : T ->) : Nil forall T
+      if fetch_size && fetch_size <= 0
+        raise ArgumentError.new("fetch_size must be positive, got #{fetch_size}")
+      end
+      extended(sql, args, fetch_size: fetch_size) { |row| yield Connection.decode_row(row, T) }
     end
 
     # Runs *sql* and returns the first row decoded as *type*, ignoring the
@@ -601,15 +611,15 @@ module Postgres
     # Prepares (or finds) *sql*, binds *args*, executes and yields each
     # `DataRow` through a `RowReader`. Retries once after the server
     # dropped a cached statement, when that is safe (outside a transaction).
-    private def extended(sql : String, args : Tuple, want_result : Bool = false, & : RowReader ->) : ExecResult
+    private def extended(sql : String, args : Tuple, want_result : Bool = false, fetch_size : Int32? = nil, & : RowReader ->) : ExecResult
       enter
       begin
         idle = @transaction_status == 'I'
         begin
-          run_extended(sql, args, want_result) { |row| yield row }
+          run_extended(sql, args, want_result, fetch_size) { |row| yield row }
         rescue ex : StaleStatement
           raise ex.error unless idle
-          run_extended(sql, args, want_result) { |row| yield row }
+          run_extended(sql, args, want_result, fetch_size) { |row| yield row }
         end
       ensure
         leave
@@ -625,7 +635,12 @@ module Postgres
       end
     end
 
-    private def run_extended(sql : String, args : Tuple, want_result : Bool, & : RowReader ->) : ExecResult
+    #
+    # With *fetch_size* the rows come in batches through the unnamed
+    # portal: `Execute(fetch_size)` + `Flush`, and the next batch is only
+    # requested once the block consumed this one (`PortalSuspended`), so
+    # memory stays flat however slow the consumer. `Sync` ends it.
+    private def run_extended(sql : String, args : Tuple, want_result : Bool, fetch_size : Int32? = nil, & : RowReader ->) : ExecResult
       statement = prepare(sql)
       unless args.size == statement.param_oids.size
         raise ArgumentError.new("query expects #{statement.param_oids.size} parameters, got #{args.size}")
@@ -639,9 +654,10 @@ module Postgres
         raise ex
       end
       flush_closes
-      Messages::Execute.new(portal: "").write(@out)
-      @out.write(Messages::SYNC)
+      Messages::Execute.new(portal: "", max_rows: fetch_size || 0).write(@out)
+      @out.write(fetch_size ? Messages::FLUSH : Messages::SYNC)
       flush
+      synced = fetch_size.nil?
       reader = @reader ||= RowReader.new(statement.columns)
       reader.reset(statement.columns)
       result = ExecResult.new("", 0_i64)
@@ -663,8 +679,22 @@ module Postgres
         when 'C'
           # Only `exec` reports the tag; `query_*` skip building it.
           result = ExecResult.from_tag(parse { Messages::CommandComplete.from_slice(body) }.tag) if want_result
-        when '2', '3', 'I', 'n', 's'
-        when 'E' then error ||= parse { query_error(body) }
+          synced = sync unless synced
+        when 's'
+          # PortalSuspended: the batch is consumed; fetch the next one, or
+          # end the portal when the block failed.
+          if failure
+            synced = sync
+          else
+            Messages::Execute.new(portal: "", max_rows: fetch_size.not_nil!).write(@out)
+            @out.write(Messages::FLUSH)
+            flush
+          end
+        when '2', '3', 'I', 'n'
+        when 'E'
+          error ||= parse { query_error(body) }
+          # The server skips everything up to a Sync after an error.
+          synced = sync unless synced
         when 'Z'
           @transaction_status = ready_status(body)
           break
@@ -829,6 +859,13 @@ module Postgres
       lost(ex)
     ensure
       @out.clear
+    end
+
+    # Sends `Sync` (ending a cursor's implicit transaction and portal).
+    private def sync : Bool
+      @out.write(Messages::SYNC)
+      flush
+      true
     end
 
     # Reads one backend message into the receive buffer and returns its

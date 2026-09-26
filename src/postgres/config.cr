@@ -296,9 +296,9 @@ module Postgres
 
     # Returns the hosts in the order to try them: as given, or shuffled
     # with *random* when `#load_balance_hosts` is `LoadBalanceHosts::Random`.
-    def ordered_hosts(random : ::Random = ::Random::DEFAULT) : Array(Host)
+    def ordered_hosts(random : ::Random? = nil) : Array(Host)
       if @load_balance_hosts.random?
-        @hosts.shuffle(random)
+        random ? @hosts.shuffle(random) : @hosts.shuffle
       else
         @hosts.dup
       end

@@ -84,15 +84,15 @@ module Postgres
     ::Postgres.def_tuple_queries(query_all, query_one, query_one?)
 
     # :ditto:
-    def query_each(sql : String, *args, as types : Tuple, &) : Nil
-      query_each(sql, *args, as: ::Postgres.tuple_type(types)) { |row| yield row }
+    def query_each(sql : String, *args, as types : Tuple, fetch_size : Int32? = nil, &) : Nil
+      query_each(sql, *args, as: ::Postgres.tuple_type(types), fetch_size: fetch_size) { |row| yield row }
     end
 
     # See `Connection#query_each`. One connection is held until the
     # iteration ends.
-    def query_each(sql : String, *args, as type : T.class, & : T ->) : Nil forall T
+    def query_each(sql : String, *args, as type : T.class, fetch_size : Int32? = nil, & : T ->) : Nil forall T
       @pool.checkout do |conn|
-        conn.query_each(sql, *args, as: T) { |value| yield value }
+        conn.query_each(sql, *args, as: T, fetch_size: fetch_size) { |value| yield value }
       end
     end
 

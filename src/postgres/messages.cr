@@ -94,6 +94,7 @@ module Postgres
 
     # Body-less frontend messages: `Sync` (`S`), `Flush` (`H`), `Terminate` (`X`).
     SYNC      = Bytes['S'.ord, 0, 0, 0, 4]
+    FLUSH     = Bytes['H'.ord, 0, 0, 0, 4]
     TERMINATE = Bytes['X'.ord, 0, 0, 0, 4]
 
     struct CancelRequest
