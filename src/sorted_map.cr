@@ -46,8 +46,6 @@ class SortedMap(K, V)
   # keys. These match Rust's `BTreeMap`.
   private CAPACITY = 11
   private MIN_LEN  =  5
-  # Index of the key a full node moves up to its parent when it splits.
-  private MIDDLE = 5
   # Deepest tree the cursors can walk: 2 * 6**31 keys, more than fit in
   # memory.
   private MAX_LEVELS = 32
@@ -349,11 +347,12 @@ class SortedMap(K, V)
         return nil
       end
       right = Node(K, V).new
-      up_key, up_value = split_keys(node, right)
-      if i <= MIDDLE
+      middle = split_point(i)
+      up_key, up_value = split_keys(node, right, middle)
+      if i <= middle
         insert_at(node, i, key, value)
       else
-        insert_at(right, i - MIDDLE - 1, key, value)
+        insert_at(right, i - middle - 1, key, value)
       end
       return {up_key, up_value, right}
     end
@@ -374,29 +373,39 @@ class SortedMap(K, V)
       return nil
     end
     right = Internal(K, V).new
-    up_key, up_value = split_keys(parent, right)
-    right.edges.copy_from(parent.edges + MIDDLE + 1, CAPACITY - MIDDLE)
-    (parent.edges + MIDDLE + 1).clear(CAPACITY - MIDDLE)
-    if i <= MIDDLE
+    middle = split_point(i)
+    up_key, up_value = split_keys(parent, right, middle)
+    right.edges.copy_from(parent.edges + middle + 1, CAPACITY - middle)
+    (parent.edges + middle + 1).clear(CAPACITY - middle)
+    if i <= middle
       insert_edge_at(parent, i, key, value, edge, edge_first)
     else
-      insert_edge_at(right, i - MIDDLE - 1, key, value, edge, edge_first)
+      insert_edge_at(right, i - middle - 1, key, value, edge, edge_first)
     end
     {up_key, up_value, right}
   end
 
-  # Moves the keys after `MIDDLE` of the full *node* into the empty *right*
-  # and returns the middle key and value, which leave *node*.
-  private def split_keys(node : Node(K, V), right : Node(K, V)) : {K, V}
-    right_len = CAPACITY - MIDDLE - 1
-    right.keys.copy_from(node.keys + MIDDLE + 1, right_len)
-    right.vals.copy_from(node.vals + MIDDLE + 1, right_len)
+  # Index of the key that moves up when a full node splits to make room
+  # at index *i*. As in Rust, the side that receives the new key ends up
+  # with 5 or 6 keys and the other side with the rest, so appending in
+  # order leaves nodes with 6 keys rather than 5.
+  @[AlwaysInline]
+  private def split_point(i : Int32) : Int32
+    i < 5 ? 4 : (i <= 6 ? 5 : 6)
+  end
+
+  # Moves the keys after index *middle* of the full *node* into the empty
+  # *right* and returns the key and value at *middle*, which leave *node*.
+  private def split_keys(node : Node(K, V), right : Node(K, V), middle : Int32) : {K, V}
+    right_len = CAPACITY - middle - 1
+    right.keys.copy_from(node.keys + middle + 1, right_len)
+    right.vals.copy_from(node.vals + middle + 1, right_len)
     right.len = right_len
-    key = node.keys[MIDDLE]
-    value = node.vals[MIDDLE]
-    (node.keys + MIDDLE).clear(CAPACITY - MIDDLE)
-    (node.vals + MIDDLE).clear(CAPACITY - MIDDLE)
-    node.len = MIDDLE
+    key = node.keys[middle]
+    value = node.vals[middle]
+    (node.keys + middle).clear(CAPACITY - middle)
+    (node.vals + middle).clear(CAPACITY - middle)
+    node.len = middle
     {key, value}
   end
 
