@@ -158,3 +158,31 @@ pgx; MT 1.28× behind). `Postgres::Client` on `Pool(T)` now matches the
 raw channel pool, so the pool overhead is gone; the remaining gap is the
 single-threaded runtime serializing the syscalls (see note 8). Target
 (3) is still missed. Hotspots 4–7 remain open (slice 2 backlog).
+
+## Rerun after runtime fixes (2026-09-26, after the container restart)
+
+Three more changes, all in the stdlib:
+
+- `98496ad` event loop: lazy system-timer re-arm. Every pool waiter's
+  cancelled `select ... timeout` cost a `timerfd_settime`; 129,804 calls
+  per run → 6.
+- `11537bd` `Pool(T)`: permit counter under the mutex, channel only for
+  hand-offs to real waiters; an uncontended checkout allocates nothing
+  (`Client#query_one` 64 → 0 bytes/op).
+- `91fc30e` `Parallel` scheduler: after the event loop readies several
+  fibers, wake up to one parked scheduler per extra fiber. Before, a
+  4-worker context ran this benchmark on 2 threads.
+
+Medians of 3 runs of `./run.sh`, same sitting for all:
+
+| metric | crystal | go | rust | crystal-mt(4w) |
+|---|---:|---:|---:|---:|
+| seq mean µs | **60.2** | 92.9 | 130.1 | — |
+| seq p50 / p99 µs | **55.8 / 113.0** | 84.5 / 200.3 | 120.3 / 249.5 | — |
+| fetch ms per 10k rows | **4.77** | 8.34 | 7.12 | — |
+| pool ops/s | 42 500 | 57 191 | 58 896 | **67 645** |
+
+With the multi-threaded runtime Crystal now leads bench 3 too (1.18× pgx,
+1.15× tokio-postgres). The single-threaded default stays ~1.35× behind:
+it is one core against Go's and tokio's four, spending most of it in the
+kernel on `write`/`read` (one of each per query, the minimum).
