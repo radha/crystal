@@ -36,8 +36,8 @@ module RedisSpec
     getter port : Int32
     getter accepted = 0
 
-    def initialize(&handler : IO ->)
-      @server = TCPServer.new("127.0.0.1", 0)
+    def initialize(@host : String = "127.0.0.1", &handler : IO ->)
+      @server = TCPServer.new(@host, 0)
       @port = @server.local_address.port
       spawn do
         while client = @server.accept?
@@ -55,7 +55,8 @@ module RedisSpec
     end
 
     def url : String
-      "redis://127.0.0.1:#{@port}"
+      host = @host.includes?(':') ? "[#{@host}]" : @host
+      "redis://#{host}:#{@port}"
     end
 
     def close : Nil
@@ -77,6 +78,17 @@ module RedisSpec
       io.flush
       true
     end
+  end
+
+  # An `Array(Redis::Value)` of *items*, for comparing against replies.
+  #
+  # Not `items.map(&.as(Redis::Value)).to_a`: `Tuple#map` fails to compile
+  # once one of *items* is itself an `Array(Redis::Value)` (a nested
+  # `values(...)` call), a quirk of `Redis::Value`'s self-referential
+  # alias tripping up the block's inferred type across heterogeneous tuple
+  # elements.
+  def self.values(*items) : Array(Redis::Value)
+    Array(Redis::Value).new(items.size) { |i| items[i].as(Redis::Value) }
   end
 
   # One pub/sub frame as the server sends it: a RESP3 push (`>`) or a

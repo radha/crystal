@@ -245,7 +245,7 @@ module Redis
                    @client_name : String? = nil, protocol @protocol_option : Int32 = 3,
                    @connect_timeout : Time::Span = 5.seconds, @read_timeout : Time::Span? = nil,
                    @tls_context : OpenSSL::SSL::Context::Client? = nil, @max_bulk_size : Int32 = RESP::MAX_BULK_SIZE,
-                   @pool_size : Int32 = 4, @max_redirects : Int32 = 5)
+                   @pool_size : Int32 = 4, @checkout_timeout : Time::Span = 5.seconds, @max_redirects : Int32 = 5)
       raise ArgumentError.new("at least one seed is required") if seeds.empty?
       raise ArgumentError.new("protocol must be 2 or 3, got #{@protocol_option}") unless @protocol_option == 2 || @protocol_option == 3
       raise ArgumentError.new("pool_size must be positive, got #{@pool_size}") unless @pool_size > 0
@@ -501,11 +501,14 @@ module Redis
 
     # Iterates every key matching *match* on every master in turn. `SCAN`
     # cursors are per node, so this is the only sensible form of `SCAN`
-    # on a cluster.
+    # on a cluster. Raises `ClusterError` if the cluster has no masters.
     def scan_each(*, match : String? = nil, count : Int? = nil, type : String? = nil, & : String ->) : Nil
       check_open
       refresh_if_stale
-      masters = @mutex.synchronize { @masters.dup }
+      masters = @mutex.synchronize do
+        raise ClusterError.new("cluster has no masters") if @masters.empty?
+        @masters.dup
+      end
       masters.each do |node|
         node.client.scan_each(match: match, count: count, type: type) { |key| yield key }
       end
@@ -513,6 +516,8 @@ module Redis
 
     # Every node the last topology load reported, masters first in the
     # order `CLUSTER SLOTS` listed them. Empty before the first command.
+    # A master first learned from a `MOVED` or `ASK` redirect joins the list
+    # at the next reload, although `node_for` may already return it.
     def nodes : Array(Node)
       @mutex.synchronize { @masters + @nodes.values.reject(&.master?) }
     end
@@ -604,13 +609,9 @@ module Redis
     # the command's reply, raising an error reply so the loop can act on
     # a further redirect.
     private def ask(node : Node, args : Indexable) : Value
-      replies = node.client.pipelined do |p|
-        p.command("ASKING")
-        p.command(args)
-      end
-      value = replies[1]
-      raise value if value.is_a?(CommandError)
-      value
+      io = IO::Memory.new
+      RESP.write_command(io, args)
+      node.client.call_raw(io.to_slice, asking: true)
     end
 
     # `MOVED 3999 127.0.0.1:6381` → `{3999, node}`; same for `ASK`.
@@ -624,7 +625,7 @@ module Redis
       colon = address.rindex(':') || raise ProtocolError.new("malformed redirect #{error.message.inspect}")
       host = address[0, colon]
       port = address[colon + 1..].to_i? || raise ProtocolError.new("malformed redirect #{error.message.inspect}")
-      host = @seeds.first.host.presence || "localhost" if host.empty?
+      host = @seeds.first.hostname.presence || "localhost" if host.empty?
       {slot, node_at(host, port)}
     end
 
@@ -633,6 +634,7 @@ module Redis
     private def node_at(host : String, port : Int32) : Node
       address = "#{host}:#{port}"
       @mutex.synchronize do
+        check_open
         @nodes[address] ||= new_node(host, port, "", true)
       end
     end
@@ -667,7 +669,7 @@ module Redis
       end
       tried = masters.map(&.address)
       @seeds.each do |seed|
-        host = seed.host.presence || "localhost"
+        host = seed.hostname.presence || "localhost"
         port = seed.port || 6379
         next if tried.includes?("#{host}:#{port}")
         begin
@@ -688,14 +690,17 @@ module Redis
       raise ClusterError.new("no cluster node reachable: #{last_error.try(&.message)}", cause: last_error)
     end
 
+    # IPv6 literals arrive bare (`::1`) in redirects and `CLUSTER SLOTS`;
+    # a URI host needs them bracketed, and `Connection` unwraps them again.
     private def node_uri(host : String, port : Int32) : URI
-      URI.new(scheme: @scheme, host: host, port: port)
+      URI.new(scheme: @scheme, host: host.includes?(':') ? "[#{host}]" : host, port: port)
     end
 
     private def node_client(host : String, port : Int32) : Client
       Client.new(node_uri(host, port), username: @username, password: @password, client_name: @client_name,
         protocol: @protocol_option, connect_timeout: @connect_timeout, read_timeout: @read_timeout,
-        tls_context: @tls_context, max_bulk_size: @max_bulk_size, pool_size: @pool_size)
+        tls_context: @tls_context, max_bulk_size: @max_bulk_size, pool_size: @pool_size,
+        checkout_timeout: @checkout_timeout)
     end
 
     private def new_node(host : String, port : Int32, id : String, master : Bool) : Node
@@ -753,6 +758,8 @@ module Redis
         assignments << {first.to_i, last.to_i, master_address}
       end
       gone, demoted = @mutex.synchronize do
+        # A reload racing `close` must not install nodes nobody closes.
+        check_open
         nodes = {} of String => Node
         leaving = [] of Node
         described.each do |address, desc|
@@ -761,9 +768,9 @@ module Redis
           node.id = desc[:id] unless desc[:id].empty?
           # A master this reload keeps may have been closed by an earlier
           # one that listed it as a replica, or as gone; it serves
-          # commands again, so let it open a client. Never after `close`:
-          # nobody would close that client.
-          node.reopen if desc[:master] && !@closed
+          # commands again, so let it open a client (`check_open` above
+          # rules out doing so after `close`).
+          node.reopen if desc[:master]
           nodes[address] = node
           leaving << node unless desc[:master]
         end

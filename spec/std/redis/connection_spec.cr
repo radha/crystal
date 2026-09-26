@@ -252,6 +252,24 @@ describe Redis::Connection do
     unix.close
     File.delete?(path)
   end
+
+  it "connects to a bracketed IPv6 URL" do
+    server = begin
+      RedisSpec::FakeServer.new("::1") do |io|
+        while cmd = RedisSpec::FakeServer.read_command(io)
+          io << (cmd[0] == "HELLO" ? RedisSpec::HELLO_REPLY : "+PONG\r\n")
+          io.flush
+        end
+      end
+    rescue Socket::Error
+      pending!("no IPv6 loopback")
+    end
+    server.url.should start_with("redis://[::1]:")
+    conn = Redis::Connection.new(server.url)
+    conn.ping.should eq("PONG")
+    conn.close
+    server.close
+  end
 end
 
 describe "Redis::Connection#watching?" do

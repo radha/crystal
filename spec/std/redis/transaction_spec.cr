@@ -2,15 +2,6 @@
 require "spec"
 require "../../support/redis"
 
-private def values(*items) : Array(Redis::Value)
-  # Not `items.map(&.as(Redis::Value)).to_a`: `Tuple#map` fails to compile
-  # once one of *items* is itself an `Array(Redis::Value)` (a nested
-  # `values(...)` call), a quirk of `Redis::Value`'s self-referential
-  # alias tripping up the block's inferred type across heterogeneous tuple
-  # elements.
-  Array(Redis::Value).new(items.size) { |i| items[i].as(Redis::Value) }
-end
-
 describe Redis::Transaction do
   it "wraps the commands in MULTI and EXEC and fans the EXEC array out" do
     p = Redis::Pipeline.new
@@ -35,9 +26,9 @@ describe Redis::Transaction do
     p.resolve(2, "QUEUED")
     p.resolve(3, "QUEUED")
     f1.not_nil!.resolved?.should be_false
-    p.resolve(4, values("OK", 7_i64))
+    p.resolve(4, RedisSpec.values("OK", 7_i64))
     before.value.should eq("v")
-    exec.value.should eq(values("OK", 7_i64))
+    exec.value.should eq(RedisSpec.values("OK", 7_i64))
     f1.not_nil!.value.should eq("OK")
     f2.not_nil!.value.should eq(7_i64)
   end
@@ -84,8 +75,8 @@ describe Redis::Transaction do
     p.resolve(1, "QUEUED")
     p.resolve(2, "QUEUED")
     err = Redis::CommandError.new("ERR runtime failure")
-    p.resolve(3, values(err, 1_i64))
-    exec.value.should eq(values(err, 1_i64))
+    p.resolve(3, RedisSpec.values(err, 1_i64))
+    exec.value.should eq(RedisSpec.values(err, 1_i64))
     expect_raises(Redis::CommandError, /runtime/) { f1.not_nil!.value }
     f2.not_nil!.value.should eq(1_i64)
   end
@@ -107,7 +98,7 @@ describe Redis::Transaction do
     exec = p.multi { |tx| f = tx.incr("n") }
     p.resolve(0, "OK")
     p.resolve(1, "QUEUED")
-    p.resolve(2, values(1_i64, 2_i64))
+    p.resolve(2, RedisSpec.values(1_i64, 2_i64))
     expect_raises(Redis::ProtocolError, /2 replies for 1/) { exec.value }
     expect_raises(Redis::ProtocolError) { f.not_nil!.value }
   end
@@ -149,7 +140,7 @@ describe Redis::Transaction do
     p.buffer.to_s.should contain("EVALSHA")
     p.resolve(0, "OK")
     p.resolve(1, "QUEUED")
-    p.resolve(2, values(1_i64))
+    p.resolve(2, RedisSpec.values(1_i64))
     f.not_nil!.value.should eq(1_i64)
   end
 end
@@ -166,6 +157,9 @@ private class TxServer
   property abort = false
   # Closes the socket on `UNWATCH` instead of answering it.
   property die_on_unwatch = false
+  # Sent verbatim in answer to `UNWATCH` when set; an empty string
+  # never answers, so the client's `read_timeout` fires.
+  property unwatch_reply : String? = nil
 
   def server
     RedisSpec::FakeServer.new do |io|
@@ -208,7 +202,11 @@ private class TxServer
                 io.close
                 break
               end
-              io << "+OK\r\n"
+              if reply = @unwatch_reply
+                io << reply
+              else
+                io << "+OK\r\n"
+              end
             else
               io << reply_for(cmd)
             end
@@ -248,7 +246,7 @@ describe "Redis::Client#multi" do
       f1 = tx.set("a", "1")
       f2 = tx.incr("n")
     end
-    replies.should eq(values("OK", 1_i64))
+    replies.should eq(RedisSpec.values("OK", 1_i64))
     f1.not_nil!.value.should eq("OK")
     f2.not_nil!.value.should eq(1_i64)
     fake.chunks.should eq([1, 1, 4])
@@ -266,8 +264,8 @@ describe "Redis::Client#multi" do
       p.get("x")
       exec = p.multi { |tx| tx.incr("n") }
     end
-    raw.should eq(values("v", "OK", "QUEUED", values(1_i64)))
-    exec.not_nil!.value.should eq(values(1_i64))
+    raw.should eq(RedisSpec.values("v", "OK", "QUEUED", RedisSpec.values(1_i64)))
+    exec.not_nil!.value.should eq(RedisSpec.values(1_i64))
     client.close
     server.close
   end
@@ -343,11 +341,11 @@ describe "Redis::Connection#pipelined and #multi" do
       p.get("x")
       f = p.incr("n")
     end
-    raw.should eq(values("v", 1_i64))
+    raw.should eq(RedisSpec.values("v", 1_i64))
     f.not_nil!.value.should eq(1_i64)
     fake.chunks.should eq([1, 2])
     g = nil
-    conn.multi { |tx| g = tx.incr("n") }.should eq(values(1_i64))
+    conn.multi { |tx| g = tx.incr("n") }.should eq(RedisSpec.values(1_i64))
     g.not_nil!.value.should eq(1_i64)
     fake.chunks.should eq([1, 2, 3])
     # The mismatch is detected when the future is read, not on the socket,
@@ -397,7 +395,7 @@ describe "Redis::Client#watch" do
       conn.get("k1").should eq("v")
       conn.multi { |tx| tx.set("k1", "w") }
     end
-    result.should eq(values("OK"))
+    result.should eq(RedisSpec.values("OK"))
     server.accepted.should eq(2)
     inner.not_nil!.closed?.should be_false
     # Once from the client's own connection, once from the pooled one.
@@ -458,5 +456,24 @@ describe "Redis::Client#watch" do
     fake.seen.last.should eq(["UNWATCH"])
     client.close
     server.close
+  end
+
+  {"times out" => "", "answers garbage" => "?junk\r\n"}.each do |failure, reply|
+    it "keeps the block's exception when UNWATCH #{failure}" do
+      fake = TxServer.new
+      server = fake.server
+      client = Redis::Client.new(server.url, read_timeout: 100.milliseconds)
+      client.ping
+      fake.unwatch_reply = reply
+      expect_raises(Exception, "boom") { client.watch("k") { |conn| raise "boom" } }
+      fake.seen.last.should eq(["UNWATCH"])
+      # That failure closed the pooled connection, so it was dropped.
+      fake.unwatch_reply = nil
+      accepted = server.accepted
+      client.watch("k") { |conn| conn.get("k") }.should eq("v")
+      server.accepted.should eq(accepted + 1)
+      client.close
+      server.close
+    end
   end
 end

@@ -1,10 +1,6 @@
 require "spec"
 require "../../support/redis"
 
-private def values(*items) : Array(Redis::Value)
-  Array(Redis::Value).new(items.size) { |i| items[i].as(Redis::Value) }
-end
-
 # Opens a cluster client, flushes every master, yields, closes.
 private def with_cluster(live : RedisSpec::LiveCluster, protocol : Int32, &block : Redis::Cluster ->)
   cluster = Redis::Cluster.new(live.urls, protocol: protocol)
@@ -72,7 +68,7 @@ private def live_cluster_specs(protocol : Int32)
 
     pending_cluster "runs multi on one slot and raises CROSSSLOT across slots" do |live|
       with_cluster(live, protocol) do |c|
-        c.multi { |tx| tx.incr("{m}a"); tx.incr("{m}b") }.should eq(values(1_i64, 1_i64))
+        c.multi { |tx| tx.incr("{m}a"); tx.incr("{m}b") }.should eq(RedisSpec.values(1_i64, 1_i64))
         error = expect_raises(Redis::CommandError, /CROSSSLOT/) { c.mget("a", "b") }
         error.code.should eq("CROSSSLOT")
       end
@@ -139,7 +135,7 @@ private def live_cluster_specs(protocol : Int32)
             pushed.send(nil)
           end
         end
-        c.with_connection("q") { |conn| conn.call("BLPOP", "q", 2) }.should eq(values("q", "job"))
+        c.with_connection("q") { |conn| conn.call("BLPOP", "q", 2) }.should eq(RedisSpec.values("q", "job"))
         # `BLPOP` can answer before the push's own reply has been read;
         # wait for it so the client is not closed with it still in flight.
         pushed.receive
@@ -152,7 +148,7 @@ private def live_cluster_specs(protocol : Int32)
         c.run(script, keys: ["s1"]).should eq(1_i64)
         c.run(script, keys: ["s2"]).should eq(1_i64)
         c.run(script, keys: ["s2"]).should eq(2_i64)
-        c.watch("{w}a") { |conn| conn.multi { |tx| tx.set("{w}a", "1") } }.should eq(values("OK"))
+        c.watch("{w}a") { |conn| conn.multi { |tx| tx.set("{w}a", "1") } }.should eq(RedisSpec.values("OK"))
         c.get("{w}a").should eq("1")
       end
     end

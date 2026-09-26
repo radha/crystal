@@ -79,13 +79,14 @@ module Redis
     # reapplied on each reconnect. *read_timeout* bounds how long a single
     # command waits for its reply before the connection is torn down.
     # *pool_size* bounds the dedicated connections `with_connection` and
-    # `watch` borrow. Raises `ArgumentError` if *protocol* is outside
+    # `watch` borrow, and *checkout_timeout* how long they wait for one to
+    # come free. Raises `ArgumentError` if *protocol* is outside
     # `2..3`.
     def initialize(url : String | URI = Connection::DEFAULT_URL, *, @db : Int32? = nil, @username : String? = nil,
                    @password : String? = nil, @client_name : String? = nil, protocol @protocol_option : Int32 = 3,
                    @connect_timeout : Time::Span = 5.seconds, @read_timeout : Time::Span? = nil,
                    @tls_context : OpenSSL::SSL::Context::Client? = nil, @max_bulk_size : Int32 = RESP::MAX_BULK_SIZE,
-                   @pool_size : Int32 = 4)
+                   @pool_size : Int32 = 4, @checkout_timeout : Time::Span = 5.seconds)
       @url = url.is_a?(URI) ? url : URI.parse(url)
       raise ArgumentError.new("protocol must be 2 or 3, got #{@protocol_option}") unless @protocol_option == 2 || @protocol_option == 3
       raise ArgumentError.new("pool_size must be positive, got #{@pool_size}") unless @pool_size > 0
@@ -291,12 +292,12 @@ module Redis
     # for the read-then-`multi` sequence, and hands it back. Returns the
     # block's value. If the block leaves without having run `multi` (it
     # returned early or raised), `UNWATCH` is sent so the watch cannot leak
-    # to the connection's next borrower; a `ConnectionError` from that
-    # `UNWATCH` is not raised, since the connection is closed by then and
-    # the pool drops it, so the block's own outcome always reaches the
-    # caller. An `AbortedError` raised by
-    # `Connection#multi` inside the block means a watched key changed;
-    # retrying is the caller's loop:
+    # to the connection's next borrower. A `ConnectionError`,
+    # `IO::TimeoutError` or `ProtocolError` from that `UNWATCH` is not
+    # raised: each of them closed the connection, so the pool drops it and
+    # the block's own outcome always reaches the caller. An `AbortedError`
+    # raised by `Connection#multi` inside the block means a watched key
+    # changed; retrying is the caller's loop:
     #
     # ```
     # loop do
@@ -321,12 +322,12 @@ module Redis
         ensure
           begin
             conn.unwatch if conn.watching? && !conn.closed?
-          rescue ConnectionError
-            # `UNWATCH` is a round trip and can fail on its own. The
-            # failure closed the connection, so the pool drops it and the
-            # watch dies with it; raising here instead would replace
-            # whatever the block raised (an `AbortedError` the caller
-            # retries on, say) with this.
+          rescue ConnectionError | IO::TimeoutError | ProtocolError
+            # `UNWATCH` is a round trip and can fail on its own. Each of
+            # these failures closed the connection, so the pool drops it
+            # and the watch dies with it; raising here instead would
+            # replace whatever the block raised (an `AbortedError` the
+            # caller retries on, say) with this.
           end
         end
       end
@@ -355,9 +356,10 @@ module Redis
     # The connection carries the client's `read_timeout`; a blocking
     # command that may wait longer needs a client created with
     # `read_timeout: nil` or a `Connection` of its own. At most `pool_size`
-    # connections are out at once; the next caller waits up to five
-    # seconds and then raises `PoolTimeoutError`. See `Pool#checkout` for
-    # what happens when the block raises.
+    # connections are out at once; the next caller waits up to
+    # `checkout_timeout` (five seconds by default) and then raises
+    # `PoolTimeoutError`. See `Pool#checkout` for what happens when the
+    # block raises.
     def with_connection(&block : Connection -> T) : T forall T
       pool.checkout(&block)
     end
@@ -365,9 +367,10 @@ module Redis
     private def pool : Pool
       @mutex.synchronize do
         check_open
-        @pool ||= Pool.new(@url, size: @pool_size, db: @db, username: @username, password: @password,
-          client_name: @client_name, protocol: @protocol_option, connect_timeout: @connect_timeout,
-          read_timeout: @read_timeout, tls_context: @tls_context, max_bulk_size: @max_bulk_size)
+        @pool ||= Pool.new(@url, size: @pool_size, checkout_timeout: @checkout_timeout, db: @db,
+          username: @username, password: @password, client_name: @client_name, protocol: @protocol_option,
+          connect_timeout: @connect_timeout, read_timeout: @read_timeout, tls_context: @tls_context,
+          max_bulk_size: @max_bulk_size)
       end
     end
 

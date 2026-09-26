@@ -93,7 +93,7 @@ module Redis
                          tls_context : OpenSSL::SSL::Context::Client?) : IO
       case url.scheme
       when "redis", "rediss"
-        host = url.host.presence || "localhost"
+        host = url.hostname.presence || "localhost"
         port = url.port || 6379
         tcp = TCPSocket.new(host, port, connect_timeout: connect_timeout)
         begin

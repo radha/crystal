@@ -253,6 +253,17 @@ describe Redis::Client do
     server.close
   end
 
+  it "waits checkout_timeout for a pooled connection" do
+    script = Script.new
+    server = script.server
+    client = Redis::Client.new(server.url, pool_size: 1, checkout_timeout: 30.milliseconds)
+    client.with_connection do
+      expect_raises(Redis::PoolTimeoutError, /30/) { client.with_connection { } }
+    end
+    client.close
+    server.close
+  end
+
   it "rejects a non-positive pool size" do
     expect_raises(ArgumentError, /pool_size/) { Redis::Client.new(pool_size: 0) }
   end

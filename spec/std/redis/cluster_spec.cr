@@ -26,10 +26,6 @@ private def fake_two(&override : RedisSpec::FakeCluster, Int32, Array(String), I
   end
 end
 
-private def values(*items) : Array(Redis::Value)
-  Array(Redis::Value).new(items.size) { |i| items[i].as(Redis::Value) }
-end
-
 private def dead_port : Int32
   server = TCPServer.new("127.0.0.1", 0)
   port = server.local_address.port
@@ -226,6 +222,24 @@ describe Redis::Cluster do
     keys = [] of String
     cluster.scan_each { |key| keys << key }
     keys.sort.should eq(["k0", "k1"])
+    cluster.close
+    fake.close
+  end
+
+  it "raises ClusterError from scan_each when the map has no masters" do
+    fake = RedisSpec::FakeCluster.new(1, [] of {Int32, Int32, Int32}) { }
+    cluster = Redis::Cluster.new(fake.url(0))
+    expect_raises(Redis::ClusterError, /no masters/) { cluster.scan_each { } }
+    cluster.close
+    fake.close
+  end
+
+  it "keeps IPv6 hosts from CLUSTER SLOTS bare in node addresses" do
+    fake = fake_two { false }
+    fake.host = "::1"
+    cluster = Redis::Cluster.new(fake.url(0))
+    cluster.refresh
+    cluster.nodes.map(&.address).should eq(["::1:#{fake.port(0)}", "::1:#{fake.port(1)}"])
     cluster.close
     fake.close
   end
@@ -432,7 +446,7 @@ describe "Redis::Cluster#pipelined" do
       p.command("PING")     # any master
     end
     replies.size.should eq(5)
-    replies[0..3].should eq(values("v", "v", "OK", "v"))
+    replies[0..3].should eq(RedisSpec.values("v", "v", "OK", "v"))
     replies[4].should eq("PONG")
     futures.map(&.value).should eq(["v", "v", "v"])
     fake.commands(0).reject { |c| c[0] == "PING" }.should eq([["CLUSTER", "SLOTS"], ["GET", "b"], ["GET", "k"]])
@@ -465,7 +479,7 @@ describe "Redis::Cluster#pipelined" do
       b = p.get("b")
       k = p.get("k")
     end
-    replies.should eq(values("v", "v", "v"))
+    replies.should eq(RedisSpec.values("v", "v", "v"))
     b.not_nil!.value.should eq("v")
     k.not_nil!.value.should eq("v")
     fake.commands(1).should eq([["GET", "a"], ["GET", "b"], ["ASKING"], ["GET", "k"]])
@@ -492,7 +506,7 @@ describe "Redis::Cluster#pipelined" do
       p.get("b")
       p.get("k")
       p.get("c")
-    end.should eq(values("v", "v", "v"))
+    end.should eq(RedisSpec.values("v", "v", "v"))
     fake.commands(1).should eq([["GET", "a"], ["GET", "b"], ["GET", "k"], ["GET", "c"]])
     # Every MOVED marks the map stale, but a retry takes its node from the
     # redirect itself instead of routing, so no reload happens between the
@@ -528,12 +542,12 @@ describe "Redis::Cluster#pipelined" do
       p.get("k")
     end
     replies.size.should eq(6)
-    exec.not_nil!.value.should eq(values(1_i64, 2_i64))
+    exec.not_nil!.value.should eq(RedisSpec.values(1_i64, 2_i64))
     a.not_nil!.value.should eq(1_i64)
     b.not_nil!.value.should eq(2_i64)
     fake.commands(1).should eq([["MULTI"], ["INCR", "{t}a"], ["INCR", "{t}b"], ["EXEC"]])
     fake.commands(0).should eq([["CLUSTER", "SLOTS"], ["GET", "b"], ["GET", "k"]])
-    cluster.multi { |tx| tx.incr("{t}a"); tx.incr("{t}b") }.should eq(values(1_i64, 2_i64))
+    cluster.multi { |tx| tx.incr("{t}a"); tx.incr("{t}b") }.should eq(RedisSpec.values(1_i64, 2_i64))
     cluster.close
     fake.close
   end
