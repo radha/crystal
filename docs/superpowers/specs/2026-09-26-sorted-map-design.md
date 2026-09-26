@@ -93,11 +93,32 @@ modeled on Rust's `BTreeMap`.
   with invariants and ranges checked, all bulk sizes 0..3000, and String
   keys changed during block and iterator walks with forced GCs.
 
+## Second round (same day)
+
+- **delete_range by split and join.** Ranges of more than 32 keys are cut
+  out with `split_node` at each end: an O(height) walk that moves the
+  suffix of each node on the path into a new right node. Then
+  `fix_right_border` / `fix_left_border` repair the cut edges top-down.
+  Each short border node is topped up from its sibling, or merged with it
+  when the two fit in one node. Internal nodes are topped up to MIN_LEN + 1
+  so that merging one level down cannot underflow them. `count_keys`
+  sizes the middle, and `join` concatenates the outer trees. `join` pops
+  the left tree's largest key as separator, then either concatenates two
+  roots of equal height or hangs the shorter tree off the other's spine
+  (`append_right` / `append_left`), merging or balancing with the
+  neighbour and splitting upward if needed. The rebalancing primitives
+  (`shift_left`, `shift_right`, `concat`) no longer need a shared parent.
+  A branch-coverage-instrumented fuzzer hit every join and fix branch.
+  About 150K checked range deletions across 31 seeds.
+- **Split point as in Rust** (index 4/5/6 by insert position).
+- **JSON/YAML** as opt-in `sorted_map/json`, `sorted_map/yaml`,
+  `sorted_set/json`, `sorted_set/yaml` (the `uuid/json` pattern).
+
 ## Deviations and follow-ups
 
-- `delete_range` is O(k log n) (collect, then delete). Split/join would
-  make it O(log n + k).
-- No comparator block (a user decision). No `to_json` / `YAML`
-  serialization yet.
-- Capacity is fixed at 11 regardless of `sizeof(K)`. Not tuned, since the
-  1.5× target was met without it.
+- No comparator block (a user decision).
+- Capacity is fixed at 11 regardless of `sizeof(K)`.
+- A 1M bulk build is 1.2-1.7x Rust, from fresh-memory cost (a node arena
+  would be the fix).
+- No public `split_off` / `append` yet. The machinery exists
+  (`split_node` + border fixes + `join`), so exposing it is small.

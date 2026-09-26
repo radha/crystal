@@ -42,37 +42,39 @@ when it is actually faster.
 
 ## Results (ns/op; ratio = Crystal / Rust)
 
+Best of three alternating runs, after the second round (split point, split/join).
+
 | op | n | Crystal | Rust | ratio | Go |
 |---|---|---:|---:|---:|---:|
-| insert_rand | 1K | 60.5 | 44.9 | 1.35 | 87.5 |
-| insert_seq | 1K | 78.9 | 60.3 | 1.31 | 49.4 |
-| bulk_sorted | 1K | 12.5 | 8.5 | 1.47 | n/a |
-| get_hit | 1K | 26.8 | 22.3 | 1.20 | 75.6 |
-| iter_all | 1K | 0.9 | 1.6 | 0.56 | 3.7 |
-| range_100 | 1K | 1.9 | 1.5 | 1.27 | 4.6 |
-| floor | 1K | 20.9 | 21.9 | 0.95 | 93.5 |
-| delete_rand | 1K | 73.0 | 49.9 | 1.46 | 93.5 |
-| insert_rand | 100K | 163.2 | 135.0 | 1.21 | 275.4 |
-| insert_seq | 100K | 99.1 | 80.5 | 1.23 | 93.0 |
-| bulk_sorted | 100K | 12.9 | 12.3 | 1.05 | n/a |
-| get_hit | 100K | 111.0 | 111.3 | 1.00 | 292.1 |
-| iter_all | 100K | 0.8 | 1.3 | 0.62 | 7.0 |
-| range_100 | 100K | 2.3 | 2.2 | 1.05 | 11.7 |
-| floor | 100K | 128.1 | 123.4 | 1.04 | 299.9 |
-| delete_rand | 100K | 158.1 | 137.1 | 1.15 | 270.4 |
-| insert_rand | 1M | 301.2 | 310.3 | 0.97 | 437.6 |
-| insert_seq | 1M | 120.5 | 102.5 | 1.18 | 104.8 |
-| bulk_sorted | 1M | 17.0 | 15.8 | 1.08 | n/a |
-| get_hit | 1M | 222.5 | 279.5 | 0.80 | 492.6 |
-| iter_all | 1M | 1.4 | 1.8 | 0.78 | 5.3 |
-| range_100 | 1M | 6.0 | 5.6 | 1.07 | 10.8 |
-| floor | 1M | 233.3 | 264.3 | 0.88 | 571.3 |
-| delete_rand | 1M | 312.7 | 277.2 | 1.13 | 556.3 |
+| insert_rand | 1000 | 51.3 | 42.6 | 1.20 | 85.7 |
+| insert_seq | 1000 | 47.6 | 46.3 | 1.03 | 48.2 |
+| bulk_sorted | 1000 | 7.9 | 6.5 | 1.22 | n/a |
+| get_hit | 1000 | 16.2 | 15.5 | 1.05 | 74.3 |
+| iter_all | 1000 | 0.7 | 1.2 | 0.58 | 3.7 |
+| range_100 | 1000 | 1.4 | 1.5 | 0.93 | 4.6 |
+| floor | 1000 | 12.8 | 19.9 | 0.64 | 93.0 |
+| delete_rand | 1000 | 51.6 | 46.8 | 1.10 | 91.7 |
+| insert_rand | 100000 | 148.3 | 133.7 | 1.11 | 231.6 |
+| insert_seq | 100000 | 89.7 | 79.1 | 1.13 | 87.0 |
+| bulk_sorted | 100000 | 12.9 | 11.6 | 1.11 | n/a |
+| get_hit | 100000 | 100.5 | 104.4 | 0.96 | 231.6 |
+| iter_all | 100000 | 0.8 | 1.2 | 0.67 | 3.9 |
+| range_100 | 100000 | 2.3 | 2.2 | 1.05 | 6.9 |
+| floor | 100000 | 112.0 | 108.2 | 1.04 | 256.4 |
+| delete_rand | 100000 | 147.5 | 131.4 | 1.12 | 249.2 |
+| insert_rand | 1000000 | 259.5 | 269.7 | 0.96 | 395.9 |
+| insert_seq | 1000000 | 103.9 | 98.4 | 1.06 | 107.7 |
+| bulk_sorted | 1000000 | 14.9 | 8.8 | 1.69 | n/a |
+| get_hit | 1000000 | 194.5 | 215.4 | 0.90 | 444.8 |
+| iter_all | 1000000 | 0.9 | 1.5 | 0.60 | 4.3 |
+| range_100 | 1000000 | 5.3 | 5.3 | 1.00 | 10.6 |
+| floor | 1000000 | 201.2 | 228.9 | 0.88 | 465.6 |
+| delete_rand | 1000000 | 249.7 | 253.7 | 0.98 | 411.8 |
 
-The target was within 1.5× of Rust everywhere, and it is met. The shared VM
-adds ±15% noise between runs, mostly at 1K. The slowest cells are small-map
-insert, delete and bulk build: GC allocation of nodes costs more than
-Rust's allocator when nodes are small and short-lived.
+The target was within 1.5× of Rust everywhere. Every cell is at or under
+1.22×, except the 1M bulk build (1.69× here; Rust's own time swings from 8.9
+to 15.8 ns between runs, and the gap is fresh-memory cost). The shared VM
+adds ±15% noise between runs, mostly at 1K.
 
 ## What moved the numbers
 
@@ -86,10 +88,24 @@ Rust's allocator when nodes are small and short-lived.
 3. **Direct floor/ceiling/lower/higher.** One descent that keeps the best
    candidate, instead of positioning a cursor: 1.5× to ~0.9-1.0× of Rust.
 
+## Second round (same day)
+
+4. **Rust's split point.** A full node now splits at index 4, 5 or 6
+   depending on where the new key lands, so in-order inserts leave nodes
+   with 6 keys instead of 5. Sequential insert at 1K: 59 -> 53 ns.
+5. **delete_range by split and join** (see the design doc): 10K keys out
+   of 1M 585 -> 13 us, 100K keys 5.8 ms -> 55 us.
+
+Measured and rejected:
+
+- A one-compare-per-key search for integer keys. It helped sequential
+  insert by 3%, but random get went 14.0 -> 16.5 ns and floor
+  19.5 -> 26.6 ns at 1K.
+- `GC_DONT_GC=1` or a 512 MB initial heap for bulk builds. Both were
+  slower: the 1M bulk-build gap is fresh memory (17 MB of nodes), not
+  collection.
+
 ## Follow-ups (not done)
 
-- `delete_range` collects the keys and deletes them one by one,
-  O(k log n). A split/join implementation would be O(log n + k).
-- Small-n insert/delete: try a free list of nodes, or allocating leaves
-  with `malloc_atomic` for pointer-free K and V (GC already does this for
-  `Node(UInt64, UInt64)`).
+- bulk_sorted at 1M stays 1.2-1.7x (Rust itself swings 8.9-15.8 ns): it
+  would need a node arena.
