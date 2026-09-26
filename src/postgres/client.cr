@@ -63,22 +63,22 @@ module Postgres
 
     # See `Connection#exec`.
     def exec(sql : String, *args) : ExecResult
-      @pool.checkout(&.exec(sql, *args))
+      borrow(&.exec(sql, *args))
     end
 
     # See `Connection#query_all`.
     def query_all(sql : String, *args, as type : T.class) : Array(T) forall T
-      @pool.checkout(&.query_all(sql, *args, as: T))
+      borrow(&.query_all(sql, *args, as: T))
     end
 
     # See `Connection#query_one`.
     def query_one(sql : String, *args, as type : T.class) : T forall T
-      @pool.checkout(&.query_one(sql, *args, as: T))
+      borrow(&.query_one(sql, *args, as: T))
     end
 
     # See `Connection#query_one?`.
     def query_one?(sql : String, *args, as type : T.class) : T? forall T
-      @pool.checkout(&.query_one?(sql, *args, as: T))
+      borrow(&.query_one?(sql, *args, as: T))
     end
 
     ::Postgres.def_tuple_queries(query_all, query_one, query_one?)
@@ -91,7 +91,7 @@ module Postgres
     # See `Connection#query_each`. One connection is held until the
     # iteration ends.
     def query_each(sql : String, *args, as type : T.class, fetch_size : Int32? = nil, & : T ->) : Nil forall T
-      @pool.checkout do |conn|
+      borrow do |conn|
         conn.query_each(sql, *args, as: T, fetch_size: fetch_size) { |value| yield value }
       end
     end
@@ -99,7 +99,7 @@ module Postgres
     # Runs the block in a transaction on one borrowed connection; see
     # `Connection#transaction`.
     def transaction(*, isolation : Connection::Isolation? = nil, read_only : Bool? = nil, & : Connection -> T) : T forall T
-      @pool.checkout do |conn|
+      borrow do |conn|
         conn.transaction(isolation: isolation, read_only: read_only) { |tx| yield tx }
       end
     end
@@ -107,12 +107,12 @@ module Postgres
     # Borrows a connection for the block, for session state (`SET`,
     # temporary tables, advisory locks) that must stay on one session.
     def with_connection(& : Connection -> T) : T forall T
-      @pool.checkout { |conn| yield conn }
+      borrow { |conn| yield conn }
     end
 
     # Sends `NOTIFY` on *channel* with *payload*; see `Connection#notify`.
     def notify(channel : String, payload : String = "") : Nil
-      @pool.checkout(&.notify(channel, payload))
+      borrow(&.notify(channel, payload))
     end
 
     # Opens a `Listener` on a connection of its own (not from the pool)
@@ -134,6 +134,19 @@ module Postgres
     # Whether `close` has been called.
     def closed? : Bool
       @pool.closed?
+    end
+
+    # Checks a connection out for the block and hands it back clean: one
+    # left in a transaction (by any path) is rolled back first, one still
+    # mid-reply is closed (the pool then drops it).
+    private def borrow(& : Connection -> T) : T forall T
+      @pool.checkout do |conn|
+        begin
+          yield conn
+        ensure
+          conn.unsafe_release
+        end
+      end
     end
 
     # Closes idle connections now and borrowed ones when they come back.

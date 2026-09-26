@@ -317,14 +317,18 @@ module Fiber::ExecutionContext
     # from external execution contexts, in which case the context may have its
     # last thread about to park itself, and we must prevent the last thread from
     # parking when there is a parallel cross context enqueue!
-    protected def wake_scheduler(count = 1) : Nil
+    #
+    # *interrupt* false skips interrupting a thread blocked on the event
+    # loop: a caller that holds the event loop itself (it just ran it)
+    # would only interrupt itself and count that as a wakeup.
+    protected def wake_scheduler(count = 1, *, interrupt : Bool = true) : Nil
       # another thread is spinning: nothing to do
       count -= @spinning.get(:relaxed)
       return if count < 1
 
       # interrupt a thread waiting on the event loop
       # FIXME: what if every scheduler can wait on evloop? (i.e. io_uring)
-      if @event_loop.interrupt?
+      if interrupt && @event_loop.interrupt?
         count -= 1
         return if count == 0
       end

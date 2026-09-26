@@ -121,9 +121,11 @@ module Postgres
     @transaction_depth = 0
     # The `read_timeout` that triggered a cancel still being answered.
     @timed_out : IO::TimeoutError?
+    @cancel_confirmed = false
     @tls_context : OpenSSL::SSL::Context::Client?
     @cache : StatementCache
     @types = TypeMap.new
+    @hold_closes = false
     @reader : RowReader?
 
     # Opens a session with *config* (see `Config.parse`).
@@ -171,6 +173,11 @@ module Postgres
       @host = host
       @parameters.clear
       @backend_pid = 0
+      # Nothing learned on a host that was rejected carries over.
+      @cache = StatementCache.new(@config.statement_cache_size)
+      @types = TypeMap.new
+      @timed_out = nil
+      @cancel_confirmed = false
       @socket = open_socket(host)
       @io = @socket
       if host.unix_socket? || @config.sslmode.disable?
@@ -320,8 +327,8 @@ module Postgres
     end
 
     # Runs the block in a transaction and returns its value: `BEGIN`, then
-    # `COMMIT` when the block returns, `ROLLBACK` when it raises (and the
-    # exception propagates). Nested calls use savepoints. A block that
+    # `COMMIT` when the block returns (also by `break` or `return`),
+    # `ROLLBACK` when it raises (and the exception propagates). Nested calls use savepoints. A block that
     # rescued a `QueryError` leaves the transaction aborted; `COMMIT` would
     # then silently roll back, so this raises `Error` after the rollback.
     def transaction(*, isolation : Isolation? = nil, read_only : Bool? = nil, & : Connection -> T) : T forall T
@@ -338,9 +345,11 @@ module Postgres
         simple_query("SAVEPOINT sp#{depth}")
       end
       @transaction_depth += 1
+      failed = false
       begin
         value = yield self
       rescue ex
+        failed = true
         @transaction_depth = depth
         unless @closed
           begin
@@ -351,8 +360,18 @@ module Postgres
           end
         end
         raise ex
+      ensure
+        # Normal exit, and also `break`/`return` out of the block (which
+        # skip any code after `yield`): commit.
+        unless failed
+          @transaction_depth = depth
+          finish_transaction(depth) unless @closed
+        end
       end
-      @transaction_depth = depth
+      value
+    end
+
+    private def finish_transaction(depth : Int32) : Nil
       if depth == 0
         if @transaction_status == 'E'
           simple_query("ROLLBACK")
@@ -362,7 +381,6 @@ module Postgres
       else
         simple_query("RELEASE SAVEPOINT sp#{depth}")
       end
-      value
     end
 
     # Sends an empty query: a cheap round trip that proves the session is
@@ -416,6 +434,24 @@ module Postgres
     # any channel name and payload are safe to pass).
     def notify(channel : String, payload : String = "") : Nil
       exec("select pg_notify($1, $2)", channel, payload)
+    end
+
+    # :nodoc:
+    #
+    # For `Client`, before a connection goes back to the pool: roll back
+    # a transaction left open; close a connection still busy mid-reply.
+    def unsafe_release : Nil
+      return if @closed
+      if @busy
+        close_quietly
+      elsif @transaction_status != 'I' || @transaction_depth != 0
+        @transaction_depth = 0
+        begin
+          simple_query("ROLLBACK")
+        rescue
+          close_quietly
+        end
+      end
     end
 
     # :nodoc:
@@ -648,8 +684,13 @@ module Postgres
       # Queued closes go after `Bind`, so an argument that fails to encode
       # (which discards the half-written `Bind`) cannot drop them.
       begin
+        # The unnamed statement (cache off) may have been replaced by the
+        # type introspection `prepare` ran; parse it again, same round trip.
+        Messages::Parse.new(name: "", query: sql, oids: [] of UInt32).write(@out) if statement.name.empty?
         Connection.write_bind(@out, statement, args)
-      rescue ex : EncodeError
+      rescue ex
+        # Whatever the encoder raised (EncodeError, or a user `to_pg`
+        # failing), the half-written `Bind` must not reach the server.
         @out.clear
         raise ex
       end
@@ -658,55 +699,66 @@ module Postgres
       @out.write(fetch_size ? Messages::FLUSH : Messages::SYNC)
       flush
       synced = fetch_size.nil?
+      completed = false
       reader = @reader ||= RowReader.new(statement.columns)
       reader.reset(statement.columns)
       result = ExecResult.new("", 0_i64)
       error = nil
       failure = nil
-      loop do
-        type, body = read_message
-        case type
-        when 'D'
-          next if error || failure
-          parse { reader.load(body) }
-          begin
-            yield reader
-          rescue ex
-            # Keep reading to `ReadyForQuery` so the connection stays in
-            # step, then raise.
-            failure = ex
-          end
-        when 'C'
-          # Only `exec` reports the tag; `query_*` skip building it.
-          result = ExecResult.from_tag(parse { Messages::CommandComplete.from_slice(body) }.tag) if want_result
-          synced = sync unless synced
-        when 's'
-          # PortalSuspended: the batch is consumed; fetch the next one, or
-          # end the portal when the block failed.
-          if failure
-            synced = sync
+      begin
+        loop do
+          type, body = read_message
+          case type
+          when 'D'
+            next if error || failure
+            parse { reader.load(body) }
+            begin
+              yield reader
+            rescue ex
+              # Keep reading to `ReadyForQuery` so the connection stays in
+              # step, then raise.
+              failure = ex
+            end
+          when 'C'
+            # Only `exec` reports the tag; `query_*` skip building it.
+            result = ExecResult.from_tag(parse { Messages::CommandComplete.from_slice(body) }.tag) if want_result
+            synced = sync unless synced
+          when 's'
+            # PortalSuspended: the batch is consumed; fetch the next one, or
+            # end the portal when the block failed.
+            if failure
+              synced = sync
+            else
+              Messages::Execute.new(portal: "", max_rows: fetch_size.not_nil!).write(@out)
+              @out.write(Messages::FLUSH)
+              flush
+            end
+          when 'I'
+            # An empty query: done, like CommandComplete.
+            synced = sync unless synced
+          when '2', '3', '1', 'n'
+          when 'E'
+            error ||= parse { query_error(body) }
+            # The server skips everything up to a Sync after an error.
+            synced = sync unless synced
+          when 'Z'
+            completed = true
+            @transaction_status = ready_status(body)
+            break
           else
-            Messages::Execute.new(portal: "", max_rows: fetch_size.not_nil!).write(@out)
-            @out.write(Messages::FLUSH)
-            flush
+            handle_async(type, body) || unexpected(type)
           end
-        when '2', '3', 'I', 'n'
-        when 'E'
-          error ||= parse { query_error(body) }
-          # The server skips everything up to a Sync after an error.
-          synced = sync unless synced
-        when 'Z'
-          @transaction_status = ready_status(body)
-          break
-        else
-          handle_async(type, body) || unexpected(type)
         end
+      ensure
+        # `break`/`return` out of the caller's block unwinds through here
+        # with the reply half read: finish it so the session stays in step.
+        abandon(synced) unless completed || @closed
       end
       if error
         if statement.name.empty? || !stale?(error)
           raise error
         end
-        @cache.forget(sql)
+        drop_stale(sql, statement, error)
         raise StaleStatement.new(error)
       end
       raise failure if failure
@@ -718,14 +770,19 @@ module Postgres
     # `DEALLOCATE`/`DISCARD ALL`.
     private def stale?(error : QueryError) : Bool
       case error.code
-      when "0A000"
-        error.detail_message.includes?("cached plan")
-      when "26000"
-        @cache.reset
-        true
-      else
-        false
+      when "0A000" then error.detail_message.includes?("cached plan")
+      when "26000" then true
+      else              false
       end
+    end
+
+    # Forgets a cached statement the server rejected as stale. After 0A000
+    # the server still holds it, so its Close is queued; after 26000 it is
+    # gone. Other cached statements are left alone: each one that was
+    # deallocated too fails, and is retried, on its own.
+    protected def drop_stale(sql : String, statement : PreparedStatement, error : QueryError) : Nil
+      @cache.forget(sql)
+      @cache.closes << statement.name if error.code == "0A000"
     end
 
     private def prepare(sql : String) : PreparedStatement
@@ -793,16 +850,19 @@ module Postgres
     # buffer). Raises `EncodeError` naming the parameter; the caller
     # discards the half-written message.
     protected def self.write_bind(buf : IO::Memory, statement : PreparedStatement, args : Tuple) : Nil
+      if args.size > UInt16::MAX
+        raise ArgumentError.new("at most #{UInt16::MAX} parameters can be bound, got #{args.size}")
+      end
       buf.write_byte('B'.ord.to_u8)
       start = buf.pos
       buf.write_bytes(0_i32, IO::ByteFormat::BigEndian)
       buf.write_byte(0_u8) # unnamed portal
       buf << statement.name
       buf.write_byte(0_u8)
-      buf.write_bytes(args.size.to_i16, IO::ByteFormat::BigEndian)
+      buf.write_bytes(args.size.to_u16, IO::ByteFormat::BigEndian)
       formats_at = buf.pos
       args.size.times { buf.write_bytes(0_i16, IO::ByteFormat::BigEndian) }
-      buf.write_bytes(args.size.to_i16, IO::ByteFormat::BigEndian)
+      buf.write_bytes(args.size.to_u16, IO::ByteFormat::BigEndian)
       oids = statement.param_oids
       args.each_with_index do |arg, i|
         if arg.nil?
@@ -831,9 +891,11 @@ module Postgres
 
     # Queues the `Close` of evicted statements ahead of the next round trip;
     # their `CloseComplete`s are read with that round trip's replies.
-    private def flush_closes : Nil
+    private def flush_closes(force : Bool = false) : Nil
       closes = @cache.closes
-      return if closes.empty?
+      # A pipeline holds closes back until every query was bound: an
+      # eviction during it (introspection) may name a statement it uses.
+      return if closes.empty? || (@hold_closes && !force)
       closes.each { |name| Messages::Close.new(kind: 'S'.ord.to_u8, name: name).write(@out) }
       closes.clear
     end
@@ -859,6 +921,26 @@ module Postgres
       lost(ex)
     ensure
       @out.clear
+    end
+
+    # Reads and discards the rest of a reply the caller walked away from
+    # (a `break` out of `query_each`), sending the missing `Sync` first
+    # in cursor mode. Any failure closes the connection: it runs in an
+    # `ensure`, where raising would mask how the caller left.
+    private def abandon(synced : Bool) : Nil
+      sync unless synced
+      loop do
+        type, body = read_message
+        if type == 'Z'
+          begin
+            @transaction_status = ready_status(body)
+          rescue IO::TimeoutError
+          end
+          return
+        end
+      end
+    rescue
+      close_quietly
     end
 
     # Sends `Sync` (ending a cursor's implicit transaction and portal).
@@ -951,9 +1033,15 @@ module Postgres
       end
       status = body[0].unsafe_chr
       if timed_out = @timed_out
-        # The query was cancelled after `read_timeout` (see `wait_readable`);
-        # the session is in step again.
+        # A cancel was sent after `read_timeout` (see `wait_readable`); the
+        # session is in step again. Only report the timeout if the server
+        # did cancel (57014): a query that finished on its own before the
+        # cancel landed keeps its real result, so a caller never retries
+        # work that was in fact done.
         @timed_out = nil
+        confirmed = @cancel_confirmed
+        @cancel_confirmed = false
+        return status unless confirmed
         @transaction_status = status
         raise IO::TimeoutError.new("#{timed_out.message}: query cancelled after read_timeout (#{@read_timeout})")
       end
@@ -989,7 +1077,9 @@ module Postgres
     end
 
     private def query_error(body : Bytes) : QueryError
-      QueryError.new(error_fields(body))
+      error = QueryError.new(error_fields(body))
+      @cancel_confirmed = true if @timed_out && error.code == "57014"
+      error
     end
 
     private def error_fields(body : Bytes) : Hash(Char, String)

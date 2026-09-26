@@ -25,6 +25,12 @@ module Postgres
   # `on_reconnect` to catch up from the data itself (e.g. re-read a jobs
   # table), and `on_disconnect` to observe the gap.
   #
+  # The reader fiber blocks while the notification channel is full, so a
+  # fiber that both consumes notifications and calls `listen`/`unlisten`
+  # must not let the channel fill up first: the reader could not read
+  # the confirmation it waits for. Size *capacity* for bursts, or consume
+  # on a separate fiber.
+  #
   # The hooks run on the reader fiber, so they must not call `listen`,
   # `unlisten`, `receive`, `receive?` or `each` on this listener (each
   # waits for the very fiber running the hook; it raises `ArgumentError`).

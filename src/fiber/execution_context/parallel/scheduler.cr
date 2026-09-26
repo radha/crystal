@@ -261,7 +261,7 @@ module Fiber::ExecutionContext
         # others stay parked. Go's scheduler does the same after netpoll.
         # Without it a 4-thread context ran pooled Postgres queries on 2
         # threads at ~48k ops/s; with it on 4 at ~76k.
-        @execution_context.wake_scheduler(size - 1) if size > 1
+        @execution_context.wake_scheduler(size - 1, interrupt: false) if size > 1
         fiber
       end
 

@@ -21,22 +21,43 @@ module Postgres
       begin
         start_copy(sql, 'G')
         writer = CopyWriter.new(self)
+        failed = false
+        completing = false
         begin
           yield writer
-          writer.flush
+          completing = true
+          complete_copy(writer)
         rescue ex
+          failed = true
+          # An error while completing came from the server (rejected data,
+          # read after ReadyForQuery): the session is in step already.
+          raise ex if completing
           @out.clear
           write_message('f') { |io| io << (ex.message || ex.class.name) << '\0' }
           flush
           finish_copy rescue nil
           raise ex
+        ensure
+          # `break`/`return` out of the block: finish the COPY as if the
+          # block had returned, so the session leaves COPY IN mode.
+          unless failed || completing || @closed
+            begin
+              complete_copy(writer)
+            rescue
+              close_quietly
+            end
+          end
         end
-        write_message('c') { }
-        flush
-        finish_copy
       ensure
         leave
       end
+    end
+
+    private def complete_copy(writer : CopyWriter) : Int64
+      writer.flush
+      write_message('c') { }
+      flush
+      finish_copy
     end
 
     # Copies all of *source* into the server with *sql*, a

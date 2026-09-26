@@ -232,6 +232,13 @@ module Postgres
     end
 
     private def run_pipeline(ops : Array(Pipeline::Op)) : Nil
+      @hold_closes = true
+      run_pipeline_rounds(ops)
+    ensure
+      @hold_closes = false
+    end
+
+    private def run_pipeline_rounds(ops : Array(Pipeline::Op)) : Nil
       # Round 1: prepare each distinct statement not in the cache, each
       # with its own Sync so one bad statement fails only its queries.
       statements = {} of String => PreparedStatement
@@ -248,7 +255,7 @@ module Postgres
         end
       end
       unless to_prepare.empty?
-        flush_closes
+        flush_closes(force: true) # queued before this pipeline: safe to send
         to_prepare.each do |sql, name|
           Messages::Parse.new(name: name, query: sql, oids: [] of UInt32).write(@out)
           Messages::Describe.new(kind: 'S'.ord.to_u8, name: name).write(@out)
@@ -287,7 +294,9 @@ module Postgres
         scratch.clear
         begin
           op.write_bind(scratch, statement)
-        rescue ex : EncodeError
+        rescue ex
+          # Any encoder failure (a user `to_pg` too) fails only this query;
+          # its half-written Bind stays in the scratch buffer.
           op.reject(ex)
           next
         end
@@ -300,7 +309,7 @@ module Postgres
       temporary.each { |name| @cache.closes << name }
       closing = !@cache.closes.empty?
       if closing
-        flush_closes
+        flush_closes(force: true)
         @out.write(Messages::SYNC)
       end
       flush unless sent.empty? && !closing
@@ -314,7 +323,7 @@ module Postgres
     end
 
     # Reads one statement's `Parse`/`Describe`/`Sync` replies.
-    private def read_prepared(name : String) : {PreparedStatement?, QueryError?}
+    private def read_prepared(name : String) : {PreparedStatement?, Exception?}
       param_oids = [] of UInt32
       columns = [] of Column
       error = nil
@@ -329,7 +338,13 @@ module Postgres
         when '1', '3', 'n'
         when 'E' then error ||= parse { query_error(body) }
         when 'Z'
-          @transaction_status = ready_status(body)
+          begin
+            @transaction_status = ready_status(body)
+          rescue ex : IO::TimeoutError
+            # This statement's Parse was cancelled; the others' replies
+            # follow and must still be read.
+            error = ex
+          end
           break
         else
           handle_async(type, body) || unexpected(type)
@@ -359,8 +374,9 @@ module Postgres
         when '2', '3', 'I', 'n', 's'
         when 'E'
           error = parse { query_error(body) }
-          @cache.reset if error.code == "26000"
-          @cache.forget(op.sql) if error.code == "0A000"
+          if (error.code == "26000" || error.code == "0A000") && (statement = op.statement) && !statement.name.empty?
+            drop_stale(op.sql, statement, error)
+          end
           failure ||= error
         when 'Z'
           begin
@@ -400,7 +416,7 @@ module Postgres
     # Runs a pipeline on one borrowed connection; see
     # `Connection#pipeline`.
     def pipeline(& : Pipeline ->) : Nil
-      @pool.checkout { |conn| conn.pipeline { |p| yield p } }
+      borrow { |conn| conn.pipeline { |p| yield p } }
     end
   end
 end
