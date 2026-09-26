@@ -77,7 +77,7 @@ describe Postgres::Config do
   it "rejects invalid env values" do
     expect_raises(ArgumentError, /port/) { parse(env: {"PGPORT" => "abc"}) }
     expect_raises(ArgumentError, /port/) { parse(env: {"PGPORT" => "70000"}) }
-    expect_raises(ArgumentError, /connect_timeout/) { parse(env: {"PGCONNECT_TIMEOUT" => "-1"}) }
+    expect_raises(ArgumentError, /connect_timeout/) { parse(env: {"PGCONNECT_TIMEOUT" => "soon"}) }
     expect_raises(ArgumentError, /sslmode/) { parse(env: {"PGSSLMODE" => "nope"}) }
   end
 

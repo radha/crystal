@@ -425,7 +425,10 @@ describe Postgres::Connection do
         conn = connect(server.url(statement_cache_size: 0))
         conn.query_one("select 1", as: Int32).should eq(1)
         conn.query_one("select 1", as: Int32).should eq(1)
-        received(server, 'P').map { |b| Fake.cstring(b) }.should eq(["", ""])
+        # Each call parses the unnamed statement twice: once to describe it,
+        # once again right before Bind (type introspection may have replaced
+        # the unnamed statement in between).
+        received(server, 'P').map { |b| Fake.cstring(b) }.should eq(["", "", "", ""])
         conn.statement_cache_size.should eq(0)
         conn.close
       end

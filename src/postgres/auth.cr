@@ -417,7 +417,8 @@ module Postgres
 
       # Computes the client-final-message (with the client proof) from the
       # server-first-message. Raises `AuthenticationError` if the server
-      # message is malformed or its nonce does not extend the client nonce.
+      # message is malformed, carries a mandatory extension (`m=`) or its
+      # nonce does not extend the client nonce.
       def client_final_message(server_first : String) : String
         nonce = nil
         salt = nil
@@ -431,6 +432,10 @@ module Postgres
             iterations = attr[2..]
           elsif attr.starts_with?("e=")
             raise AuthenticationError.new("SCRAM authentication failed: #{attr[2..]}")
+          elsif attr.starts_with?("m=")
+            # RFC 5802: `m=` is reserved for a mandatory extension, which a
+            # client that does not support it must reject.
+            raise AuthenticationError.new("Unsupported SCRAM mandatory extension in server-first-message")
           end
         end
 

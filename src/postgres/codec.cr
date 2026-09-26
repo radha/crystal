@@ -127,12 +127,17 @@ module Postgres
     def self.encode(io : IO, oid : UInt32, value : Time::Span) : Int16
       case oid
       when OID::INTERVAL
-        write_interval(io, Interval.new(value))
+        interval = begin
+          Interval.new(value)
+        rescue ex : ArgumentError
+          raise EncodeError.new(ex.message)
+        end
+        write_interval(io, interval)
       when OID::TIME
         unless Time::Span.zero <= value < 1.day
           raise EncodeError.new("#{value} is outside a time of day (0 to 24 hours)")
         end
-        io.write_bytes(value.total_nanoseconds.to_i64 // 1000, IO::ByteFormat::BigEndian)
+        io.write_bytes(span_microseconds(value), IO::ByteFormat::BigEndian)
       else
         mismatch(oid, value)
       end
@@ -238,7 +243,7 @@ module Postgres
           encode_array_text(io, item)
         else
           io << '"'
-          item.to_s.each_char do |char|
+          text_form(item).each_char do |char|
             io << '\\' if char == '"' || char == '\\'
             io << char
           end
@@ -279,7 +284,10 @@ module Postgres
 
     def self.encode(io : IO, oid : UInt32, value : TimeTz) : Int16
       mismatch(oid, value) unless oid == OID::TIMETZ
-      io.write_bytes(value.time.total_nanoseconds.to_i64 // 1000, IO::ByteFormat::BigEndian)
+      unless Time::Span.zero <= value.time <= 1.day
+        raise EncodeError.new("#{value.time} is outside a time of day (0 to 24 hours)")
+      end
+      io.write_bytes(span_microseconds(value.time), IO::ByteFormat::BigEndian)
       io.write_bytes(-value.offset, IO::ByteFormat::BigEndian) # the wire counts seconds west
       BINARY
     end
@@ -352,7 +360,8 @@ module Postgres
 
     # A `Tuple` as a composite (row) value, sent as a row literal the server
     # parses by the composite's own field types: `(1,"a b",)`, NULL for
-    # nil. Fields are written with `to_s`, so keep them to scalars.
+    # nil. Each field is written in the text form PostgreSQL parses for
+    # its type (see `.text_form`); a type without one raises `EncodeError`.
     def self.encode(io : IO, oid : UInt32, value : Tuple) : Int16
       mismatch(oid, value) if OID.binary?(oid) && oid != OID::RECORD
       io << '('
@@ -360,8 +369,7 @@ module Postgres
         io << ',' if i > 0
         next if item.nil?
         io << '"'
-        text = item.is_a?(Time) ? item.to_utc.to_s("%F %T.%6N+00") : item.to_s
-        text.each_char do |char|
+        text_form(item).each_char do |char|
           io << char if char == '"' || char == '\\'
           io << char
         end
@@ -369,6 +377,109 @@ module Postgres
       end
       io << ')'
       TEXT
+    end
+
+    # :nodoc:
+    #
+    # The PostgreSQL text input form of a value inside a composite or array
+    # literal, where the server parses each field by its declared type.
+    def self.text_form(value : String) : String
+      value
+    end
+
+    # :ditto:
+    def self.text_form(value : Bool) : String
+      value ? "t" : "f"
+    end
+
+    # :ditto:
+    def self.text_form(value : Int::Primitive | Float::Primitive | BigInt | BigDecimal | UUID | Inet | MacAddress | TimeTz) : String
+      value.to_s
+    end
+
+    # :ditto:
+    def self.text_form(value : Bytes) : String
+      "\\x#{value.hexstring}"
+    end
+
+    # :ditto:
+    def self.text_form(value : Time) : String
+      value.to_utc.to_s("%F %T.%6N+00")
+    end
+
+    # A span as `[-]H:MM:SS.ffffff` (whole hours, no days), which both
+    # `interval` and (below 24 hours) `time` parse.
+    def self.text_form(value : Time::Span) : String
+      micros = begin
+        span_microseconds(value)
+      rescue OverflowError
+        raise EncodeError.new("#{value} is out of range for an interval")
+      end
+      String.build { |io| write_time_text(io, micros) }
+    end
+
+    # PostgreSQL's own interval style: `1 mons -3 days -04:05:06.5`.
+    def self.text_form(value : Interval) : String
+      String.build do |io|
+        io << value.months << " mons " << value.days << " days "
+        write_time_text(io, value.microseconds)
+      end
+    end
+
+    # :ditto:
+    def self.text_form(value : Enum) : String
+      value.to_s.underscore
+    end
+
+    # :ditto:
+    def self.text_form(value : Socket::IPAddress) : String
+      value.address
+    end
+
+    # :ditto:
+    def self.text_form(value : BitArray) : String
+      String.build { |io| value.each { |bit| io << (bit ? '1' : '0') } }
+    end
+
+    # :ditto:
+    def self.text_form(value : JSON::Any) : String
+      value.to_json
+    end
+
+    # A nested composite.
+    def self.text_form(value : Tuple) : String
+      String.build { |io| encode(io, OID::RECORD, value) }
+    end
+
+    # An array literal (`{"1","2"}`).
+    def self.text_form(value : Array) : String
+      String.build { |io| encode_array_text(io, value) }
+    end
+
+    # An `hstore` literal.
+    def self.text_form(value : Hash) : String
+      String.build { |io| encode(io, 0_u32, value) }
+    end
+
+    # :ditto:
+    def self.text_form(value) : String
+      if value.responds_to?(:to_pg)
+        text_form(value.to_pg)
+      else
+        raise EncodeError.new("cannot encode #{value.class} as a composite or array field")
+      end
+    end
+
+    # `[-]H:MM:SS[.ffffff]` of *micros* microseconds.
+    private def self.write_time_text(io : IO, micros : Int64) : Nil
+      io << '-' if micros < 0
+      # Int64::MIN.abs overflows; the magnitude fits in UInt64.
+      magnitude = micros < 0 ? (-(micros + 1)).to_u64 + 1 : micros.to_u64
+      seconds, fraction = magnitude.divmod(1_000_000_u64)
+      hours, seconds = seconds.divmod(3600_u64)
+      minutes, seconds = seconds.divmod(60_u64)
+      io << hours << ':' << minutes.to_s.rjust(2, '0') << ':' << seconds.to_s.rjust(2, '0')
+      io << '.' << fraction.to_s.rjust(6, '0').rstrip('0') unless fraction == 0
     end
 
     # An enum: its value for an integer parameter, otherwise its name in
@@ -391,6 +502,12 @@ module Postgres
       else
         mismatch(oid, value)
       end
+    end
+
+    # *span* in whole microseconds, truncated toward zero, computed
+    # exactly (no `Float64` round trip). The caller bounds *span*.
+    private def self.span_microseconds(span : Time::Span) : Int64
+      span.to_i * 1_000_000 + span.nanoseconds.tdiv(1000)
     end
 
     private def self.checked(type : T.class, value, oid : UInt32) : T forall T
@@ -546,13 +663,21 @@ module Postgres
         if us == Int64::MAX || us == Int64::MIN
           raise DecodeError.new("column #{c.name.inspect}: #{us > 0 ? "" : "-"}infinity cannot be a Time")
         end
-        Time.unix(PG_EPOCH_UNIX + (us // 1_000_000)) + Time::Span.new(nanoseconds: (us % 1_000_000) * 1000)
+        begin
+          Time.unix(PG_EPOCH_UNIX + (us // 1_000_000)) + Time::Span.new(nanoseconds: (us % 1_000_000) * 1000)
+        rescue ArgumentError | OverflowError
+          raise DecodeError.new("column #{c.name.inspect}: #{timestamp_text(us, c.codec_oid == OID::TIMESTAMPTZ)} is outside the range of Time")
+        end
       when OID::DATE
         days = int(b, c, Int32)
         if days == Int32::MAX || days == Int32::MIN
           raise DecodeError.new("column #{c.name.inspect}: #{days > 0 ? "" : "-"}infinity cannot be a Time")
         end
-        Time.unix((PG_EPOCH_DAYS + days) * 86_400)
+        begin
+          Time.unix((PG_EPOCH_DAYS + days) * 86_400)
+        rescue ArgumentError | OverflowError
+          raise DecodeError.new("column #{c.name.inspect}: #{date_text(days)} is outside the range of Time")
+        end
       else
         mismatch(c, type)
       end
@@ -562,13 +687,17 @@ module Postgres
       mismatch(c, type) unless c.binary?
       case c.codec_oid
       when OID::TIME
-        Time::Span.new(nanoseconds: int(b, c, Int64) * 1000)
+        time_of_day(int(b, c, Int64), c)
       when OID::INTERVAL
         interval = read_interval(b, c)
         unless interval.months == 0
           raise DecodeError.new("column #{c.name.inspect}: an interval of #{interval.months} months cannot be a Time::Span; use Postgres::Interval")
         end
-        interval.to_span
+        begin
+          interval.to_span
+        rescue ex : ArgumentError | OverflowError
+          raise DecodeError.new("column #{c.name.inspect}: #{ex.message}")
+        end
       else
         mismatch(c, type)
       end
@@ -581,10 +710,16 @@ module Postgres
 
     def self.decode(b : Bytes, c : Column, type : JSON::Any.class) : JSON::Any
       mismatch(c, type) unless c.binary?
-      case c.codec_oid
-      when OID::JSON  then JSON.parse(String.new(b))
-      when OID::JSONB then JSON.parse(jsonb(b, c))
-      else                 mismatch(c, type)
+      text = case c.codec_oid
+             when OID::JSON  then String.new(b)
+             when OID::JSONB then jsonb(b, c)
+             else                 mismatch(c, type)
+             end
+      begin
+        JSON.parse(text)
+      rescue ex : JSON::ParseException | ArgumentError | OverflowError
+        # Valid JSON can still be out of range here (`1e400`, `2**64`).
+        raise DecodeError.new("column #{c.name.inspect}: cannot parse #{OID.name(c.codec_oid)} as JSON::Any: #{ex.message.try(&.[0, 200])}")
       end
     end
 
@@ -607,6 +742,14 @@ module Postgres
         size = IO::ByteFormat::BigEndian.decode(Int32, b + 12 + d * 8)
         raise DecodeError.new("column #{c.name.inspect}: negative array size") if size < 0
         size
+      end
+      # Each element takes at least its 4-byte length: reject sizes the
+      # data cannot hold before allocating anything.
+      remaining = (b.size - 12 - 8 * dimensions) // 4
+      total = 1_i64
+      sizes.each do |size|
+        total *= size
+        raise DecodeError.new("column #{c.name.inspect}: truncated array") if total > remaining
       end
       element_column = Column.new(c.name, IO::ByteFormat::BigEndian.decode(UInt32, b + 8), types: c.types)
       build_array(type, sizes, 0, ArrayCursor.new(b, 12 + 8 * dimensions, element_column))
@@ -653,7 +796,7 @@ module Postgres
             raise DecodeError.new("column #{c.name.inspect}: NULL element but #{T} is not nilable")
           {% end %}
         end
-        raise DecodeError.new("column #{c.name.inspect}: truncated array") if @pos + size > b.size
+        raise DecodeError.new("column #{c.name.inspect}: truncated array") if size > b.size - @pos
         item = b[@pos, size]
         @pos += size
         {% if T.nilable? %}
@@ -690,15 +833,16 @@ module Postgres
     def self.decode(b : Bytes, c : Column, type : TimeTz.class) : TimeTz
       mismatch(c, type) unless c.binary? && c.codec_oid == OID::TIMETZ
       raise DecodeError.new("column #{c.name.inspect}: expected 12 bytes for timetz, got #{b.size}") unless b.size == 12
-      TimeTz.new(Time::Span.new(nanoseconds: IO::ByteFormat::BigEndian.decode(Int64, b) * 1000),
-        -IO::ByteFormat::BigEndian.decode(Int32, b + 8))
+      offset = IO::ByteFormat::BigEndian.decode(Int32, b + 8)
+      raise DecodeError.new("column #{c.name.inspect}: timetz offset #{offset} out of range") if offset == Int32::MIN
+      TimeTz.new(time_of_day(IO::ByteFormat::BigEndian.decode(Int64, b), c), -offset)
     end
 
     def self.decode(b : Bytes, c : Column, type : BitArray.class) : BitArray
       mismatch(c, type) unless c.binary? && (c.codec_oid == OID::BIT || c.codec_oid == OID::VARBIT)
       raise DecodeError.new("column #{c.name.inspect}: truncated bit string") if b.size < 4
       size = IO::ByteFormat::BigEndian.decode(Int32, b)
-      raise DecodeError.new("column #{c.name.inspect}: truncated bit string") if size < 0 || b.size < 4 + (size + 7) // 8
+      raise DecodeError.new("column #{c.name.inspect}: truncated bit string") if size < 0 || b.size - 4 < (size.to_i64 + 7) // 8
       bits = BitArray.new(size)
       size.times { |i| bits[i] = b[4 + i // 8].bit(7 - i % 8) == 1 }
       bits
@@ -733,6 +877,7 @@ module Postgres
           @reader.next_char
           skip_spaces
         end
+        fail("unexpected #{@reader.current_char.inspect}") if @reader.has_next?
         hash
       end
 
@@ -745,7 +890,10 @@ module Postgres
               char = @reader.next_char
               fail("unterminated string") if char == '\0' && !@reader.has_next?
               break if char == '"'
-              char = @reader.next_char if char == '\\'
+              if char == '\\'
+                char = @reader.next_char
+                fail("unterminated string") if char == '\0' && !@reader.has_next?
+              end
               s << char
             end
             @reader.next_char
@@ -797,7 +945,7 @@ module Postgres
         raise DecodeError.new("column #{c.name.inspect}: truncated range") if pos + 4 > b.size
         size = IO::ByteFormat::BigEndian.decode(Int32, b + pos)
         pos += 4
-        raise DecodeError.new("column #{c.name.inspect}: truncated range") if size < 0 || pos + size > b.size
+        raise DecodeError.new("column #{c.name.inspect}: truncated range") if size < 0 || size > b.size - pos
         bound = b[pos, size]
         pos += size
         bound
@@ -820,13 +968,76 @@ module Postgres
     end
 
     private def self.bound_text(b : Bytes, c : Column) : String
-      case c.codec_oid
-      when OID::INT4, OID::INT8 then decode(b, c, Int64).to_s
-      when OID::NUMERIC         then decode(b, c, BigDecimal).to_s
-      when OID::DATE            then decode(b, c, Time).to_s("%F")
-      when OID::TIMESTAMP       then %("#{decode(b, c, Time).to_s("%F %T.%6N").rchop(".000000")}")
-      else                           %("#{decode(b, c, Time).to_s("%F %T.%6N").rchop(".000000")}+00")
+      text = case c.codec_oid
+             when OID::INT4, OID::INT8 then decode(b, c, Int64).to_s
+             when OID::NUMERIC         then decode(b, c, BigDecimal).to_s
+             when OID::DATE            then date_text(int(b, c, Int32))
+             else                           timestamp_text(int(b, c, Int64), c.codec_oid == OID::TIMESTAMPTZ)
+             end
+      # As `range_out`, quote a bound containing a space (or nothing else
+      # special: these forms never contain quotes, commas or brackets).
+      text.includes?(' ') ? %("#{text}") : text
+    end
+
+    # A time of day from its microseconds (0 to 24:00:00, inclusive).
+    private def self.time_of_day(micros : Int64, c : Column) : Time::Span
+      unless 0 <= micros <= 86_400_000_000
+        raise DecodeError.new("column #{c.name.inspect}: #{micros} microseconds is not a time of day")
       end
+      Time::Span.new(seconds: micros // 1_000_000, nanoseconds: (micros % 1_000_000) * 1000)
+    end
+
+    # :nodoc:
+    #
+    # PostgreSQL's ISO text form of a `timestamp` (`timestamptz` in UTC)
+    # from its microseconds since 2000-01-01, for any value the server can
+    # store, including years past 9999, BC years and the infinities.
+    def self.timestamp_text(us : Int64, tz : Bool) : String
+      return "infinity" if us == Int64::MAX
+      return "-infinity" if us == Int64::MIN
+      days = us // 86_400_000_000
+      micros = us % 86_400_000_000
+      String.build do |io|
+        bc = write_civil_date(io, days)
+        io << ' '
+        seconds, fraction = micros.divmod(1_000_000)
+        hours, seconds = seconds.divmod(3600)
+        minutes, seconds = seconds.divmod(60)
+        io << hours.to_s.rjust(2, '0') << ':' << minutes.to_s.rjust(2, '0') << ':' << seconds.to_s.rjust(2, '0')
+        io << '.' << fraction.to_s.rjust(6, '0').rstrip('0') unless fraction == 0
+        io << "+00" if tz
+        io << " BC" if bc
+      end
+    end
+
+    # :nodoc:
+    #
+    # PostgreSQL's ISO text form of a `date` from its days since 2000-01-01.
+    def self.date_text(days : Int32) : String
+      return "infinity" if days == Int32::MAX
+      return "-infinity" if days == Int32::MIN
+      String.build do |io|
+        io << " BC" if write_civil_date(io, days.to_i64)
+      end
+    end
+
+    # Writes the proleptic Gregorian `YYYY-MM-DD` of *days* since
+    # 2000-01-01 (a BC year as its positive number); returns whether the
+    # year is BC. Howard Hinnant's `civil_from_days`.
+    private def self.write_civil_date(io : IO, days : Int64) : Bool
+      z = days + PG_EPOCH_DAYS + 719_468
+      era = z // 146_097
+      doe = z - era * 146_097
+      yoe = (doe - doe // 1460 + doe // 36_524 - doe // 146_096) // 365
+      doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+      mp = (5 * doy + 2) // 153
+      day = doy - (153 * mp + 2) // 5 + 1
+      month = mp < 10 ? mp + 3 : mp - 9
+      year = yoe + era * 400 + (month <= 2 ? 1 : 0)
+      bc = year <= 0
+      year = 1 - year if bc
+      io << year.to_s.rjust(4, '0') << '-' << month.to_s.rjust(2, '0') << '-' << day.to_s.rjust(2, '0')
+      bc
     end
 
     # An enum, by label from a text column (or a PostgreSQL enum, which
@@ -867,7 +1078,7 @@ module Postgres
                   raise DecodeError.new("column #{c.name.inspect}: field {{ i + 1 }} is NULL but #{typeof(Pointer(T).null.value[{{ i }}])} is not nilable")
                 {% end %}
               else
-                raise DecodeError.new("column #{c.name.inspect}: truncated record") if pos + size > b.size
+                raise DecodeError.new("column #{c.name.inspect}: truncated record") if size > b.size - pos
                 bytes = b[pos, size]
                 pos += size
                 {% if T.type_vars[i].nilable? %}
@@ -915,10 +1126,15 @@ module Postgres
       when 0xD000 then raise DecodeError.new("column #{c.name.inspect}: Infinity cannot be a BigDecimal")
       when 0xF000 then raise DecodeError.new("column #{c.name.inspect}: -Infinity cannot be a BigDecimal")
       end
+      unless sign == 0x0000 || sign == 0x4000
+        raise DecodeError.new("column #{c.name.inspect}: invalid numeric sign 0x#{sign.to_s(16)}")
+      end
       raise DecodeError.new("column #{c.name.inspect}: truncated numeric") if ndigits < 0 || dscale < 0 || b.size != 8 + ndigits * 2
       unscaled = BigInt.new(0)
       ndigits.times do |i|
-        unscaled = unscaled * 10000 + IO::ByteFormat::BigEndian.decode(Int16, b + 8 + i * 2)
+        digit = IO::ByteFormat::BigEndian.decode(Int16, b + 8 + i * 2)
+        raise DecodeError.new("column #{c.name.inspect}: invalid numeric digit #{digit}") unless 0 <= digit <= 9999
+        unscaled = unscaled * 10000 + digit
       end
       # value = unscaled * 10000^(weight - ndigits + 1); scale it by 10^dscale.
       exponent = 4 * (weight - ndigits + 1) + dscale

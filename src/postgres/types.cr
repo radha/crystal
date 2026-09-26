@@ -141,17 +141,22 @@ module Postgres
       Time::Location.fixed(@offset)
     end
 
-    # `13:14:15.5+02:00`.
+    # `13:14:15.5+02:00`, with the offset's seconds when not zero
+    # (`+05:30:15`), which PostgreSQL parses back.
     def to_s(io : IO) : Nil
-      total = @time.total_nanoseconds.to_i64
-      hours, rest = total.divmod(3_600_000_000_000)
-      minutes, rest = rest.divmod(60_000_000_000)
-      seconds, nanos = rest.divmod(1_000_000_000)
+      # Exact integer arithmetic: `total_nanoseconds` is a Float64.
+      io << '-' if @time < Time::Span.zero
+      span = @time.abs
+      nanos = span.nanoseconds
+      hours, rest = span.to_i.divmod(3600)
+      minutes, seconds = rest.divmod(60)
       io << hours.to_s.rjust(2, '0') << ':' << minutes.to_s.rjust(2, '0') << ':' << seconds.to_s.rjust(2, '0')
       io << '.' << nanos.to_s.rjust(9, '0').rstrip('0') unless nanos == 0
       sign = @offset < 0 ? '-' : '+'
-      oh, om = @offset.abs.divmod(3600)
-      io << sign << oh.to_s.rjust(2, '0') << ':' << (om // 60).to_s.rjust(2, '0')
+      oh, rest = @offset.to_i64.abs.divmod(3600)
+      om, os = rest.divmod(60)
+      io << sign << oh.to_s.rjust(2, '0') << ':' << om.to_s.rjust(2, '0')
+      io << ':' << os.to_s.rjust(2, '0') unless os == 0
     end
   end
 

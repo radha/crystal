@@ -20,12 +20,17 @@ module Postgres
     def initialize(*, @months : Int32 = 0, @days : Int32 = 0, @microseconds : Int64 = 0_i64)
     end
 
-    # Creates an interval with no months or days from *span*, truncated to
-    # whole microseconds.
+    # Creates an interval with no months or days from *span*, truncated
+    # toward zero to whole microseconds. Raises `ArgumentError` if *span*
+    # does not fit in 64 bits of microseconds (about 292,000 years).
     def initialize(span : Time::Span)
       @months = 0
       @days = 0
-      @microseconds = span.total_nanoseconds.to_i64 // 1000
+      @microseconds = begin
+        span.to_i.to_i64 * 1_000_000 + span.nanoseconds.tdiv(1000)
+      rescue OverflowError
+        raise ArgumentError.new("#{span} is out of range for an interval")
+      end
     end
 
     # Converts to a `Time::Span`, counting a day as 24 hours. Raises
@@ -33,7 +38,11 @@ module Postgres
     # length.
     def to_span : Time::Span
       raise ArgumentError.new("cannot convert an interval of #{@months} months to Time::Span") unless @months == 0
-      Time::Span.new(days: @days) + Time::Span.new(nanoseconds: @microseconds * 1000)
+      # Every interval without months fits: days * 86400 and the
+      # microseconds' seconds both stay far below Int64::MAX.
+      Time::Span.new(
+        seconds: @days.to_i64 * 86_400 + @microseconds.tdiv(1_000_000),
+        nanoseconds: @microseconds.remainder(1_000_000) * 1000)
     end
 
     # Writes the ISO 8601 duration form, e.g. `P1Y2M3DT4H5M6.5S` (`PT0S`

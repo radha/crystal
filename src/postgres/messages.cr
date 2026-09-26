@@ -117,9 +117,11 @@ module Postgres
       field value : String, cstring: true
     end
 
+    # Counts in `ParameterDescription` and `RowDescription` are unsigned
+    # 16-bit on the wire (a statement may have up to 65535 parameters).
     struct ParameterDescription
       include Binary::Format
-      field count : Int16
+      field count : UInt16
       field oids : Array(UInt32), count: :count, max: 65535
     end
 
@@ -136,7 +138,7 @@ module Postgres
 
     struct RowDescription
       include Binary::Format
-      field count : Int16
+      field count : UInt16
       field columns : Array(ColumnDescription), count: :count, max: 1664
     end
 

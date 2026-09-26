@@ -193,8 +193,11 @@ module Postgres
     # The `application_name` startup parameter, if any.
     getter application_name : String?
 
-    # How long to wait for the connection to be established. Defaults to 10 seconds.
-    getter connect_timeout : Time::Span
+    # How long to wait for the connection to be established, or `nil` to
+    # wait indefinitely. Defaults to 10 seconds. As in libpq, a
+    # `connect_timeout` setting of zero or less (in a URL, service file or
+    # `PGCONNECT_TIMEOUT`), or a `Time::Span.zero` keyword, means no timeout.
+    getter connect_timeout : Time::Span?
 
     # The number of prepared statements cached per connection (`0`
     # disables the cache). Defaults to `256`.
@@ -246,7 +249,7 @@ module Postgres
     # :nodoc:
     def initialize(@hosts : Array(Host), @user : String, @explicit_password : String?, @database : String,
                    @sslmode : SSLMode, @sslrootcert : String?, @application_name : String?,
-                   @connect_timeout : Time::Span, @statement_cache_size : Int32, @options : String?,
+                   @connect_timeout : Time::Span?, @statement_cache_size : Int32, @options : String?,
                    @target_session_attrs : TargetSessionAttrs, @load_balance_hosts : LoadBalanceHosts,
                    @passfile : String?, @channel_binding : Auth::ChannelBinding = Auth::ChannelBinding::Prefer)
       @file_passwords = if @explicit_password.presence
@@ -281,7 +284,9 @@ module Postgres
     # Returns the password to use with *host*: the one given by keyword,
     # URL, service file or `PGPASSWORD` when not empty, else the first
     # matching line of the password file (`#passfile`), else `nil`. As in
-    # libpq, a Unix socket host matches the `localhost` host name there.
+    # libpq, a Unix socket in a default socket directory
+    # (`PassFile::DEFAULT_SOCKET_DIRS`) matches the `localhost` host name
+    # there; any other socket directory matches its own path.
     def password_for(host : Host) : String?
       if (explicit = @explicit_password) && !explicit.empty?
         return explicit
@@ -359,8 +364,8 @@ module Postgres
       if port
         check_port(port)
       end
-      if connect_timeout && connect_timeout <= Time::Span.zero
-        raise ArgumentError.new("Invalid connect_timeout: #{connect_timeout} (must be positive)")
+      if connect_timeout && connect_timeout < Time::Span.zero
+        raise ArgumentError.new("Invalid connect_timeout: #{connect_timeout} (must not be negative)")
       end
       if statement_cache_size && statement_cache_size < 0
         raise ArgumentError.new("Invalid statement_cache_size: #{statement_cache_size} (must not be negative)")
@@ -387,6 +392,8 @@ module Postgres
       r_app = application_name || from_url.application_name || from_service.application_name || getenv.call("PGAPPNAME")
       r_timeout = connect_timeout || from_url.connect_timeout || from_service.connect_timeout ||
                   getenv.call("PGCONNECT_TIMEOUT").try { |v| parse_timeout(v) } || DEFAULT_CONNECT_TIMEOUT
+      # `Time::Span.zero` stands for "no timeout" until here.
+      r_timeout = nil if r_timeout.zero?
       r_cache = statement_cache_size || from_url.statement_cache_size || DEFAULT_STATEMENT_CACHE_SIZE
       r_options = options.presence || from_url.options || from_service.options || getenv.call("PGOPTIONS")
       if search_path
@@ -418,7 +425,7 @@ module Postgres
       io << ", sslmode: " << @sslmode
       io << ", sslrootcert: " << @sslrootcert.inspect
       io << ", application_name: " << @application_name.inspect
-      io << ", connect_timeout: " << @connect_timeout
+      io << ", connect_timeout: " << (@connect_timeout || "nil")
       io << ", socket_path: " << socket_path.inspect
       io << ", statement_cache_size: " << @statement_cache_size
       io << ", options: " << @options.inspect
@@ -447,12 +454,15 @@ module Postgres
     end
 
     # :nodoc:
+    #
+    # Parses integer seconds; zero or less means no timeout, as in libpq,
+    # and is returned as `Time::Span.zero`.
     def self.parse_timeout(value : String) : Time::Span
-      seconds = value.to_i?
-      unless seconds && seconds > 0
-        raise ArgumentError.new("Invalid connect_timeout: #{value.inspect} (must be a positive integer of seconds)")
+      seconds = value.strip.to_i?
+      unless seconds
+        raise ArgumentError.new("Invalid connect_timeout: #{value.inspect} (must be an integer of seconds)")
       end
-      seconds.seconds
+      seconds > 0 ? seconds.seconds : Time::Span.zero
     end
 
     # :nodoc:
@@ -614,7 +624,8 @@ module Postgres
         spec.split(',').each do |entry|
           if entry.starts_with?('[')
             close = entry.index(']') || raise ArgumentError.new("Invalid PostgreSQL URL: unterminated IPv6 address in #{entry.inspect}")
-            host = entry[1...close]
+            # A zone index is percent-encoded: `[fe80::1%25eth0]`.
+            host = URI.decode(entry[1...close])
             tail = entry[(close + 1)..]
             unless tail.empty? || tail.starts_with?(':')
               raise ArgumentError.new("Invalid PostgreSQL URL: unexpected #{tail.inspect} after IPv6 address")
@@ -769,11 +780,20 @@ module Postgres
         fields
       end
 
+      # The Unix socket directories that match `localhost` in the password
+      # file. libpq only maps its compiled-in `DEFAULT_PGSOCKET_DIR`; since
+      # that differs between builds, both the upstream default (`/tmp`) and
+      # the Debian/Ubuntu one (`/var/run/postgresql`) are accepted.
+      DEFAULT_SOCKET_DIRS = {"/tmp", "/var/run/postgresql"}
+
       # Returns the password of the first entry matching *host*, *database*
-      # and *user*, or `nil` (also for an empty password).
+      # and *user*, or `nil` (also for an empty password). A Unix socket
+      # directory matches as `localhost` when it is one of
+      # `DEFAULT_SOCKET_DIRS`, else as the directory path itself.
       def self.lookup(entries : Array(Array(String?)), host : Host, database : String, user : String) : String?
         return nil if entries.empty?
-        hostname = host.unix_socket? ? "localhost" : host.host
+        hostname = host.host
+        hostname = Config::DEFAULT_HOST if host.unix_socket? && DEFAULT_SOCKET_DIRS.includes?(hostname.rchop('/'))
         port = host.port.to_s
         entries.each do |fields|
           next unless matches?(fields[0], hostname) && matches?(fields[1], port) &&
