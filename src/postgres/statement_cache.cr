@@ -12,9 +12,13 @@ module Postgres
     # otherwise one code per column.
     getter result_formats : Array(Int16)
 
-    def initialize(@name : String, @param_oids : Array(UInt32), columns : Array(Column))
+    # *declared_params* are the server's parameter types; `param_oids`
+    # holds what the codec encodes them as (domains as their base type).
+    def initialize(@name : String, declared_params : Array(UInt32), columns : Array(Column), types : TypeMap? = nil)
+      @param_oids = declared_params.map { |oid| types.try(&.resolve_param(oid)) || oid }
       @columns = columns.map do |c|
-        Column.new(c.name, c.type_oid, c.table_oid, c.type_modifier, OID.binary?(c.type_oid) ? 1_i16 : 0_i16)
+        codec_oid = types.try(&.resolve_column(c.type_oid)) || c.type_oid
+        Column.new(c.name, c.type_oid, c.table_oid, c.type_modifier, OID.binary?(codec_oid) ? 1_i16 : 0_i16, types)
       end
       @result_formats = if @columns.all?(&.binary?)
                           @columns.empty? ? [] of Int16 : [1_i16]

@@ -3,38 +3,40 @@ module Postgres
   #
   # Type OIDs of the built-in types the codec knows (`pg_type.oid`).
   module OID
-    BOOL        =   16_u32
-    BYTEA       =   17_u32
-    CHAR        =   18_u32
-    NAME        =   19_u32
-    INT8        =   20_u32
-    INT2        =   21_u32
-    INT4        =   23_u32
-    TEXT        =   25_u32
-    OID         =   26_u32
-    JSON        =  114_u32
-    FLOAT4      =  700_u32
-    FLOAT8      =  701_u32
-    UNKNOWN     =  705_u32
-    BPCHAR      = 1042_u32
-    VARCHAR     = 1043_u32
-    DATE        = 1082_u32
-    TIME        = 1083_u32
-    TIMESTAMP   = 1114_u32
-    TIMESTAMPTZ = 1184_u32
-    INTERVAL    = 1186_u32
-    NUMERIC     = 1700_u32
-    UUID        = 2950_u32
-    JSONB       = 3802_u32
-    XML         =  142_u32
-    CIDR        =  650_u32
-    MONEY       =  790_u32
-    MACADDR8    =  774_u32
-    MACADDR     =  829_u32
-    INET        =  869_u32
-    TIMETZ      = 1266_u32
-    BIT         = 1560_u32
-    VARBIT      = 1562_u32
+    BOOL         =   16_u32
+    BYTEA        =   17_u32
+    CHAR         =   18_u32
+    NAME         =   19_u32
+    INT8         =   20_u32
+    INT2         =   21_u32
+    INT4         =   23_u32
+    TEXT         =   25_u32
+    OID          =   26_u32
+    JSON         =  114_u32
+    FLOAT4       =  700_u32
+    FLOAT8       =  701_u32
+    UNKNOWN      =  705_u32
+    BPCHAR       = 1042_u32
+    VARCHAR      = 1043_u32
+    DATE         = 1082_u32
+    TIME         = 1083_u32
+    TIMESTAMP    = 1114_u32
+    TIMESTAMPTZ  = 1184_u32
+    INTERVAL     = 1186_u32
+    NUMERIC      = 1700_u32
+    UUID         = 2950_u32
+    JSONB        = 3802_u32
+    RECORD       = 2249_u32
+    RECORD_ARRAY = 2287_u32
+    XML          =  142_u32
+    CIDR         =  650_u32
+    MONEY        =  790_u32
+    MACADDR8     =  774_u32
+    MACADDR      =  829_u32
+    INET         =  869_u32
+    TIMETZ       = 1266_u32
+    BIT          = 1560_u32
+    VARBIT       = 1562_u32
 
     # :nodoc:
     # Range types and their element types.
@@ -60,6 +62,7 @@ module Postgres
       1041_u32 => INET, 1270_u32 => TIMETZ, 1561_u32 => BIT, 1563_u32 => VARBIT,
       3905_u32 => 3904_u32, 3927_u32 => 3926_u32, 3907_u32 => 3906_u32, 3909_u32 => 3908_u32,
       3911_u32 => 3910_u32, 3913_u32 => 3912_u32,
+      2287_u32 => RECORD,
     }
 
     # The element type of array type *oid*, or nil if *oid* is not an
@@ -74,7 +77,7 @@ module Postgres
       case oid
       when BOOL, BYTEA, CHAR, NAME, INT8, INT2, INT4, TEXT, OID, JSON, FLOAT4, FLOAT8, UNKNOWN,
            BPCHAR, VARCHAR, DATE, TIME, TIMESTAMP, TIMESTAMPTZ, INTERVAL, NUMERIC, UUID, JSONB,
-           XML, CIDR, MONEY, MACADDR8, MACADDR, INET, TIMETZ, BIT, VARBIT
+           XML, CIDR, MONEY, MACADDR8, MACADDR, INET, TIMETZ, BIT, VARBIT, RECORD
         true
       else
         ARRAY_ELEMENTS.has_key?(oid) || RANGE_ELEMENTS.has_key?(oid)
@@ -115,6 +118,7 @@ module Postgres
       when NUMERIC     then "numeric"
       when UUID        then "uuid"
       when JSONB       then "jsonb"
+      when RECORD      then "record"
       when XML         then "xml"
       when CIDR        then "cidr"
       when MONEY       then "money"

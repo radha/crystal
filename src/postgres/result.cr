@@ -1,3 +1,5 @@
+require "./type_map"
+
 module Postgres
   # One column of a result, as the server described it.
   struct Column
@@ -11,9 +13,17 @@ module Postgres
     getter type_modifier : Int32
     # 1 when the column is transferred in binary, 0 in text.
     getter format : Int16
+    # :nodoc:
+    #
+    # The OID the codec decodes this column as: `type_oid`, or for a domain
+    # its base type, for a composite `record` (see `TypeMap`).
+    getter codec_oid : UInt32
+    # :nodoc:
+    getter types : TypeMap?
 
     def initialize(@name : String, @type_oid : UInt32, @table_oid : UInt32 = 0_u32,
-                   @type_modifier : Int32 = -1, @format : Int16 = 1_i16)
+                   @type_modifier : Int32 = -1, @format : Int16 = 1_i16, @types : TypeMap? = nil)
+      @codec_oid = @types.try(&.resolve_column(@type_oid)) || @type_oid
     end
 
     # Whether the column is transferred in binary.
@@ -138,6 +148,8 @@ module Postgres
   end
 end
 
+require "./type_map"
+
 module Postgres
   # :nodoc:
   #
@@ -155,6 +167,13 @@ module Postgres
   # Only ever used inside `typeof`: the instance type of *type*.
   def self.instance_of(type : X.class) : X forall X
     Pointer(X).null.value # never evaluated: `typeof` only
+  end
+
+  # :nodoc:
+  #
+  # A nested tuple of types (`{Int32, {Int32, String}}`): the tuple type.
+  def self.instance_of(types : Tuple)
+    instance_of(tuple_type(types))
   end
 
   # :nodoc:

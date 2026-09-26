@@ -314,6 +314,27 @@ module Postgres
       io << '"'
     end
 
+    # A `Tuple` as a composite (row) value, sent as a row literal the server
+    # parses by the composite's own field types: `(1,"a b",)`, NULL for
+    # nil. Fields are written with `to_s`, so keep them to scalars.
+    def self.encode(io : IO, oid : UInt32, value : Tuple) : Int16
+      mismatch(oid, value) if OID.binary?(oid) && oid != OID::RECORD
+      io << '('
+      value.each_with_index do |item, i|
+        io << ',' if i > 0
+        next if item.nil?
+        io << '"'
+        text = item.is_a?(Time) ? item.to_utc.to_s("%F %T.%6N+00") : item.to_s
+        text.each_char do |char|
+          io << char if char == '"' || char == '\\'
+          io << char
+        end
+        io << '"'
+      end
+      io << ')'
+      TEXT
+    end
+
     # An enum: its value for an integer parameter, otherwise its name in
     # `snake_case` (`Status::OnHold` → `"on_hold"`), matching the usual
     # spelling of PostgreSQL enum labels.
@@ -390,18 +411,18 @@ module Postgres
     # --- decoding ---------------------------------------------------------
 
     def self.decode(b : Bytes, c : Column, type : Bool.class) : Bool
-      mismatch(c, type) unless c.binary? && c.type_oid == OID::BOOL && b.size == 1
+      mismatch(c, type) unless c.binary? && c.codec_oid == OID::BOOL && b.size == 1
       b[0] != 0
     end
 
     def self.decode(b : Bytes, c : Column, type : Int16.class) : Int16
-      mismatch(c, type) unless c.binary? && c.type_oid == OID::INT2
+      mismatch(c, type) unless c.binary? && c.codec_oid == OID::INT2
       int(b, c, Int16)
     end
 
     def self.decode(b : Bytes, c : Column, type : Int32.class) : Int32
       mismatch(c, type) unless c.binary?
-      case c.type_oid
+      case c.codec_oid
       when OID::INT4 then int(b, c, Int32)
       when OID::INT2 then int(b, c, Int16).to_i32
       else                mismatch(c, type)
@@ -410,7 +431,7 @@ module Postgres
 
     def self.decode(b : Bytes, c : Column, type : Int64.class) : Int64
       mismatch(c, type) unless c.binary?
-      case c.type_oid
+      case c.codec_oid
       when OID::INT8  then int(b, c, Int64)
       when OID::INT4  then int(b, c, Int32).to_i64
       when OID::INT2  then int(b, c, Int16).to_i64
@@ -420,18 +441,18 @@ module Postgres
     end
 
     def self.decode(b : Bytes, c : Column, type : UInt32.class) : UInt32
-      mismatch(c, type) unless c.binary? && c.type_oid == OID::OID
+      mismatch(c, type) unless c.binary? && c.codec_oid == OID::OID
       int(b, c, UInt32)
     end
 
     def self.decode(b : Bytes, c : Column, type : Float32.class) : Float32
-      mismatch(c, type) unless c.binary? && c.type_oid == OID::FLOAT4
+      mismatch(c, type) unless c.binary? && c.codec_oid == OID::FLOAT4
       int(b, c, Float32)
     end
 
     def self.decode(b : Bytes, c : Column, type : Float64.class) : Float64
       mismatch(c, type) unless c.binary?
-      case c.type_oid
+      case c.codec_oid
       when OID::FLOAT8 then int(b, c, Float64)
       when OID::FLOAT4 then int(b, c, Float32).to_f64
       else                  mismatch(c, type)
@@ -440,7 +461,7 @@ module Postgres
 
     def self.decode(b : Bytes, c : Column, type : BigDecimal.class) : BigDecimal
       mismatch(c, type) unless c.binary?
-      case c.type_oid
+      case c.codec_oid
       when OID::NUMERIC then read_numeric(b, c)
       when OID::INT8    then BigDecimal.new(int(b, c, Int64))
       when OID::INT4    then BigDecimal.new(int(b, c, Int32))
@@ -451,7 +472,7 @@ module Postgres
 
     def self.decode(b : Bytes, c : Column, type : String.class) : String
       return String.new(b) unless c.binary?
-      case c.type_oid
+      case c.codec_oid
       when OID::TEXT, OID::VARCHAR, OID::BPCHAR, OID::NAME, OID::CHAR, OID::UNKNOWN, OID::JSON, OID::XML
         String.new(b)
       when OID::JSONB
@@ -461,7 +482,7 @@ module Postgres
       when OID::TIMETZ                 then decode(b, c, TimeTz).to_s
       when OID::BIT, OID::VARBIT       then String.build { |s| decode(b, c, BitArray).each { |bit| s << (bit ? '1' : '0') } }
       else
-        if OID.range_element(c.type_oid)
+        if OID.range_element(c.codec_oid)
           range_text(b, c)
         else
           mismatch(c, type)
@@ -470,12 +491,12 @@ module Postgres
     end
 
     def self.decode(b : Bytes, c : Column, type : Bytes.class) : Bytes
-      mismatch(c, type) unless c.binary? && c.type_oid == OID::BYTEA
+      mismatch(c, type) unless c.binary? && c.codec_oid == OID::BYTEA
       b.dup
     end
 
     def self.decode(b : Bytes, c : Column, type : UUID.class) : UUID
-      mismatch(c, type) unless c.binary? && c.type_oid == OID::UUID && b.size == 16
+      mismatch(c, type) unless c.binary? && c.codec_oid == OID::UUID && b.size == 16
       bytes = uninitialized UInt8[16]
       b.copy_to(bytes.to_slice)
       UUID.new(bytes)
@@ -483,7 +504,7 @@ module Postgres
 
     def self.decode(b : Bytes, c : Column, type : Time.class) : Time
       mismatch(c, type) unless c.binary?
-      case c.type_oid
+      case c.codec_oid
       when OID::TIMESTAMPTZ, OID::TIMESTAMP
         us = int(b, c, Int64)
         if us == Int64::MAX || us == Int64::MIN
@@ -503,7 +524,7 @@ module Postgres
 
     def self.decode(b : Bytes, c : Column, type : Time::Span.class) : Time::Span
       mismatch(c, type) unless c.binary?
-      case c.type_oid
+      case c.codec_oid
       when OID::TIME
         Time::Span.new(nanoseconds: int(b, c, Int64) * 1000)
       when OID::INTERVAL
@@ -518,13 +539,13 @@ module Postgres
     end
 
     def self.decode(b : Bytes, c : Column, type : Interval.class) : Interval
-      mismatch(c, type) unless c.binary? && c.type_oid == OID::INTERVAL
+      mismatch(c, type) unless c.binary? && c.codec_oid == OID::INTERVAL
       read_interval(b, c)
     end
 
     def self.decode(b : Bytes, c : Column, type : JSON::Any.class) : JSON::Any
       mismatch(c, type) unless c.binary?
-      case c.type_oid
+      case c.codec_oid
       when OID::JSON  then JSON.parse(String.new(b))
       when OID::JSONB then JSON.parse(jsonb(b, c))
       else                 mismatch(c, type)
@@ -535,7 +556,7 @@ module Postgres
     # decode like columns of the element type; a nilable element type
     # reads NULL elements as `nil`.
     def self.decode(b : Bytes, c : Column, type : Array(T).class) : Array(T) forall T
-      element = c.binary? ? OID.element(c.type_oid) : nil
+      element = c.binary? ? OID.element(c.codec_oid) : nil
       mismatch(c, type) unless element
       raise DecodeError.new("column #{c.name.inspect}: truncated array") if b.size < 12
       dimensions = IO::ByteFormat::BigEndian.decode(Int32, b)
@@ -546,7 +567,7 @@ module Postgres
       raise DecodeError.new("column #{c.name.inspect}: truncated array") if b.size < 20
       count = IO::ByteFormat::BigEndian.decode(Int32, b + 12)
       raise DecodeError.new("column #{c.name.inspect}: negative array size") if count < 0
-      element_column = Column.new(c.name, IO::ByteFormat::BigEndian.decode(UInt32, b + 8))
+      element_column = Column.new(c.name, IO::ByteFormat::BigEndian.decode(UInt32, b + 8), types: c.types)
       pos = 20
       Array(T).new(count) do
         raise DecodeError.new("column #{c.name.inspect}: truncated array") if pos + 4 > b.size
@@ -573,9 +594,9 @@ module Postgres
     end
 
     def self.decode(b : Bytes, c : Column, type : Inet.class) : Inet
-      mismatch(c, type) unless c.binary? && (c.type_oid == OID::INET || c.type_oid == OID::CIDR)
+      mismatch(c, type) unless c.binary? && (c.codec_oid == OID::INET || c.codec_oid == OID::CIDR)
       unless b.size >= 4 && b.size == 4 + b[3]
-        raise DecodeError.new("column #{c.name.inspect}: malformed #{OID.name(c.type_oid)}")
+        raise DecodeError.new("column #{c.name.inspect}: malformed #{OID.name(c.codec_oid)}")
       end
       Inet.new(b[4, b[3]].dup, b[1].to_i, cidr: b[2] == 1)
     rescue ex : ArgumentError
@@ -588,21 +609,21 @@ module Postgres
     end
 
     def self.decode(b : Bytes, c : Column, type : MacAddress.class) : MacAddress
-      mismatch(c, type) unless c.binary? && (c.type_oid == OID::MACADDR || c.type_oid == OID::MACADDR8)
+      mismatch(c, type) unless c.binary? && (c.codec_oid == OID::MACADDR || c.codec_oid == OID::MACADDR8)
       MacAddress.new(b.dup)
     rescue ex : ArgumentError
       raise DecodeError.new("column #{c.name.inspect}: #{ex.message}")
     end
 
     def self.decode(b : Bytes, c : Column, type : TimeTz.class) : TimeTz
-      mismatch(c, type) unless c.binary? && c.type_oid == OID::TIMETZ
+      mismatch(c, type) unless c.binary? && c.codec_oid == OID::TIMETZ
       raise DecodeError.new("column #{c.name.inspect}: expected 12 bytes for timetz, got #{b.size}") unless b.size == 12
       TimeTz.new(Time::Span.new(nanoseconds: IO::ByteFormat::BigEndian.decode(Int64, b) * 1000),
         -IO::ByteFormat::BigEndian.decode(Int32, b + 8))
     end
 
     def self.decode(b : Bytes, c : Column, type : BitArray.class) : BitArray
-      mismatch(c, type) unless c.binary? && (c.type_oid == OID::BIT || c.type_oid == OID::VARBIT)
+      mismatch(c, type) unless c.binary? && (c.codec_oid == OID::BIT || c.codec_oid == OID::VARBIT)
       raise DecodeError.new("column #{c.name.inspect}: truncated bit string") if b.size < 4
       size = IO::ByteFormat::BigEndian.decode(Int32, b)
       raise DecodeError.new("column #{c.name.inspect}: truncated bit string") if size < 0 || b.size < 4 + (size + 7) // 8
@@ -685,11 +706,11 @@ module Postgres
 
     # A range of `T` (`Postgres::Range(Int32)` for `int4range`, ...).
     def self.decode(b : Bytes, c : Column, type : Range(T).class) : Range(T) forall T
-      element = c.binary? ? OID.range_element(c.type_oid) : nil
+      element = c.binary? ? OID.range_element(c.codec_oid) : nil
       mismatch(c, type) unless element
       lower, upper, flags = range_bounds(b, c)
       return Range(T).empty if flags.bits_set?(0x01)
-      element_column = Column.new(c.name, element)
+      element_column = Column.new(c.name, element, types: c.types)
       Range(T).new(lower.try { |l| decode(l, element_column, T) }, upper.try { |u| decode(u, element_column, T) },
         lower_inclusive: flags.bits_set?(0x02), upper_inclusive: flags.bits_set?(0x04))
     end
@@ -716,7 +737,7 @@ module Postgres
     private def self.range_text(b : Bytes, c : Column) : String
       lower, upper, flags = range_bounds(b, c)
       return "empty" if flags.bits_set?(0x01)
-      element = Column.new(c.name, OID.range_element(c.type_oid).not_nil!)
+      element = Column.new(c.name, OID.range_element(c.codec_oid).not_nil!, types: c.types)
       String.build do |s|
         s << (flags.bits_set?(0x02) ? '[' : '(')
         lower.try { |l| s << bound_text(l, element) }
@@ -727,7 +748,7 @@ module Postgres
     end
 
     private def self.bound_text(b : Bytes, c : Column) : String
-      case c.type_oid
+      case c.codec_oid
       when OID::INT4, OID::INT8 then decode(b, c, Int64).to_s
       when OID::NUMERIC         then decode(b, c, BigDecimal).to_s
       when OID::DATE            then decode(b, c, Time).to_s("%F")
@@ -742,20 +763,57 @@ module Postgres
     # is a compile-time error.
     def self.decode(b : Bytes, c : Column, type : T.class) : T forall T
       {% if T < Enum %}
-        if c.binary? && (c.type_oid == OID::INT2 || c.type_oid == OID::INT4 || c.type_oid == OID::INT8)
+        if c.binary? && (c.codec_oid == OID::INT2 || c.codec_oid == OID::INT4 || c.codec_oid == OID::INT8)
           number = decode(b, c, Int64)
           T.from_value?(number) || raise DecodeError.new("column #{c.name.inspect}: #{number} is not a value of #{T}")
         else
           label = decode(b, c, String)
           T.parse?(label) || raise DecodeError.new("column #{c.name.inspect}: #{label.inspect} is not a member of #{T}")
         end
+      {% elsif T < Tuple %}
+        # A composite (row) value, positionally: Int32 field count, then
+        # per field its type OID, length (-1: NULL) and bytes.
+        mismatch(c, type) unless c.binary? && c.codec_oid == OID::RECORD
+        raise DecodeError.new("column #{c.name.inspect}: truncated record") if b.size < 4
+        count = IO::ByteFormat::BigEndian.decode(Int32, b)
+        unless count == {{ T.type_vars.size }}
+          raise DecodeError.new("column #{c.name.inspect}: a record of #{count} fields cannot be decoded as #{T}")
+        end
+        pos = 4
+        {
+          {% for i in 0...T.type_vars.size %}
+            begin
+              raise DecodeError.new("column #{c.name.inspect}: truncated record") if pos + 8 > b.size
+              field_oid = IO::ByteFormat::BigEndian.decode(UInt32, b + pos)
+              size = IO::ByteFormat::BigEndian.decode(Int32, b + pos + 4)
+              pos += 8
+              field = Column.new(c.name, field_oid, types: c.types)
+              if size < 0
+                {% if T.type_vars[i].nilable? %}
+                  nil
+                {% else %}
+                  raise DecodeError.new("column #{c.name.inspect}: field {{ i + 1 }} is NULL but #{typeof(Pointer(T).null.value[{{ i }}])} is not nilable")
+                {% end %}
+              else
+                raise DecodeError.new("column #{c.name.inspect}: truncated record") if pos + size > b.size
+                bytes = b[pos, size]
+                pos += size
+                {% if T.type_vars[i].nilable? %}
+                  decode(bytes, field, typeof(Pointer(T).null.value[{{ i }}].not_nil!))
+                {% else %}
+                  decode(bytes, field, typeof(Pointer(T).null.value[{{ i }}]))
+                {% end %}
+              end
+            end,
+          {% end %}
+        }
       {% else %}
         {% raise "Postgres cannot decode a column as #{T}: use a supported type, a Postgres::Serializable, or a converter (@[Postgres::Field(converter: ...)])" %}
       {% end %}
     end
 
     private def self.int(b : Bytes, c : Column, type : T.class) : T forall T
-      raise DecodeError.new("column #{c.name.inspect}: expected #{sizeof(T)} bytes for #{OID.name(c.type_oid)}, got #{b.size}") unless b.size == sizeof(T)
+      raise DecodeError.new("column #{c.name.inspect}: expected #{sizeof(T)} bytes for #{OID.name(c.codec_oid)}, got #{b.size}") unless b.size == sizeof(T)
       IO::ByteFormat::BigEndian.decode(T, b)
     end
 
@@ -802,7 +860,7 @@ module Postgres
     end
 
     private def self.mismatch(c : Column, type) : NoReturn
-      how = c.binary? ? OID.name(c.type_oid) : "#{OID.name(c.type_oid)} (text format)"
+      how = c.binary? ? OID.name(c.codec_oid) : "#{OID.name(c.codec_oid)} (text format)"
       raise DecodeError.new("column #{c.name.inspect} of type #{how} cannot be decoded as #{type}")
     end
   end

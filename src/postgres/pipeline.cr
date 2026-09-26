@@ -255,14 +255,22 @@ module Postgres
           @out.write(Messages::SYNC)
         end
         flush
+        described = [] of {String, PreparedStatement}
         to_prepare.each do |sql, name|
           statement, error = read_prepared(name)
           if statement
-            statements[sql] = statement
-            @cache.add(sql, statement) if @cache.enabled?
+            described << {sql, statement}
           else
             ops.each { |op| op.reject(error.not_nil!) if op.sql == sql }
           end
+        end
+        # One introspection for every new statement, then rebuild them with
+        # what it learned (domain parameters, composite columns).
+        introspect(described.flat_map { |_, s| s.param_oids + s.columns.map(&.type_oid) })
+        described.each do |sql, raw|
+          statement = PreparedStatement.new(raw.name, raw.param_oids, raw.columns, @types)
+          statements[sql] = statement
+          @cache.add(sql, statement) if @cache.enabled?
         end
       end
 

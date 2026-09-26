@@ -123,6 +123,7 @@ module Postgres
     @timed_out : IO::TimeoutError?
     @tls_context : OpenSSL::SSL::Context::Client?
     @cache : StatementCache
+    @types = TypeMap.new
     @reader : RowReader?
 
     # Opens a session with *config* (see `Config.parse`).
@@ -383,6 +384,12 @@ module Postgres
       {% if T.class.has_method?(:from_pg_row) %}
         T.from_pg_row(row)
       {% elsif T < Tuple %}
+        # One composite column read as a tuple of its fields.
+        {% if T.type_vars.size > 1 %}
+          if row.size == 1 && row.columns[0].codec_oid == OID::RECORD
+            return row.read(0, T)
+          end
+        {% end %}
         unless row.size == {{ T.type_vars.size }}
           raise DecodeError.new("#{T} reads {{ T.type_vars.size }} columns, but the result has #{row.size}")
         end
@@ -723,9 +730,30 @@ module Postgres
         end
       end
       raise error if error
-      statement = PreparedStatement.new(name, param_oids, columns)
+      introspect(param_oids + columns.map(&.type_oid))
+      statement = PreparedStatement.new(name, param_oids, columns, @types)
       @cache.add(sql, statement) if @cache.enabled?
       statement
+    end
+
+    # Asks `pg_type` about the OIDs among *oids* the codec does not know
+    # (domains, composites, arrays of those) and records the answers in
+    # the connection's `TypeMap`. Its own query uses built-in types only,
+    # so it cannot recurse. Arrays of unknown elements take a second round.
+    private def introspect(oids : Enumerable(UInt32), depth : Int32 = 0) : Nil
+      unknown = @types.unknown(oids)
+      return if unknown.empty? || depth > 4
+      rows = [] of {UInt32, String, UInt32, UInt32, UInt32, Array(UInt32)}
+      run_extended(TypeMap::INTROSPECT, {unknown}, false) do |row|
+        rows << {row.read(0, UInt32), row.read(1, String), row.read(2, UInt32), row.read(3, UInt32),
+                 row.read(4, UInt32), row.read(5, Array(UInt32))}
+      end
+      # Array elements and composite fields first (an array resolves
+      # through its element's entry; a record's fields are decoded by OID).
+      dependencies = rows.flat_map { |r| r[5] + (r[3] == 0 ? [] of UInt32 : [r[3]]) } - unknown
+      introspect(dependencies, depth + 1)
+      rows.sort_by! { |r| r[3] == 0 ? 0 : 1 }
+      rows.each { |oid, kind, base, element, base_array, _| @types.learn(oid, kind, base, element, base_array) }
     end
 
     # `Bind`: portal and statement names, parameter formats, values (each
