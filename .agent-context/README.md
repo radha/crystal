@@ -16,11 +16,21 @@ that finished the Postgres track and merged it to fork `master`).
   `require "pool"` (generic `Pool(T)`), and **`require "postgres"`,
   feature complete**: see `docs/superpowers/specs/2026-09-26-postgres-client-design.md`
   (§1–14 design, §15–17 what was built and why, per round).
+- **SortedMap / SortedSet** (`require "sorted_map"`, `"sorted_set"`, plus
+  `sorted_map/json` etc.): a B-tree with split/join `delete_range`, at or
+  under 1.22× Rust `BTreeMap` nearly everywhere. Design:
+  `docs/superpowers/specs/2026-09-26-sorted-map-design.md`. Bench:
+  `harnesses/harness-2026-09-26/sorted_map/`.
+- **LRUCache / SyncLRUCache** (`require "lru_cache"`): count or weight
+  bound, TTL, eviction callback, single-flight fetch. Writes beat Rust's
+  `lru`, reads 1.2-1.6×. Bench: `harnesses/harness-2026-09-26/lru_cache/`.
+- Both are on branch `claude/hopeful-tesla-ux066m`, in a PR to fork
+  `master` (not merged yet).
 - **Runtime fixes on the fork** (found through the Postgres benchmarks):
   lazy event-loop timer re-arm, allocation-free `Pool(T)` checkout, and the
   `Parallel` scheduler waking parked threads after the event loop readies
   several fibers.
-- **Next up** (user to choose): Tier 5 containers (SortedMap/B-tree, LRU),
+- **Next up** (user to choose): merge the Tier 5 PR, then
   Tier 6 fillers (TOML, CLI subcommands), or exercising the Postgres client
   in a real app first.
 
