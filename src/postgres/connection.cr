@@ -377,14 +377,14 @@ module Postgres
             raise AuthenticationError.new("unsupported authentication method #{code}")
           end
         when 'K'
-          key = Messages::BackendKeyData.from_slice(body)
+          key = parse { Messages::BackendKeyData.from_slice(body) }
           @backend_pid = key.pid
           @secret = key.secret
         when 'Z'
-          @transaction_status = body[0].unsafe_chr
+          @transaction_status = ready_status(body)
           break
         when 'E'
-          fields = error_fields(body)
+          fields = parse { error_fields(body) }
           message = QueryError.format(fields)
           raise AuthenticationError.new(message) if fields['C']?.try(&.starts_with?("28"))
           raise ConnectionError.new(message)
@@ -414,13 +414,13 @@ module Postgres
         loop do
           type, body = read_message
           case type
-          when 'C' then result = ExecResult.from_tag(Messages::CommandComplete.from_slice(body).tag)
+          when 'C' then result = ExecResult.from_tag(parse { Messages::CommandComplete.from_slice(body) }.tag)
           when 'T', 'D', 'I', '3'
             # Rows of a simple query are not returned; empty query; the
             # `CloseComplete`s of queued statement closes.
-          when 'E' then error ||= query_error(body)
+          when 'E' then error ||= parse { query_error(body) }
           when 'Z'
-            @transaction_status = body[0].unsafe_chr
+            @transaction_status = ready_status(body)
             break
           else
             handle_async(type, body) || unexpected(type)
@@ -481,7 +481,7 @@ module Postgres
         case type
         when 'D'
           next if error || failure
-          reader.load(body)
+          parse { reader.load(body) }
           begin
             yield reader
           rescue ex
@@ -489,11 +489,11 @@ module Postgres
             # step, then raise.
             failure = ex
           end
-        when 'C' then result = ExecResult.from_tag(Messages::CommandComplete.from_slice(body).tag)
+        when 'C' then result = ExecResult.from_tag(parse { Messages::CommandComplete.from_slice(body) }.tag)
         when '2', '3', 'I', 'n', 's'
-        when 'E' then error ||= query_error(body)
+        when 'E' then error ||= parse { query_error(body) }
         when 'Z'
-          @transaction_status = body[0].unsafe_chr
+          @transaction_status = ready_status(body)
           break
         else
           handle_async(type, body) || unexpected(type)
@@ -542,15 +542,15 @@ module Postgres
         type, body = read_message
         case type
         when 't'
-          param_oids = Messages::ParameterDescription.from_slice(body).oids
+          param_oids = parse { Messages::ParameterDescription.from_slice(body) }.oids
         when 'T'
-          columns = Messages::RowDescription.from_slice(body).columns.map do |c|
+          columns = parse { Messages::RowDescription.from_slice(body) }.columns.map do |c|
             Column.new(c.name, c.type_oid, c.table_oid, c.type_modifier, c.format)
           end
         when '1', '3', 'n'
-        when 'E' then error ||= query_error(body)
+        when 'E' then error ||= parse { query_error(body) }
         when 'Z'
-          @transaction_status = body[0].unsafe_chr
+          @transaction_status = ready_status(body)
           break
         else
           handle_async(type, body) || unexpected(type)
@@ -645,11 +645,12 @@ module Postgres
       header = uninitialized UInt8[5]
       @io.read_fully(header.to_slice)
       type = header[0].unsafe_chr
-      length = IO::ByteFormat::BigEndian.decode(Int32, header.to_slice + 1) - 4
-      if length < 0 || length > MAX_MESSAGE_SIZE
-        close
-        raise ProtocolError.new("invalid message length #{length + 4} for #{type.inspect}")
+      raw = IO::ByteFormat::BigEndian.decode(Int32, header.to_slice + 1)
+      if raw < 4 || raw - 4 > MAX_MESSAGE_SIZE
+        close_quietly
+        raise ProtocolError.new("invalid message length #{raw} for #{type.inspect}")
       end
+      length = raw - 4
       @buffer = Bytes.new(Math.pw2ceil(length)) if length > @buffer.size
       body = @buffer[0, length]
       @io.read_fully(body)
@@ -662,6 +663,28 @@ module Postgres
       lost(ex)
     end
 
+    # Runs a decoder over a message body. A malformed body closes the
+    # connection (it is out of step with the server) and raises
+    # `ProtocolError`.
+    private def parse(& : -> T) : T forall T
+      yield
+    rescue ex : ProtocolError
+      close_quietly
+      raise ex
+    rescue ex : IO::EOFError | Binary::Error | IndexError | ArgumentError
+      close_quietly
+      raise ProtocolError.new("malformed message: #{ex.message}", cause: ex)
+    end
+
+    # The status byte of a `ReadyForQuery`.
+    private def ready_status(body : Bytes) : Char
+      unless body.size == 1
+        close_quietly
+        raise ProtocolError.new("ReadyForQuery with a #{body.size}-byte body")
+      end
+      body[0].unsafe_chr
+    end
+
     # The server's own limit on a message.
     MAX_MESSAGE_SIZE = 1 << 30
 
@@ -670,7 +693,7 @@ module Postgres
     private def handle_async(type : Char, body : Bytes) : Bool
       case type
       when 'S'
-        status = Messages::ParameterStatus.from_slice(body)
+        status = parse { Messages::ParameterStatus.from_slice(body) }
         @parameters[status.name] = status.value
       when 'N'
         @on_notice.try &.call(Notice.new(error_fields(body)))
