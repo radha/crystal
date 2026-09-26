@@ -12,6 +12,13 @@ private struct Person
   getter touched = false
 end
 
+private struct Tagged
+  include Postgres::Serializable
+  getter id : Int32
+  getter tags : Array(String)
+  getter scores : Array(Float64?)?
+end
+
 private struct Strict
   include Postgres::Serializable
   getter id : Int64
@@ -61,9 +68,37 @@ describe "Postgres live" do
       conn.query_one("select $1::json", %({"b": 2}), as: String).should eq(%({"b": 2}))
       conn.query_one("select $1::jsonb", %({"b": 2}), as: JSON::Any)["b"].should eq(2)
       conn.query_one("select $1::int4 + 1", nil, as: Int32?).should be_nil
-      conn.query_one("select array[1,2,3]", as: String).should eq("{1,2,3}")
-      conn.query_one("select $1::int[]", "{4,5}", as: String).should eq("{4,5}")
+      conn.query_one("select array[1,2,3]", as: Array(Int32)).should eq([1, 2, 3])
+      conn.query_one("select $1::int[]", "{4,5}", as: Array(Int64)).should eq([4_i64, 5_i64])
       conn.query_one("select '10.0.0.0/8'::cidr", as: String).should eq("10.0.0.0/8")
+    end
+  end
+
+  pending_postgres "round-trips one-dimensional arrays" do
+    PostgresSpec.connect do |conn|
+      conn.query_one("select $1::int4[]", [1, nil, 3], as: Array(Int32?)).should eq([1, nil, 3])
+      conn.query_one("select $1::int8[]", [] of Int64, as: Array(Int64)).should eq([] of Int64)
+      conn.query_one("select $1::text[]", ["a", "b\"c", "", nil], as: Array(String?)).should eq(["a", "b\"c", "", nil])
+      conn.query_one("select $1::float8[]", [1.5, -0.25], as: Array(Float64)).should eq([1.5, -0.25])
+      conn.query_one("select $1::bool[]", [true, false], as: Array(Bool)).should eq([true, false])
+      uuids = [UUID.random, UUID.random]
+      conn.query_one("select $1::uuid[]", uuids, as: Array(UUID)).should eq(uuids)
+      times = [Time.utc(2020, 1, 2, 3, 4, 5), Time.utc(1999, 12, 31)]
+      conn.query_one("select $1::timestamptz[]", times, as: Array(Time)).should eq(times)
+      nums = [BigDecimal.new("1.25"), BigDecimal.new("-99999999999999999999.5")]
+      conn.query_one("select $1::numeric[]", nums, as: Array(BigDecimal)).should eq(nums)
+      conn.query_one("select $1::bytea[]", [Bytes[1, 2], Bytes.empty], as: Array(Bytes)).should eq([Bytes[1, 2], Bytes.empty])
+      conn.query_one("select $1::jsonb[]", [JSON.parse(%({"a":1}))], as: Array(JSON::Any)).should eq([JSON.parse(%({"a":1}))])
+      # Strings for a non-text element type go as a quoted text literal.
+      conn.query_one("select $1::int4[]", ["7", "8"], as: Array(Int32)).should eq([7, 8])
+      # An element type the codec does not know: sent as text, read as text.
+      conn.query_one("select $1::inet[]::text", ["10.0.0.1", "::1"], as: String).should eq("{10.0.0.1,::1}")
+      conn.query_one("select array_length($1::int4[], 1)", [5, 6, 7], as: Int32).should eq(3)
+      conn.query_all("select g from generate_series(1, 5) g where g = any($1)", [2, 4], as: Int32).should eq([2, 4])
+      expect_raises(Postgres::DecodeError, /2-dimensional/) { conn.query_one("select array[[1,2],[3,4]]", as: Array(Int32)) }
+      expect_raises(Postgres::DecodeError, /NULL element/) { conn.query_one("select array[1,null]", as: Array(Int32)) }
+      conn.query_one("select array[1]::int4[]", as: Array(Int32)?).should eq([1])
+      conn.query_one("select null::int4[]", as: Array(Int32)?).should be_nil
     end
   end
 
@@ -94,6 +129,14 @@ describe "Postgres live" do
         conn.query_each("select * from spec_people order by id", as: Person) { |p| names << p.name }
         names.should eq(["ana", "bo"])
       end
+    end
+  end
+
+  pending_postgres "maps array columns onto Serializable fields" do
+    PostgresSpec.connect do |conn|
+      rows = conn.query_all("select 1 as id, array['a','b'] as tags, array[1.5, null]::float8[] as scores union all select 2, '{}', null order by id", as: Tagged)
+      rows.map(&.tags).should eq([["a", "b"], [] of String])
+      rows.map(&.scores).should eq([[1.5, nil], nil])
     end
   end
 
@@ -186,7 +229,7 @@ describe "Postgres live" do
       # Only the inspecting query itself is left prepared: every evicted
       # statement, including the one queued before the encode error, is gone.
       sql = "select array_agg(statement) from pg_prepared_statements"
-      conn.query_one(sql, as: String).should eq(%({"#{sql}"}))
+      conn.query_one(sql, as: Array(String)).should eq([sql])
     end
     PostgresSpec.connect(statement_cache_size: 0) do |conn|
       conn.query_one("select $1::int * 2", 21, as: Int32).should eq(42)

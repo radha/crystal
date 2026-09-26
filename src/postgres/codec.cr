@@ -155,6 +155,61 @@ module Postgres
       BINARY
     end
 
+    # A one-dimensional array for array type *oid*: binary when every
+    # element encodes in binary for the element type, otherwise (strings
+    # for a type without a binary encoder, e.g. `inet[]`) the text literal
+    # `{"a","b",NULL}` for the server to parse.
+    def self.encode(io : IO, oid : UInt32, value : Array) : Int16
+      element = OID.element(oid)
+      unless element
+        # A type the codec does not know (`inet[]`, an enum array): let the
+        # server parse the text form. A known scalar type is a mistake.
+        mismatch(oid, value) if OID.binary?(oid)
+        return encode_array_text(io, value)
+      end
+      body = IO::Memory.new
+      has_null = false
+      value.each do |item|
+        if item.nil?
+          has_null = true
+          body.write_bytes(-1_i32, IO::ByteFormat::BigEndian)
+        else
+          length_at = body.pos
+          body.write_bytes(0_i32, IO::ByteFormat::BigEndian)
+          return encode_array_text(io, value) unless encode(body, element, item) == BINARY
+          IO::ByteFormat::BigEndian.encode((body.pos - length_at - 4).to_i32, body.to_slice + length_at)
+        end
+      end
+      io.write_bytes(value.empty? ? 0_i32 : 1_i32, IO::ByteFormat::BigEndian)
+      io.write_bytes(has_null ? 1_i32 : 0_i32, IO::ByteFormat::BigEndian)
+      io.write_bytes(element, IO::ByteFormat::BigEndian)
+      unless value.empty?
+        io.write_bytes(value.size.to_i32, IO::ByteFormat::BigEndian)
+        io.write_bytes(1_i32, IO::ByteFormat::BigEndian) # lower bound
+      end
+      io.write(body.to_slice)
+      BINARY
+    end
+
+    private def self.encode_array_text(io : IO, value : Array) : Int16
+      io << '{'
+      value.each_with_index do |item, i|
+        io << ',' if i > 0
+        if item.nil?
+          io << "NULL"
+        else
+          io << '"'
+          item.to_s.each_char do |char|
+            io << '\\' if char == '"' || char == '\\'
+            io << char
+          end
+          io << '"'
+        end
+      end
+      io << '}'
+      TEXT
+    end
+
     private def self.checked(type : T.class, value, oid : UInt32) : T forall T
       unless T::MIN <= value <= T::MAX
         raise EncodeError.new("#{value} is out of range for #{OID.name(oid)}")
@@ -338,6 +393,48 @@ module Postgres
       when OID::JSON  then JSON.parse(String.new(b))
       when OID::JSONB then JSON.parse(jsonb(b, c))
       else                 mismatch(c, type)
+      end
+    end
+
+    # A one-dimensional array (an empty one has no dimensions). Elements
+    # decode like columns of the element type; a nilable element type
+    # reads NULL elements as `nil`.
+    def self.decode(b : Bytes, c : Column, type : Array(T).class) : Array(T) forall T
+      element = c.binary? ? OID.element(c.type_oid) : nil
+      mismatch(c, type) unless element
+      raise DecodeError.new("column #{c.name.inspect}: truncated array") if b.size < 12
+      dimensions = IO::ByteFormat::BigEndian.decode(Int32, b)
+      return [] of T if dimensions == 0
+      unless dimensions == 1
+        raise DecodeError.new("column #{c.name.inspect}: a #{dimensions}-dimensional array cannot be decoded as #{type}")
+      end
+      raise DecodeError.new("column #{c.name.inspect}: truncated array") if b.size < 20
+      count = IO::ByteFormat::BigEndian.decode(Int32, b + 12)
+      raise DecodeError.new("column #{c.name.inspect}: negative array size") if count < 0
+      element_column = Column.new(c.name, IO::ByteFormat::BigEndian.decode(UInt32, b + 8))
+      pos = 20
+      Array(T).new(count) do
+        raise DecodeError.new("column #{c.name.inspect}: truncated array") if pos + 4 > b.size
+        size = IO::ByteFormat::BigEndian.decode(Int32, b + pos)
+        pos += 4
+        if size < 0
+          {% if T.nilable? %}
+            nil
+          {% else %}
+            raise DecodeError.new("column #{c.name.inspect}: NULL element but #{T} is not nilable")
+          {% end %}
+        else
+          raise DecodeError.new("column #{c.name.inspect}: truncated array") if pos + size > b.size
+          item = b[pos, size]
+          pos += size
+          {% if T.nilable? %}
+            {% inner = T.union_types.reject(&.==(Nil)) %}
+            {% raise "Postgres: array element #{T} must be a single type or a single type plus Nil" unless inner.size == 1 %}
+            decode(item, element_column, {{ inner[0] }})
+          {% else %}
+            decode(item, element_column, T)
+          {% end %}
+        end
       end
     end
 

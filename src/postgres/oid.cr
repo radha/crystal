@@ -27,6 +27,22 @@ module Postgres
     UUID        = 2950_u32
     JSONB       = 3802_u32
 
+    # :nodoc:
+    # One-dimensional array types and their element types.
+    ARRAY_ELEMENTS = {
+      1000_u32 => BOOL, 1001_u32 => BYTEA, 1002_u32 => CHAR, 1003_u32 => NAME, 1016_u32 => INT8,
+      1005_u32 => INT2, 1007_u32 => INT4, 1009_u32 => TEXT, 1028_u32 => OID, 199_u32 => JSON,
+      1021_u32 => FLOAT4, 1022_u32 => FLOAT8, 1014_u32 => BPCHAR, 1015_u32 => VARCHAR,
+      1182_u32 => DATE, 1183_u32 => TIME, 1115_u32 => TIMESTAMP, 1185_u32 => TIMESTAMPTZ,
+      1187_u32 => INTERVAL, 1231_u32 => NUMERIC, 2951_u32 => UUID, 3807_u32 => JSONB,
+    }
+
+    # The element type of array type *oid*, or nil if *oid* is not an
+    # array type the codec knows.
+    def self.element(oid : UInt32) : UInt32?
+      ARRAY_ELEMENTS[oid]?
+    end
+
     # Whether the codec decodes *oid* in binary; everything else is
     # requested in text format.
     def self.binary?(oid : UInt32) : Bool
@@ -35,7 +51,7 @@ module Postgres
            BPCHAR, VARCHAR, DATE, TIME, TIMESTAMP, TIMESTAMPTZ, INTERVAL, NUMERIC, UUID, JSONB
         true
       else
-        false
+        ARRAY_ELEMENTS.has_key?(oid)
       end
     end
 
@@ -73,7 +89,7 @@ module Postgres
       when NUMERIC     then "numeric"
       when UUID        then "uuid"
       when JSONB       then "jsonb"
-      else                  "oid #{oid}"
+      else                  (elem = element(oid)) ? "#{name(elem)}[]" : "oid #{oid}"
       end
     end
   end

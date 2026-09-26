@@ -47,20 +47,24 @@ require "./postgres/client"
 # | `UInt32` | oid |
 # | `Float32`, `Float64` | float4; float4, float8 |
 # | `BigDecimal` | numeric, int2/4/8 |
-# | `String` | text, varchar, bpchar, name, char, json, jsonb, and any type without a binary decoder (as its text form; arrays too) |
+# | `String` | text, varchar, bpchar, name, char, json, jsonb, and any type without a binary decoder (as its text form) |
 # | `Bytes` | bytea |
 # | `UUID` | uuid |
 # | `Time` | timestamptz, timestamp (as UTC), date (UTC midnight) |
 # | `Time::Span` | time, interval without months |
 # | `Postgres::Interval` | interval |
 # | `JSON::Any` | json, jsonb |
+# | `Array(T)`, `Array(T?)` | one-dimensional arrays of the types above (`int4[]`, `text[]`, ...) |
 #
 # A nilable type reads SQL NULL as `nil`. Parameters are encoded for the
 # type the server inferred for them; a `String` works for any type (it is
 # sent as text for the server to parse), so enums, `inet` or array
-# literals like `"{1,2}"` can be passed as strings.
+# literals like `"{1,2}"` can be passed as strings. An `Array` is sent in
+# binary for the array types above and as a quoted text literal otherwise
+# (e.g. `Array(String)` for an `inet[]` parameter), so `where id = any($1)`
+# takes a plain Crystal array.
 #
-# Not supported yet: arrays as Crystal arrays, COPY, LISTEN/NOTIFY,
+# Not supported yet: multi-dimensional arrays, COPY, LISTEN/NOTIFY,
 # pipelining several queries, query cancellation.
 module Postgres
 end

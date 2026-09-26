@@ -120,6 +120,38 @@ describe Postgres::Codec do
   end
 end
 
+describe "Postgres::Codec arrays" do
+  # Vectors: `select encode(array_send(...), 'hex')` on PostgreSQL 16.
+  it "matches the server's binary arrays" do
+    int4s = "00000001000000010000001700000003000000010000000400000001ffffffff0000000400000003"
+    encode(1007_u32, [1, nil, 3]).should eq({int4s, 1_i16})
+    decode(int4s, 1007_u32, Array(Int32?)).should eq([1, nil, 3])
+    encode(1007_u32, [] of Int32).should eq({"000000000000000000000017", 1_i16})
+    decode("000000000000000000000017", 1007_u32, Array(Int32)).should eq([] of Int32)
+    texts = "000000010000000000000019000000020000000100000001610000000162"
+    encode(1009_u32, ["a", "b"]).should eq({texts, 1_i16})
+    decode(texts, 1009_u32, Array(String)).should eq(["a", "b"])
+  end
+
+  it "rejects NULL elements for a non-nilable type and multi-dimensional arrays" do
+    expect_raises(Postgres::DecodeError, /NULL element/) do
+      decode("00000001000000010000001700000003000000010000000400000001ffffffff0000000400000003", 1007_u32, Array(Int32))
+    end
+    two_d = "0000000200000000000000170000000100000001000000010000000100000004" + "00000005"
+    expect_raises(Postgres::DecodeError, /2-dimensional/) { decode(two_d, 1007_u32, Array(Int32)) }
+    expect_raises(Postgres::DecodeError, /truncated/) { decode("0000000100000000000000170000000500000001", 1007_u32, Array(Int32)) }
+    expect_raises(Postgres::EncodeError, /cannot encode Array/) { encode(Postgres::OID::INT4, [1]) }
+  end
+
+  it "falls back to a quoted text literal when elements cannot go binary" do
+    # Strings for int4[]: the server parses each element.
+    literal = "{\"1\",NULL,\"a\\\"b\\\\c\"}" # {"1",NULL,"a\"b\\c"}
+    encode(1007_u32, ["1", nil, "a\"b\\c"]).should eq({literal.to_slice.hexstring, 0_i16})
+    # inet[] is unknown to the codec.
+    encode(1041_u32, ["10.0.0.1"]).should eq({"{\"10.0.0.1\"}".to_slice.hexstring, 0_i16})
+  end
+end
+
 describe Postgres::Interval do
   it "formats as ISO 8601" do
     Postgres::Interval.new(months: 14, days: 3, microseconds: 14_706_500_000_i64).to_s.should eq("P1Y2M3DT4H5M6.5S")
@@ -153,7 +185,7 @@ describe Postgres::StatementCache do
   it "asks for binary results only for types it decodes" do
     all_binary = Postgres::PreparedStatement.new("", [] of UInt32, [Postgres::Column.new("a", Postgres::OID::INT4, format: 0_i16)])
     all_binary.result_formats.should eq([1_i16])
-    mixed = Postgres::PreparedStatement.new("", [] of UInt32, [Postgres::Column.new("a", Postgres::OID::INT4), Postgres::Column.new("b", 1007_u32)])
+    mixed = Postgres::PreparedStatement.new("", [] of UInt32, [Postgres::Column.new("a", Postgres::OID::INT4), Postgres::Column.new("b", 869_u32)])
     mixed.result_formats.should eq([1_i16, 0_i16])
     mixed.columns.map(&.binary?).should eq([true, false])
   end
