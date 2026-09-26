@@ -1,0 +1,33 @@
+crystal 1 RESULT seq mean_us=66.17 p50_us=62.02 p99_us=127.48
+crystal 2 RESULT seq mean_us=60.21 p50_us=55.33 p99_us=111.75
+crystal 3 RESULT seq mean_us=60.24 p50_us=55.82 p99_us=113.03
+go 1 RESULT seq mean_us=96.69 p50_us=87.19 p99_us=200.32
+go 2 RESULT seq mean_us=91.57 p50_us=83.85 p99_us=189.99
+go 3 RESULT seq mean_us=92.93 p50_us=84.46 p99_us=202.43
+rust 1 RESULT seq mean_us=124.41 p50_us=115.40 p99_us=226.47
+rust 2 RESULT seq mean_us=131.55 p50_us=120.25 p99_us=258.41
+rust 3 RESULT seq mean_us=130.08 p50_us=120.47 p99_us=249.52
+crystal 1 RESULT fetch ms_per_fetch=4.768 rows_per_s=2097503
+crystal 2 RESULT fetch ms_per_fetch=5.134 rows_per_s=1947950
+crystal 3 RESULT fetch ms_per_fetch=4.700 rows_per_s=2127739
+go 1 RESULT fetch ms_per_fetch=8.338 rows_per_s=1199359
+go 2 RESULT fetch ms_per_fetch=8.504 rows_per_s=1175875
+go 3 RESULT fetch ms_per_fetch=7.719 rows_per_s=1295525
+rust 1 RESULT fetch ms_per_fetch=7.559 rows_per_s=1322871
+rust 2 RESULT fetch ms_per_fetch=7.040 rows_per_s=1420441
+rust 3 RESULT fetch ms_per_fetch=7.122 rows_per_s=1404017
+crystal 1 RESULT pool ops_per_s=42500
+crystal 2 RESULT pool ops_per_s=39111
+crystal 3 RESULT pool ops_per_s=44738
+go 1 RESULT pool ops_per_s=57191
+go 2 RESULT pool ops_per_s=55576
+go 3 RESULT pool ops_per_s=59438
+rust 1 RESULT pool ops_per_s=58896
+rust 2 RESULT pool ops_per_s=55858
+rust 3 RESULT pool ops_per_s=59367
+crystal-mt(4w) 1 RESULT pool ops_per_s=67924
+crystal-mt(4w) 2 RESULT pool ops_per_s=67645
+crystal-mt(4w) 3 RESULT pool ops_per_s=67330
+crystal-chanpool(diag) 1 RESULT pool_chan ops_per_s=41632
+crystal-chanpool(diag) 2 RESULT pool_chan ops_per_s=41775
+crystal-chanpool(diag) 3 RESULT pool_chan ops_per_s=45008

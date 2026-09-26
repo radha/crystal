@@ -464,3 +464,35 @@ cancel; pipeline queries are **independent** (a Sync after each; wrap in
 
 Benchmarks (harness README): COPY 1M rows 2.25M rows/s vs pgx 1.55M;
 100 queries pipelined 3.1x faster than sequential on loopback.
+
+## 17. Feature-complete round (2026-09-26, same session)
+
+User scope decision: finish Postgres before merging to fork master, with
+enums + converters, more built-in types, ranges, multi-dimensional arrays
++ composites, pgpass + service + options, multi-host failover, SCRAM
+channel binding, tuple rows and cursors. Runtime fixes stay fork-only; no
+upstream report for the compiler crash.
+
+- Enums (by label or value), `@[Postgres::Field(converter: M)]`
+  (`M.from_pg(row, index)`), `to_pg` for parameters, `as: {A, B}` tuples.
+- inet/cidr (`Inet`, `Socket::IPAddress`), macaddr(8), timetz, bit/varbit
+  (`BitArray`), money (`Int64` minor units), xml, hstore
+  (`Hash(String, String?)`, text form), `Postgres::Range(T)` for the six
+  built-in ranges (Crystal `Range` as a parameter). Binary types keep a
+  canonical `String` form (money excepted).
+- N-dimensional arrays by nesting (`Array(Array(T))`), rectangular only.
+- Per-connection `TypeMap`: unknown OIDs looked up in `pg_type` lazily and
+  transitively; domains act as their base type; composites and `row()`
+  decode into tuples; a tuple parameter is a row literal.
+- Config: multi-host lists, `target_session_attrs`, `load_balance_hosts`,
+  `.pgpass`, `pg_service.conf`, `options`/`search_path`,
+  `channel_binding`. Connection fails over across hosts; one host keeps
+  its own error.
+- Auth: SASLprep; SCRAM-SHA-256-PLUS (tls-server-end-point); `require`
+  also refuses cleartext/md5 and an unverified AuthenticationOk.
+- Cursors: `query_each(..., fetch_size:)` over the unnamed portal
+  (Execute + Flush per batch, Sync at the end).
+- Found on the way: compiler crash repro in
+  `.agent-context/notes/compiler-crash-indexable-ivar-tuples.cr`; macro
+  code must not spell user type names (file-private types) — use
+  `typeof(...)`.
