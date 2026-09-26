@@ -218,9 +218,9 @@ One session, not fiber-safe (the pool gives each fiber its own).
 ### 6.1 Query path
 
 `exec(sql, *args)`, `query_one`, `query_one?`, `query_all`, `query_each`.
-With no args and `statement_cache: false`, or for `exec` with no args,
-the **simple** protocol is used (`Query`), which also allows
-multi-statement strings. Everything else uses the **extended** protocol:
+Only `exec` without args uses the **simple** protocol (`Query`), which
+also allows multi-statement strings; every `query_*` call is extended, so
+results are binary and typed. Everything else uses the **extended** protocol:
 
 1. Statement lookup by SQL text. Miss (or cache off): `Parse(name, sql,
    no param types)` + `Describe('S', name)` + `Sync` → `ParseComplete`,
@@ -253,9 +253,10 @@ response before propagating so the connection stays in sync.
 
 `transaction { |tx| }` sends `BEGIN` (simple), yields `self`, `COMMIT` on
 normal exit, `ROLLBACK` on exception (re-raised). Nested calls use
-`SAVEPOINT sp<depth>` / `RELEASE` / `ROLLBACK TO`. `tx.rollback` inside the
-block raises `Postgres::Rollback` internally to unwind and is not
-re-raised. Options: `transaction(isolation: :serializable, read_only: true)`.
+`SAVEPOINT sp<depth>` / `RELEASE` / `ROLLBACK TO`. There is no `rollback`
+method: raising rolls back. A block that swallowed a `QueryError` leaves
+the transaction aborted; `COMMIT` would silently roll back, so
+`transaction` rolls back and raises `Error` instead. Options: `transaction(isolation: :serializable, read_only: true)`.
 
 ## 7. Types (`src/postgres/codec.cr`, `src/postgres/interval.cr`)
 
@@ -414,3 +415,22 @@ SCRAM-SHA-256-PLUS, `verify-ca`/`verify-full` beyond what
 `OpenSSL::SSL::Context::Client` verification gives (root cert via
 `sslrootcert`), dynamic `Value` rows, tuple mapping, `Redis::Pool` moving
 onto `::Pool(T)`, SASLprep, GSSAPI.
+
+## 15. Implementation notes (2026-09-26)
+
+Deviations settled while building slice 1:
+
+- `Connection.new(config: cfg)` and `Client.new(config: cfg)` take a
+  `Config` by keyword only. A positional `Config` overload next to
+  `new(url = nil, ...)` is silently shadowed by the compiler (a def whose
+  first positional has a default replaces one where it is required), so
+  the URL form keeps the positional slot. The URL forms list every
+  `Config.parse` keyword explicitly (not `**options`) so symbol autocast
+  works (`sslmode: :require`).
+- Config (built in parallel): `connect_timeout` must be positive (libpq's
+  `0` = no timeout is rejected); ports 1..65535; a `+` in a URL password
+  stays `+` for a `String` URL (a pre-parsed `URI` has already turned it
+  into a space); `statement_cache_size` has no environment variable.
+- Queued statement `Close`s are written after `Bind`, so an argument that
+  fails to encode (which discards the half-written `Bind`) cannot drop
+  them.
