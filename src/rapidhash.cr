@@ -37,11 +37,13 @@ module Rapidhash
   private SECRET6 = 0x90ed1765281c388c_u64
 
   # Returns the rapidhash V3 of *data* with the given *seed*.
+  @[AlwaysInline]
   def self.v3(data : Bytes, seed : UInt64 = 0_u64) : UInt64
     hash_premixed(data.to_unsafe, data.size, premix(seed))
   end
 
   # Returns the rapidhash V3 of the bytes of *data* with the given *seed*.
+  @[AlwaysInline]
   def self.v3(data : String, seed : UInt64 = 0_u64) : UInt64
     hash_premixed(data.to_unsafe, data.bytesize, premix(seed))
   end
@@ -59,6 +61,7 @@ module Rapidhash
   # * Any other type that defines `rapidhash(seed : UInt64) : UInt64`, which
   #   lets an application make its own types usable as sketch items (for
   #   example by hashing a canonical byte encoding with `v3`).
+  @[AlwaysInline]
   def self.of(value, seed : UInt64 = 0_u64) : UInt64
     of_premixed(value, premix(seed))
   end

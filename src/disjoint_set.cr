@@ -51,11 +51,10 @@
 class DisjointSet(T)
   include Enumerable(T)
 
-  # `@parent[i]` is the parent of element `i` (itself for a root);
-  # `@sizes[i]` is the number of elements in the set rooted at `i` (only
-  # meaningful for roots).
+  # `@parent[i]` is the parent of element `i`, or, for a root, the negated
+  # size of its set. One array instead of parent + size halves the memory a
+  # `find` touches.
   @parent : Array(Int32)
-  @sizes : Array(Int32)
   @set_count : Int32
 
   # Element <-> index maps for every `T` but `Int32`, whose elements are
@@ -66,7 +65,6 @@ class DisjointSet(T)
   # Creates an empty disjoint set.
   def initialize
     @parent = [] of Int32
-    @sizes = [] of Int32
     @set_count = 0
     @index = {} of T => Int32
     @elements = [] of T
@@ -139,10 +137,12 @@ class DisjointSet(T)
     b_root = root(index_for(b))
     return false if a_root == b_root
 
-    sizes = @sizes.to_unsafe
-    a_root, b_root = b_root, a_root if sizes[a_root] < sizes[b_root]
-    @parent.to_unsafe[b_root] = a_root
-    sizes[a_root] += sizes[b_root]
+    parent = @parent.to_unsafe
+    # Union by size: roots hold negated sizes, so the larger set is the
+    # more negative one.
+    a_root, b_root = b_root, a_root if parent[a_root] > parent[b_root]
+    parent[a_root] += parent[b_root]
+    parent[b_root] = a_root
     @set_count -= 1
     true
   end
@@ -181,7 +181,7 @@ class DisjointSet(T)
   # Raises `KeyError` if *element* is not present.
   def set_size(element : T) : Int32
     index = index_of?(element) || raise KeyError.new("Missing disjoint set element: #{element.inspect}")
-    @sizes.to_unsafe[root(index)]
+    -@parent.to_unsafe[root(index)]
   end
 
   # Returns the elements in the same set as *element* (including itself),
@@ -191,7 +191,7 @@ class DisjointSet(T)
   def set_of(element : T) : Array(T)
     index = index_of?(element) || raise KeyError.new("Missing disjoint set element: #{element.inspect}")
     target = root(index)
-    members = Array(T).new(@sizes.to_unsafe[target])
+    members = Array(T).new(-@parent.to_unsafe[target])
     @parent.size.times do |i|
       members << element_at(i) if root(i) == target
     end
@@ -238,7 +238,7 @@ class DisjointSet(T)
       group = slot.to_unsafe[r]
       if group < 0
         group = slot.to_unsafe[r] = groups.size
-        groups << Array(T).new(@sizes.to_unsafe[r])
+        groups << Array(T).new(-@parent.to_unsafe[r])
       end
       groups.to_unsafe[group] << element_at(i)
     end
@@ -253,7 +253,6 @@ class DisjointSet(T)
   # Removes every element.
   def clear : self
     @parent.clear
-    @sizes.clear
     @set_count = 0
     @index.clear
     @elements.clear
@@ -264,7 +263,7 @@ class DisjointSet(T)
   # are not duplicated.
   def dup : self
     copy = self.class.new
-    copy.initialize_copy(@parent.dup, @sizes.dup, @set_count, @index.dup, @elements.dup)
+    copy.initialize_copy(@parent.dup, @set_count, @index.dup, @elements.dup)
     copy
   end
 
@@ -290,16 +289,13 @@ class DisjointSet(T)
     inspect(io)
   end
 
-  protected def initialize_copy(@parent, @sizes, @set_count, @index, @elements) : Nil
+  protected def initialize_copy(@parent, @set_count, @index, @elements) : Nil
   end
 
   protected def grow(new_size : Int32) : Nil
     old_size = @parent.size
     return if new_size <= old_size
-    (old_size...new_size).each do |i|
-      @parent << i
-      @sizes << 1
-    end
+    (new_size - old_size).times { @parent << -1 }
     @set_count += new_size - old_size
   end
 
@@ -308,12 +304,14 @@ class DisjointSet(T)
   @[AlwaysInline]
   private def root(index : Int32) : Int32
     parent = @parent.to_unsafe
-    while (up = parent[index]) != index
+    loop do
+      up = parent[index]
+      return index if up < 0
       grand = parent[up]
+      return up if grand < 0
       parent[index] = grand
       index = grand
     end
-    index
   end
 
   # Returns the index of *element*, adding it first if it is not present.
@@ -326,8 +324,7 @@ class DisjointSet(T)
     {% else %}
       @index.put_if_absent(element) do
         @elements << element
-        @parent << @parent.size
-        @sizes << 1
+        @parent << -1
         @set_count += 1
         @parent.size - 1
       end
