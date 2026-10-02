@@ -24,15 +24,18 @@ that finished the Postgres track and merged it to fork `master`).
 - **LRUCache / SyncLRUCache** (`require "lru_cache"`): count or weight
   bound, TTL, eviction callback, single-flight fetch. Writes beat Rust's
   `lru`, reads 1.2-1.6×. Bench: `harnesses/harness-2026-09-26/lru_cache/`.
-- Both are on branch `claude/hopeful-tesla-ux066m`, in a PR to fork
-  `master` (not merged yet).
+- Both are merged to fork `master`.
 - **Runtime fixes on the fork** (found through the Postgres benchmarks):
   lazy event-loop timer re-arm, allocation-free `Pool(T)` checkout, and the
   `Parallel` scheduler waking parked threads after the event loop readies
   several fibers.
-- **Next up** (user to choose): merge the Tier 5 PR, then
-  Tier 6 fillers (TOML, CLI subcommands), or exercising the Postgres client
-  in a real app first.
+- **Tier 5 leftovers** (2026-10-02, PR from `claude/vigilant-brown-24w3lc`):
+  `require "rapidhash"`, `"bloom_filter"`, `"hyper_log_log"`,
+  `"count_min_sketch"`, `"disjoint_set"`, `"radix_tree"`. Benches in
+  `harnesses/harness-2026-10-02/`.
+- **Next up** (user to choose): Tier 6 fillers (TOML, CLI subcommands),
+  Tier 2 serializer → Tier 4 RPC, or exercising the Postgres client in a
+  real app first.
 
 ## Resuming
 

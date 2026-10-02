@@ -1,0 +1,22 @@
+[package]
+name = "sketches_bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bench"
+path = "bench.rs"
+
+[dependencies]
+bloomfilter = "3.0.2"
+count-min-sketch = "0.2.0"
+fastbloom = "0.17.0"
+hyperloglogplus = "0.4.1"
+petgraph = "0.8.3"
+rapidhash = "4.5.1"
+union-find = "0.4.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
