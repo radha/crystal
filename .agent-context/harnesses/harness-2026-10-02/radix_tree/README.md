@@ -116,3 +116,73 @@ Other choices:
   root sits in cache. Shrinking nodes to 48 bytes by folding the label
   pointer into the key reference for value nodes is a possible next step
   for iteration.
+
+## Round 2 (same day): closing the prefix_keys gap
+
+Medians of 9 alternating rounds, ns/op ("before" = the table above's
+code, rebuilt on the same runtime):
+
+| data | op | before | after | qp-trie | after / qp-trie |
+|---|---|---:|---:|---:|---:|
+| urls | insert | 180.5 | 181.6 | 156.8 | 1.16 |
+| urls | get_hit | 352.2 | 346.1 | 328.9 | 1.05 |
+| urls | get_miss | 137.3 | 141.8 | 114.2 | 1.24 |
+| urls | longest_prefix | 424.1 | 397.7 | 438.9 | 0.91 |
+| urls | prefix_vals | 4.8 | 4.8 | 3.9 | 1.23 |
+| urls | prefix_keys | 11.1 | 7.9 | 3.7 | 2.14 |
+| urls | delete_half | 485.2 | 429.7 | 420.8 | 1.02 |
+| words | insert | 309.2 | 317.3 | 474.5 | 0.67 |
+| words | get_hit | 360.3 | 359.0 | 434.1 | 0.83 |
+| words | get_miss | 232.1 | 198.8 | 207.2 | 0.96 |
+| words | longest_prefix | 399.2 | 348.7 | 561.1 | 0.62 |
+| words | prefix_vals | 12.6 | 13.2 | 33.3 | 0.40 |
+| words | prefix_keys | 17.6 | 21.2 | 29.2 | 0.73 |
+| words | delete_half | 431.4 | 370.7 | 550.8 | 0.67 |
+
+This VM's memory system is very noisy: the same binary can run one
+iteration cell at 3.4 ns in one process and 11-19 ns in the next. Single
+best-of runs (the first table) mislead; compare medians of interleaved
+rounds, and for iteration a dedicated micro (below).
+
+What changed:
+
+1. **Child blocks grow by ~1.5x** (1, 2, 3, 4, 6, 8, 12, 16, 24, ...)
+   instead of doubling. URL id nodes have 11 children and got 16 slots;
+   slot use went 69% -> 92% (urls) and 79% -> 91% (words).
+2. **48-byte nodes** (from 56): no label pointer. Every non-root node keeps
+   a *path key* (its own key, or one below it) that spells its path; the
+   label is `label_size` bytes of it ending at the node's depth, which
+   every walk tracks. The has-value flag is bit 31 of the label size.
+   Merging edges no longer walks down for a key. Node memory per key:
+   urls 89 -> 58 B, words 80 -> 60 B (qp-trie: ~50 B of structure plus
+   its own key copies).
+3. The walks test the has-value **flag** (`has_value?`), not `key`: with
+   the shrink, `key` builds a `String?` from the flag and the path key, and
+   that cost 25% on iteration until the walks stopped calling it.
+4. **Runtime (fork-only): the GC heap gets transparent huge pages** once it
+   passes 16 MiB (`src/gc/boehm.cr`, `CRYSTAL_GC_HUGE_PAGES`, `0` disables).
+   Boehm maps the heap with 4 KiB pages and THP here is in `madvise` mode,
+   so a 15 MB tree walk was mostly TLB misses (two-level page walks under
+   virtualization). Words prefix iteration: vals 21.4 -> 10.9, keys 31.4
+   -> 14.8 (THP off vs default, same binary).
+
+Focused micro (URL tree, prefix iteration only, 15 interleaved processes,
+median of best-of-8): before vals 5.09 / keys 3.77; growth only 3.43 /
+3.66; growth + 48 B nodes calling `key` 4.59 / 4.38; final 3.25 / 3.12.
+qp-trie in the same setup: ~3.9-4.5. In isolation the key gap is gone.
+
+What did not work, measured:
+
+- **Software prefetch on block entry** (key strings of leaves and child
+  blocks): urls keys 8.2 -> 7.5 but vals 3.5 -> 9.3 and words worse.
+  Rejected again (the first round rejected a sibling prefetch).
+- **Huge pages from the first heap expansion** (`CRYSTAL_GC_HUGE_PAGES=1`):
+  no better than the 16 MiB default.
+
+The remaining urls prefix_keys ratio in this harness (2.1x) is one memory
+load per yielded key: Crystal's `String#bytesize` lives in the string
+object, Rust carries `len` in the fat pointer and never touches the key.
+Cachegrind shows identical instruction and cache-miss counts for a fast
+and a slow process (it does not model TLBs or physical placement), and the
+cell depends on what the process allocated before (the micro, with the
+same data, is at parity).
