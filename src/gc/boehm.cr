@@ -402,6 +402,108 @@ module GC
     presize_heap(initial_heap) if initial_heap > 0
   end
 
+  {% if flag?(:linux) %}
+    # Heap sizes at which the GC heap starts using transparent huge pages,
+    # overridable with `CRYSTAL_GC_HUGE_PAGES` (`0` disables).
+    private DEFAULT_HUGE_PAGES_THRESHOLD = 16 * 1024 * 1024
+    private HUGE_PAGES_MIN_MAPPING       = 4 * 1024 * 1024
+
+    @@huge_pages_threshold = 0_u64
+
+    # Asks the kernel to back the GC heap with transparent huge pages once it
+    # is large. Boehm maps the heap with 4 KiB pages and, with THP in the
+    # common `madvise` mode, never gets huge pages; a large heap then pays a
+    # TLB miss (a two-level page walk under virtualization) on most accesses
+    # to pointer-heavy data. Small heaps are left alone: a huge page costs
+    # 2 MiB of resident memory as soon as one byte of it is touched.
+    private def self.enable_huge_pages : Nil
+      threshold = env_size?("CRYSTAL_GC_HUGE_PAGES") || DEFAULT_HUGE_PAGES_THRESHOLD.to_u64
+      return if threshold == 0
+      @@huge_pages_threshold = threshold
+
+      # Boehm reports each heap expansion right after mapping the new
+      # memory and before handing any of it out, so advice given here
+      # applies to the first faults.
+      LibGC.set_on_heap_resize(->(new_size : LibGC::Word) {
+        GC.advise_huge_pages if new_size.to_u64 >= @@huge_pages_threshold
+        nil
+      })
+    end
+
+    # Marks every large anonymous read-write mapping that holds the GC heap
+    # with `MADV_HUGEPAGE`. Runs inside the GC's heap-resize hook with the
+    # allocation lock held, so it must not allocate: it reads
+    # `/proc/self/maps` into stack buffers.
+    #
+    # :nodoc:
+    def self.advise_huge_pages : Nil
+      fd = LibC.open("/proc/self/maps", LibC::O_RDONLY | LibC::O_CLOEXEC)
+      return if fd < 0
+      buffer = uninitialized UInt8[4096]
+      line = uninitialized UInt8[256]
+      size = 0
+      while (count = LibC.read(fd, buffer.to_unsafe, buffer.size)) > 0
+        count.times do |i|
+          byte = buffer.to_unsafe[i]
+          if byte == '\n'.ord
+            advise_maps_line(line.to_unsafe, size)
+            size = 0
+          elsif size < line.size
+            # A longer line only has a longer path; anonymous mappings,
+            # the only ones of interest, have none.
+            line.to_unsafe[size] = byte
+            size += 1
+          end
+        end
+      end
+      LibC.close(fd)
+    end
+
+    # Parses one `/proc/self/maps` line (`start-end perms offset dev inode
+    # [path]`) and advises the range if it is an anonymous read-write
+    # private mapping of the GC heap.
+    private def self.advise_maps_line(line : UInt8*, size : Int32) : Nil
+      start, i = parse_hex(line, size, 0)
+      return unless i < size && line[i] == '-'.ord
+      finish, i = parse_hex(line, size, i + 1)
+      return unless i < size && line[i] == ' '.ord
+      i += 1
+      return unless i + 4 <= size && line[i] == 'r'.ord && line[i + 1] == 'w'.ord && line[i + 3] == 'p'.ord
+
+      # Skip perms, offset, dev and inode; anything left is a path.
+      4.times do
+        while i < size && line[i] != ' '.ord
+          i += 1
+        end
+        while i < size && line[i] == ' '.ord
+          i += 1
+        end
+      end
+      return if i < size
+
+      length = finish &- start
+      return if length < HUGE_PAGES_MIN_MAPPING
+      address = Pointer(Void).new(start)
+      return unless LibGC.is_heap_ptr(address) != 0
+      LibC.madvise(address, length, LibC::MADV_HUGEPAGE)
+    end
+
+    private def self.parse_hex(line : UInt8*, size : Int32, i : Int32) : {UInt64, Int32}
+      value = 0_u64
+      while i < size
+        byte = line[i]
+        digit = case byte
+                when '0'.ord..'9'.ord then byte - '0'.ord
+                when 'a'.ord..'f'.ord then byte - 'a'.ord + 10
+                else                       break
+                end
+        value = (value << 4) | digit
+        i += 1
+      end
+      {value, i}
+    end
+  {% end %}
+
   # Parses a non-negative size from the named environment variable, supporting an
   # optional `k`/`m`/`g` (case-insensitive, 1024-based) suffix. Returns `nil`
   # when the variable is unset; returns `0` for an unparseable or empty value.
@@ -443,6 +545,10 @@ module GC
     # thread (e.g. one built with `-Dwithout_mt`) would otherwise mark on a
     # single core forever. Idempotent when the markers are already running.
     start_mark_threads
+
+    {% if flag?(:linux) %}
+      enable_huge_pages
+    {% end %}
 
     apply_heap_tuning
 

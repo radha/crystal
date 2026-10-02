@@ -159,3 +159,33 @@ describe "GC" do
     end
   {% end %}
 end
+
+{% if flag?(:linux) %}
+  # Returns the VmFlags of the mapping that contains *address*, from
+  # /proc/self/smaps.
+  private def vm_flags_of(address : UInt64) : String?
+    inside = false
+    File.each_line("/proc/self/smaps") do |line|
+      if line =~ /\A([0-9a-f]+)-([0-9a-f]+) /
+        inside = $1.to_u64(16) <= address < $2.to_u64(16)
+      elsif inside && line.starts_with?("VmFlags:")
+        return line
+      end
+    end
+    nil
+  end
+
+  describe "GC huge pages" do
+    it "advises huge pages for a large heap" do
+      pending! "THP unsupported" unless File.exists?("/sys/kernel/mm/transparent_hugepage/enabled")
+      pending! "CRYSTAL_GC_HUGE_PAGES is set" if ENV["CRYSTAL_GC_HUGE_PAGES"]?
+      # Grow the heap past the 16 MiB threshold, then look at the mapping
+      # of a fresh large allocation.
+      keep = Array.new(64) { Bytes.new(1024 * 1024) }
+      big = Bytes.new(8 * 1024 * 1024)
+      flags = vm_flags_of(big.to_unsafe.address).should_not be_nil
+      flags.split.should contain("hg")
+      keep.size.should eq(64)
+    end
+  end
+{% end %}
