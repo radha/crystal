@@ -55,11 +55,14 @@ class RadixTree(V)
   # block. Leaves own no block.
   #
   # The label is the run of key bytes on the edge from the parent; its
-  # first byte is the one the parent files the node under. Labels point
-  # into stored key strings, at the offset where the node starts, so the
-  # bytes before a label spell the node's whole path.
+  # first byte is the one the parent files the node under. Nodes store no
+  # label pointer: every node other than the root keeps a *path key*, a
+  # stored key that starts with the node's whole path (its own key, or a
+  # key below it), so the label is the `label_size` bytes of the path key
+  # that end at the node's depth, which walks track anyway. A path key
+  # may outlive the entry it came from; its bytes still spell the path.
   #
-  # A node holds a value exactly when `key` is set. Every node other than
+  # A node holds a value exactly when `key` is set (the has-value flag). Every node other than
   # the root has a non-empty label, and every node other than the root that
   # holds no value has at least two children.
   #
@@ -70,8 +73,9 @@ class RadixTree(V)
     # bytes in `@small`, so finding a child reads no other memory.
     INLINE = 16
 
-    @label : Pointer(UInt8)
-    @label_size : Int32
+    # Bit 31 flags a value; the low bits are the label size (keys are
+    # shorter than 2 GiB).
+    @label_info : UInt32
     @count : UInt16
     @capacity : UInt16
     # The children's first bytes, in order, while `@capacity <= INLINE`
@@ -81,25 +85,25 @@ class RadixTree(V)
     # first bytes sit just before them in the same block, padded to a
     # multiple of 8.
     @edges : Pointer(Node(V))
-    @key : String?
+    @path : String?
     @value : V
 
-    getter label : Pointer(UInt8)
-    getter label_size : Int32
     getter edges : Pointer(Node(V))
-    getter key : String?
 
-    def initialize(@label : Pointer(UInt8), @label_size : Int32)
+    private HAS_VALUE = 0x8000_0000_u32
+
+    def initialize(@path : String?, label_size : Int32)
+      @label_info = label_size.to_u32
       @count = 0_u16
       @capacity = 0_u16
       @small = StaticArray(UInt64, 2).new(0_u64)
       @edges = Pointer(Node(V)).null
-      @key = nil
       @value = uninitialized V
       pointerof(@value).clear
     end
 
-    def initialize(@label : Pointer(UInt8), @label_size : Int32, @key : String, @value : V)
+    def initialize(@path : String, label_size : Int32, @value : V)
+      @label_info = label_size.to_u32 | HAS_VALUE
       @count = 0_u16
       @capacity = 0_u16
       @small = StaticArray(UInt64, 2).new(0_u64)
@@ -117,21 +121,49 @@ class RadixTree(V)
     def value=(@value : V) : V
     end
 
+    def label_size : Int32
+      (@label_info & ~HAS_VALUE).to_i32
+    end
+
+    # Whether this node holds a value: a flag test, cheaper than `key`.
+    def has_value? : Bool
+      @label_info & HAS_VALUE != 0
+    end
+
+    # The stored key, if this node holds a value.
+    def key : String?
+      @path if @label_info & HAS_VALUE != 0
+    end
+
+    # The path key (nil only for the root).
+    def path_key : String?
+      @path
+    end
+
     def stored_key : String
-      @key.not_nil!
+      @path.not_nil!
+    end
+
+    # The first byte of the node's path (not defined for the root). The
+    # label starts at the node's depth from here.
+    def path : Pointer(UInt8)
+      @path.not_nil!.to_unsafe
     end
 
     def set(key : String, value : V) : Nil
-      @key = key
+      @path = key
+      @label_info |= HAS_VALUE
       @value = value
     end
 
+    # Drops the value but keeps the path key, which still spells the path.
     def unset : Nil
-      @key = nil
+      @label_info &= ~HAS_VALUE
       pointerof(@value).clear
     end
 
-    def relabel(@label : Pointer(UInt8), @label_size : Int32) : Nil
+    def relabel(label_size : Int32) : Nil
+      @label_info = (@label_info & HAS_VALUE) | label_size.to_u32
     end
 
     # May point into this node itself: call it on a variable, not on a
@@ -142,6 +174,15 @@ class RadixTree(V)
       else
         @edges.as(Pointer(UInt8)) - Node.byte_area(@capacity.to_i32)
       end
+    end
+
+    # Child-block capacities grow by about 1.5x (1, 2, 3, 4, 6, 8, 12, 16,
+    # 24, ...) rather than doubling: the extra reallocations are cheap,
+    # and typical fanouts (11 for decimal ids plus a separator) waste a
+    # slot instead of five.
+    protected def self.next_capacity(capacity : Int32) : Int32
+      return capacity + 1 if capacity < 4
+      capacity & (capacity - 1) == 0 ? capacity + capacity // 2 : capacity + capacity // 3
     end
 
     protected def self.byte_area(capacity : Int32) : Int32
@@ -206,7 +247,7 @@ class RadixTree(V)
     def insert_edge(i : Int32, byte : UInt8, child : Node(V)) : Nil
       count = @count.to_i32
       if count == @capacity
-        grow(count == 0 ? 2 : count * 2)
+        grow(Node.next_capacity(count))
       end
       bytes = first_bytes
       tail = count - i
@@ -276,17 +317,6 @@ class RadixTree(V)
         insert_edge(i, bytes[i], edges[i].deep_copy)
       end
     end
-
-    # Returns the key of some node at or below this one that holds a value.
-    def some_key : String
-      node = self
-      while true
-        if key = node.key
-          return key
-        end
-        node = node.edges.value
-      end
-    end
   end
 
   # :nodoc:
@@ -332,7 +362,7 @@ class RadixTree(V)
         node = start.value
         @edges = node.edges
         @count = node.count
-        return start if node.key
+        return start if node.has_value?
       end
       while true
         while @index < @count
@@ -340,7 +370,7 @@ class RadixTree(V)
           @index += 1
           node = child.value
           if node.count == 0
-            return child if node.key
+            return child if node.has_value?
           else
             # Descend into the child, saving our place.
             push(@node, @index)
@@ -348,7 +378,7 @@ class RadixTree(V)
             @edges = node.edges
             @count = node.count
             @index = 0
-            return child if node.key
+            return child if node.has_value?
           end
         end
         return Pointer(Node(V)).null if @depth == 0
@@ -383,7 +413,7 @@ class RadixTree(V)
   # tree.empty? # => true
   # ```
   def initialize
-    @root = Node(V).new(Pointer(UInt8).null, 0)
+    @root = Node(V).new(nil, 0)
     @size = 0
   end
 
@@ -419,7 +449,7 @@ class RadixTree(V)
 
   # Removes every key from the tree.
   def clear : self
-    @root = Node(V).new(Pointer(UInt8).null, 0)
+    @root = Node(V).new(nil, 0)
     @size = 0
     self
   end
@@ -593,7 +623,7 @@ class RadixTree(V)
       i = node.lower_bound(byte)
       if i == node.count || node.first_bytes[i] != byte
         stored = owned_key(key)
-        node.insert_edge(i, byte, Node(V).new(stored.to_unsafe + pos, len - pos, stored, value))
+        node.insert_edge(i, byte, Node(V).new(stored, len - pos, value))
         node_ptr.value = node
         @size += 1
         return {false, value}
@@ -601,7 +631,7 @@ class RadixTree(V)
 
       child_ptr = node.edges + i
       child = child_ptr.value
-      label = child.label
+      label = child.path + pos
       limit = Math.min(child.label_size, len - pos)
       common = 1
       while common < limit && label[common] == ptr[pos + common]
@@ -611,8 +641,8 @@ class RadixTree(V)
       if common < child.label_size
         # Split the edge: a new node takes the common part of the label and
         # the child moves into its block.
-        middle = Node(V).new(label, common)
-        child.relabel(label + common, child.label_size - common)
+        middle = Node(V).new(child.path_key, common)
+        child.relabel(child.label_size - common)
         middle.insert_edge(0, label[common], child)
         child_ptr.value = middle
       end
@@ -658,18 +688,15 @@ class RadixTree(V)
     grandparent = Pointer(Node(V)).null
     parent = Pointer(Node(V)).null
     parent_index = 0
-    parent_start = 0
     node_ptr = root
-    start = 0
     pos = 0
     # Descends like `find_node`, remembering the parent and grandparent.
     while pos < len
       i = node_ptr.value.index(ptr[pos])
       return yield key if i < 0
       grandparent = parent
-      parent, parent_index, parent_start = node_ptr, i, start
+      parent, parent_index = node_ptr, i
       node_ptr = node_ptr.value.edges + i
-      start = pos
       pos += node_ptr.value.label_size
     end
     node = node_ptr.value
@@ -682,12 +709,12 @@ class RadixTree(V)
       node.unset
       node_ptr.value = node
     elsif node.count == 1
-      node_ptr.value = merged(node, start)
+      node_ptr.value = merged(node)
     else
       parent_node = parent.value
       parent_node.remove_edge(parent_index)
       if !grandparent.null? && parent_node.count == 1 && !parent_node.key
-        parent.value = merged(parent_node, parent_start)
+        parent.value = merged(parent_node)
       else
         parent.value = parent_node
       end
@@ -696,12 +723,11 @@ class RadixTree(V)
   end
 
   # Returns the only child of *node*, which holds no value (or is losing
-  # it), with *node*'s label prepended. *start* is the offset of *node*'s
-  # label within its keys. The merged label is taken from a key below the
-  # child, which spells it out, so merging does not allocate.
-  private def merged(node : Node(V), start : Int32) : Node(V)
+  # it), with *node*'s label prepended. The child's path key already
+  # spells the merged label, so merging only adds the label sizes.
+  private def merged(node : Node(V)) : Node(V)
     child = node.edges.value
-    child.relabel(child.some_key.to_unsafe + start, node.label_size + child.label_size)
+    child.relabel(node.label_size + child.label_size)
     child
   end
 
@@ -744,21 +770,19 @@ class RadixTree(V)
     # match, which is the common case, the deepest node holding a value is
     # the answer.
     node = root
-    best = node.value.key ? node : Pointer(Node(V)).null
+    best = node.value.has_value? ? node : Pointer(Node(V)).null
     pos = 0
-    start = 0
     while pos < len
       child = node.value.child(ptr[pos])
       break if child.null?
       size = child.value.label_size
       break if len - pos < size
-      start = pos
       pos += size
       node = child
-      best = node if node.value.key
+      best = node if node.value.has_value?
     end
     return best if pos == 0
-    limit = common_prefix(node.value.label - start, ptr, pos)
+    limit = common_prefix(node.value.path, ptr, pos)
     return best if limit == pos
     longest_prefix_node_within(ptr, limit)
   end
@@ -767,7 +791,7 @@ class RadixTree(V)
   # *limit* bytes at *ptr*, which are known to lie on a path of the tree.
   private def longest_prefix_node_within(ptr : Pointer(UInt8), limit : Int32) : Pointer(Node(V))
     node = root
-    best = node.value.key ? node : Pointer(Node(V)).null
+    best = node.value.has_value? ? node : Pointer(Node(V)).null
     pos = 0
     while pos < limit
       child = node.value.child(ptr[pos])
@@ -786,18 +810,16 @@ class RadixTree(V)
   private def prefix_limit(ptr : Pointer(UInt8), len : Int32) : Int32
     node = root
     pos = 0
-    start = 0
     while pos < len
       child = node.value.child(ptr[pos])
       break if child.null?
       size = child.value.label_size
       break if len - pos < size
-      start = pos
       pos += size
       node = child
     end
     return 0 if pos == 0
-    common_prefix(node.value.label - start, ptr, pos)
+    common_prefix(node.value.path, ptr, pos)
   end
 
   # Yields each key in the tree that is a prefix of *key* (or is *key*
@@ -818,7 +840,7 @@ class RadixTree(V)
     ptr = key.to_unsafe
     limit = prefix_limit(ptr, key.bytesize)
     node = root.value
-    yield({node.stored_key, node.value}) if node.key
+    yield({node.stored_key, node.value}) if node.has_value?
     pos = 0
     while pos < limit
       child = node.child(ptr[pos])
@@ -826,7 +848,7 @@ class RadixTree(V)
       node = child.value
       break if limit - pos < node.label_size
       pos += node.label_size
-      yield({node.stored_key, node.value}) if node.key
+      yield({node.stored_key, node.value}) if node.has_value?
     end
   end
 
@@ -843,17 +865,15 @@ class RadixTree(V)
   private def subtree(ptr : Pointer(UInt8), len : Int32) : Pointer(Node(V))
     node = root
     pos = 0
-    start = 0
     while pos < len
       child = node.value.child(ptr[pos])
       return child if child.null?
-      start = pos
       pos += child.value.label_size
       node = child
     end
     if len > 0
       # Check the skipped label bytes, as in `find_node`.
-      return Pointer(Node(V)).null unless common_prefix(node.value.label - start, ptr, len) == len
+      return Pointer(Node(V)).null unless common_prefix(node.value.path, ptr, len) == len
     end
     return Pointer(Node(V)).null if node.value.count == 0 && !node.value.key
     node
@@ -865,7 +885,7 @@ class RadixTree(V)
     return if start.null?
     node = start
     current = node.value
-    yield node if current.key
+    yield node if current.has_value?
     edges = current.edges
     count = current.count
     index = 0
@@ -879,7 +899,7 @@ class RadixTree(V)
         index += 1
         current = child.value
         if current.count == 0
-          yield child if current.key
+          yield child if current.has_value?
         else
           if depth == capacity
             capacity = capacity == 0 ? 16 : capacity * 2
@@ -893,7 +913,7 @@ class RadixTree(V)
           edges = current.edges
           count = current.count
           index = 0
-          yield child if current.key
+          yield child if current.has_value?
         end
       end
       break if depth == 0
@@ -1125,8 +1145,8 @@ class RadixTree(V)
         unless node.key || node.count >= 2
           raise "uncompressed node #{path.inspect} (#{node.count} children, no value)"
         end
-        start = path.bytesize - node.label_size
-        raise "label does not spell the path" unless Slice.new(node.label - start, path.bytesize) == path.to_slice
+        raise "short path key" unless node.path_key.not_nil!.bytesize >= path.bytesize
+        raise "path key does not spell the path" unless Slice.new(node.path, path.bytesize) == path.to_slice
       end
       if key = node.key
         count += 1
@@ -1135,9 +1155,9 @@ class RadixTree(V)
       bytes = node.first_bytes
       node.count.times do |i|
         child = node.edges[i]
-        raise "first byte mismatch" unless bytes[i] == child.label[0]
+        raise "first byte mismatch" unless bytes[i] == (child.path + path.bytesize)[0]
         raise "children out of order" if i > 0 && bytes[i - 1] >= bytes[i]
-        label = Slice.new(child.label, child.label_size)
+        label = Slice.new(child.path + path.bytesize, child.label_size)
         nodes << {child, String.build { |io| io << path; io.write(label) }}
       end
     end
