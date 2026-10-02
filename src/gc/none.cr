@@ -5,6 +5,7 @@
 require "crystal/tracing"
 
 module GC
+  # :nodoc:
   def self.init
     Crystal::System::Thread.init_suspend_resume
   end
@@ -73,23 +74,16 @@ module GC
     malloc(size)
   end
 
-  def self.collect
+  def self.collect : Nil
   end
 
-  def self.enable
+  def self.enable : Nil
   end
 
-  def self.disable
+  def self.disable : Nil
   end
 
-  # Limit the heap size to *size* bytes.
-  # Useful when you are debugging, especially on systems that do not handle
-  # running out of memory well. Or as an alternative to the environment variable
-  # `GC_MAX_HEAP_SIZE`.
-  #
-  # A zero *size* means the heap is unbounded; this is the default.
-  #
-  # This implementation rejects any other value than `0`.
+  # :nodoc:
   def self.max_heap_size=(size : UInt64) : UInt64
     raise ArgumentError.new("max_heap_size must be 0") unless size.zero?
     size
@@ -106,6 +100,7 @@ module GC
   def self.presize_heap(size : Int) : Nil
   end
 
+  # :nodoc:
   def self.free(pointer : Void*) : Nil
     Crystal.trace :gc, "free"
 
@@ -116,13 +111,16 @@ module GC
     {% end %}
   end
 
+  # :nodoc:
   def self.is_heap_ptr(pointer : Void*) : Bool
     false
   end
 
+  # :nodoc:
   def self.add_finalizer(object)
   end
 
+  # :nodoc:
   def self.register_disappearing_link(pointer : Void**)
   end
 
@@ -187,14 +185,15 @@ module GC
     {Pointer(Void).null, Pointer(Void).null}
   end
 
-  # :nodoc:
   {% if !flag?(:without_mt) %}
+    # :nodoc:
     def self.set_stackbottom(thread : Thread, stack_bottom : Void*)
       # NOTE we could store stack_bottom per thread,
       #      and return it in `#current_thread_stack_bottom`,
       #      but there is no actual use for that.
     end
   {% else %}
+    # :nodoc:
     def self.set_stackbottom(stack_bottom : Void*)
     end
   {% end %}

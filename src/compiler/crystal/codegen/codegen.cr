@@ -58,6 +58,9 @@ module Crystal
     "GC_free"                 => {ALLOC_KIND_FREE, nil},
   }
 
+  TYPE_ID_TO_CLASS_NAME_PTR = "__crystal_type_id_to_class_name_ptr"
+  TYPE_ID_TO_CLASS_NAME_MAP = "__crystal_type_id_to_class_name_map"
+
   class Program
     def run(code, filename : String? = nil, debug = Debug::Default)
       parser = new_parser(code)
@@ -360,6 +363,10 @@ module Crystal
       @modules = {"" => @main_module_info} of String => ModuleInfo
       @types_to_modules = {} of Type => ModuleInfo
 
+      # Whether to build the mapping from type IDs to their names. Currently
+      # required for raising `TypeCastError`.
+      @needs_typeinfo = false
+
       set_internal_fun_debug_location(@main, MAIN_NAME, nil)
 
       @alloca_block, @entry_block = new_entry_block_chain "alloca", "entry"
@@ -583,6 +590,7 @@ module Crystal
       end
 
       # must come last: type ids are handed out lazily during codegen
+      codegen_typeinfo
       define_gc_layouts
 
       env_dump = ENV["DUMP"]?
@@ -1663,26 +1671,10 @@ module Crystal
     end
 
     def type_id_to_class_name(type_id)
-      map_name = "__crystal_type_id_to_class_name_map"
+      @needs_typeinfo = true
 
-      global = @main_mod.globals[map_name]?
-      unless global
-        global = @main_mod.globals.add(@main_llvm_typer.llvm_type(@program.string).array(@program.llvm_id.@ids.size), map_name)
-        global.linkage = LLVM::Linkage::Internal if @single_module
-        global.initializer = create_type_id_to_class_name_map
-        global.global_constant = true
-      end
-
-      if @llvm_mod != @main_mod
-        global = @llvm_mod.globals[map_name]?
-        unless global
-          global = @llvm_mod.globals.add(@llvm_typer.llvm_type(@program.string).array(@program.llvm_id.@ids.size), map_name)
-          global.linkage = LLVM::Linkage::External
-          global.global_constant = true
-        end
-      end
-
-      str_ptr = gep llvm_type(@program.string).array(@program.llvm_id.@ids.size), global, 0, type_id
+      type_id_map = load llvm_type(@program.string).pointer, define_type_id_to_class_name_ptr
+      str_ptr = gep llvm_type(@program.string), type_id_map, type_id
       load llvm_type(@program.string), str_ptr
     end
 
@@ -1694,6 +1686,31 @@ module Crystal
       end
 
       @main_llvm_typer.llvm_type(@program.string).const_array(id_map)
+    end
+
+    def codegen_typeinfo : Nil
+      return unless @needs_typeinfo
+
+      str_type = @main_llvm_typer.llvm_type(@program.string)
+      map_type = str_type.array(@program.llvm_id.@ids.size)
+
+      map_global = @main_mod.globals.add(map_type, TYPE_ID_TO_CLASS_NAME_MAP)
+      map_global.linkage = LLVM::Linkage::Private
+      map_global.initializer = create_type_id_to_class_name_map
+      map_global.global_constant = true
+
+      ptr_global = define_type_id_to_class_name_ptr(llvm_mod: @main_mod, llvm_typer: @main_llvm_typer)
+      ptr_global.initializer = gep(map_type, map_global, 0, 0)
+    end
+
+    private def define_type_id_to_class_name_ptr(*, llvm_mod = @llvm_mod, llvm_typer = @llvm_typer)
+      llvm_mod.globals[TYPE_ID_TO_CLASS_NAME_PTR]? || begin
+        llvm_type = llvm_typer.llvm_type(@program.string).pointer
+        global = llvm_mod.globals.add(llvm_type, TYPE_ID_TO_CLASS_NAME_PTR)
+        global.linkage = @single_module ? LLVM::Linkage::Internal : LLVM::Linkage::External
+        global.global_constant = true
+        global
+      end
     end
 
     def visit(node : IsA)
@@ -2316,7 +2333,7 @@ module Crystal
     # Stack slots, `GC.malloc_atomic` memory, the libc fallback and memory
     # handed in by the user (`Reference.pre_initialize`) must still be cleared.
     def pre_initialize_aggregate(type, struct_type, ptr, *, cleared = false)
-      memset ptr, int8(0), size_t(struct_type.size) unless cleared
+      memset ptr, int8(0), size_t(@llvm_typer.size_of(struct_type)) unless cleared
       run_instance_vars_initializers(type, type, ptr)
 
       unless type.struct?
@@ -2395,13 +2412,13 @@ module Crystal
     end
 
     def generic_malloc(type, &) : {LLVM::Value, Bool}
-      size = type.size
+      size = size_t(@llvm_typer.size_of(type))
 
       if malloc_fun = yield
         pointer = call malloc_fun, size
         from_gc = true
       else
-        pointer = call c_malloc_fun, size_t(size)
+        pointer = call c_malloc_fun, size
         from_gc = false
       end
 
@@ -2421,7 +2438,7 @@ module Crystal
     # only when the allocator didn't already do it, which includes the libc
     # `malloc` fallback used without the prelude.
     def generic_array_malloc(type, count, *, gc_clears : Bool, &)
-      size = builder.mul type.size, count
+      size = builder.mul size_t(@llvm_typer.size_of(type)), count
 
       if malloc_fun = yield
         pointer = call malloc_fun, size
