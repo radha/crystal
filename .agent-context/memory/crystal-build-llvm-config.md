@@ -43,3 +43,20 @@ then rebuild the compiler (release). See [[perf-stdlib-backlog]].
 - **2026-09-20 UNPINNED: `Makefile.local` now exports `LLVM_CONFIG=/opt/homebrew/opt/llvm/bin/llvm-config` (brew's current keg, 23.1.1; keg-only so `find-llvm-config.sh` cannot auto-detect it — an explicit export is still required, just no longer version-pinned). Active `.build/crystal` = 1.22.0-dev [ab99c0e02] linked to libLLVM.23.1 (`make crystal release=1 interpreter=1`, ~4 min). Fork pushed `c589b000f..ab99c0e02`. Rebuild after any `brew upgrade llvm`. Throwaway binaries removed; `.build/crystal-llvm22-keep` retained as a fallback LLVM 22 build until the next clean rebuild.
 
 - **2026-09-26 REBASED onto upstream origin/master `89541d678` (20 new upstream commits incl. #17432 "Support LLVM 23.1 and 24.0" = const_int high-bit zeroing; our `9bdbf22d2`-equivalent returnaddress.p0 fix + cherry-picked #17414 still needed, #17414 still NOT merged upstream); clean rebase, 153 fork commits, tip `0f0dd0aae`; backup tag `backup/pre-rebase-2026-09-26`; old binary `.build/crystal-pre-rebase-2026-09-26`. brew llvm now 23.1.2. Verified: release+interpreter build OK, std_spec 18944 ex / same 14 env failures, primitives 716/0, compiler_spec 13729/0, format clean. Force-pushed to fork (cfd2f3d76→0f0dd0aae). All earlier fork hashes in memory are STALE — map by subject line.**
+
+## Cloud Linux container (2026-10-02)
+
+The compiler DOES build in the cloud now. Ubuntu's llvm-18 ships only
+`/usr/lib/llvm-18/lib/libLLVM.so.18.1` (no `libLLVM-18.so` dev symlink, no static
+`.a` archives), so the stock `llvm-config --libs` errors and `make crystal` died at
+link time with hundreds of undefined `LLVM*` symbols. `provision-linux.sh` (run by
+the SessionStart hook) now creates `/opt/llvm-shim/`: a `libLLVM-18.so` symlink plus
+an `llvm-config` wrapper that answers `--libs` with
+`-L/opt/llvm-shim/lib -Wl,-rpath,/usr/lib/llvm-18/lib -lLLVM-18` and forwards every
+other flag to the real one. It also exports `LLVM_CONFIG=/opt/llvm-shim/llvm-config`.
+Do NOT add `-lz -lzstd -ltinfo` to the shim (no zstd dev link; libLLVM.so pulls
+its own deps). Debug `make crystal` ≈ 10 min on 4 cores. For direct
+`bin/crystal spec spec/compiler/...` runs pass
+`-Dwithout_libxml2 -Dwithout_openssl -Dwithout_zlib` (no libxml2 dev link).
+Verified with the 2026-10-02 upstream sync (merge `4328e9e79`): `gc_spec` 13/0, codegen
+allocation/cast/sizeof/nilable_cast/automatic_cast/class/struct/exception 287/0.

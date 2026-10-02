@@ -48,10 +48,15 @@ on 5433, and Redis, then exports the spec environment (`PATH`,
 container restarts mid-session (processes die, files stay), run
 `eval "$(.agent-context/setup/provision-linux.sh)"`.
 
-Known limit: the container's LLVM 18 has no dev libraries, so the in-tree
-compiler cannot be built there (`make crystal` fails to link); stdlib work
-runs fine through `bin/crystal` with the bootstrap compiler, but
-`compiler_spec`/`primitives_spec` cannot run in the cloud.
+The container's LLVM 18 ships only the runtime `libLLVM.so.18.1` (no dev
+symlink, no static libs), so the stock `llvm-config --libs` errors. The
+provision script installs a shim at `/opt/llvm-shim/llvm-config` that links
+the shared library instead and exports `LLVM_CONFIG` to it, so `make crystal`
+links in the cloud (debug build ~10 min on 4 cores; verified 2026-10-02 with
+`gc_spec` and a batch of codegen specs, the full suites not yet run).
+When running compiler specs directly with `bin/crystal spec`, pass the
+Makefile's flags: `-Dwithout_libxml2 -Dwithout_openssl -Dwithout_zlib`
+(the container has no libxml2 dev link).
 
 ### On the workstation (macOS)
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Provisions a Debian/Ubuntu host (the Claude Code cloud container, or a
 # Linux workstation run as root) for this fork: the Crystal bootstrap
-# compiler, the GMP dev link, a PostgreSQL 16 test cluster (trust,
-# cleartext, md5, SCRAM and TLS roles, a streaming standby on 5433) and
-# redis-server. Idempotent: skips what exists, (re)starts what is down.
-# Prints the environment the specs need as `export` lines on stdout;
-# progress goes to stderr.
+# compiler, the GMP dev link, an llvm-config shim for building the
+# compiler, a PostgreSQL 16 test cluster (trust, cleartext, md5, SCRAM and
+# TLS roles, a streaming standby on 5433) and redis-server. Idempotent:
+# skips what exists, (re)starts what is down. Prints the environment the
+# specs need as `export` lines on stdout; progress goes to stderr.
 set -uo pipefail
 
 log() { echo "[provision] $*" >&2; }
@@ -42,6 +42,33 @@ fi
 for dir in /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu; do
   if [ -e "$dir/libgmp.so.10" ] && [ ! -e "$dir/libgmp.so" ]; then ln -sf libgmp.so.10 "$dir/libgmp.so"; fi
 done
+
+# --- LLVM shim (lets `make crystal` link the in-tree compiler) ----------------
+# Ubuntu's llvm-18 runtime package ships only libLLVM.so.<N> (no dev symlink,
+# no static archives), so `llvm-config --libs` errors and the compiler fails
+# to link. The shim answers `--libs` with the shared library through a
+# libLLVM-<N>.so symlink and passes everything else to the real llvm-config.
+# Skipped when the stock llvm-config works (full dev packages installed).
+LLVM_SHIM=/opt/llvm-shim
+if command -v llvm-config >/dev/null && ! llvm-config --libs >/dev/null 2>&1; then
+  llvm_libdir=$(llvm-config --libdir)
+  llvm_major=$(llvm-config --version | cut -d. -f1)
+  llvm_so=$(ls "$llvm_libdir"/libLLVM.so.* "$llvm_libdir"/libLLVM-"$llvm_major".so.* 2>/dev/null | head -1)
+  if [ -n "$llvm_so" ]; then
+    mkdir -p "$LLVM_SHIM/lib"
+    ln -sf "$llvm_so" "$LLVM_SHIM/lib/libLLVM-$llvm_major.so"
+    cat > "$LLVM_SHIM/llvm-config" <<SHIM
+#!/bin/sh
+case " \$* " in
+  *" --libs "*) echo "-L$LLVM_SHIM/lib -Wl,-rpath,$llvm_libdir -lLLVM-$llvm_major"; exit 0;;
+esac
+exec $(command -v llvm-config) "\$@"
+SHIM
+    chmod +x "$LLVM_SHIM/llvm-config"
+  else
+    log "no libLLVM shared library in $llvm_libdir; the compiler will not link"
+  fi
+fi
 
 # --- PostgreSQL primary -----------------------------------------------------
 id postgres >/dev/null 2>&1 || useradd -r postgres
@@ -131,3 +158,6 @@ export POSTGRES_SCRAM_URL="postgres://crystal_scram:scrampass@127.0.0.1/crystal_
 export POSTGRES_SSL_URL="postgres://crystal_ssl:sslpass@127.0.0.1/crystal_test"
 export POSTGRES_STANDBY_URL="postgres://postgres@127.0.0.1:5433/crystal_test?sslmode=disable"
 ENV
+if [ -x "$LLVM_SHIM/llvm-config" ]; then
+  echo "export LLVM_CONFIG=$LLVM_SHIM/llvm-config"
+fi
